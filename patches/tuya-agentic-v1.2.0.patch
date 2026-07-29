@@ -1,0 +1,494 @@
+--- a/apps/common/LLM/audio/audio_input.c
++++ b/apps/common/LLM/audio/audio_input.c
+@@ -22,7 +22,7 @@
+ #define MSG_AUDIO_RECORDER_FIRST_PLAY_NEXT_STOP_PLAY_TEST   11
+ 
+ 
+-#define AUDIO_PLAY_VOICE_VOLUME   80
++#define AUDIO_PLAY_VOICE_VOLUME   50    /* 下行 TTS 播放音量(0-100)。原 80 太大,改 50。要运行时调见 AUDIO_DEC_SET_VOLUME */
+ #define AUDIO_RECORD_VOICE_VOLUME 100
+ 
+ #if defined CONFIG_VOLC_LLM_ENABLE
+@@ -33,6 +33,8 @@
+ #define AUDIO_RECORD_VOICE_UPLORD_LEN (640)
+ #elif defined CONFIG_TWETALK_ENABLE
+ #define AUDIO_RECORD_VOICE_UPLORD_LEN (180)
++#elif defined CONFIG_TUYA_AGENTIC_ENABLE
++#define AUDIO_RECORD_VOICE_UPLORD_LEN (1280)  /* PCM 16k/16bit/mono 40ms=1280B/帧;opus format_mode=0 是百度无头,涂鸦解不了 */
+ #else
+ #define AUDIO_RECORD_VOICE_UPLORD_LEN (1280)
+ #endif
+@@ -159,6 +161,8 @@
+     mdelay(1);
+ #elif defined CONFIG_TWETALK_ENABLE
+     mdelay(60);
++#elif defined CONFIG_TUYA_AGENTIC_ENABLE
++    mdelay(40);                /* PCM 40ms/帧(1280B),按帧节拍取数 */
+ #else
+     mdelay(30);
+ #endif
+@@ -192,20 +196,76 @@
+     cbuf_clear(&g_audio_hdl.pcm_cbuff_w);
+ }
+ 
++unsigned int _device_get_voice_level(void)
++{
++    return cbuf_get_data_size(&g_audio_hdl.pcm_cbuff_w);
++}
++
++unsigned int _device_get_play_level(void)
++{
++    return cbuf_get_data_size(&g_audio_hdl.pcm_cbuff_r);   /* 下行 TTS 播放 cbuf 水位:排空≈DAC 播完 */
++}
++
+ int _device_write_voice_data(void *data, unsigned int len)
+ {
+     cbuffer_t *cbuf = (cbuffer_t *)&g_audio_hdl.pcm_cbuff_r;
+     if (len > 0) {
++#if defined(CONFIG_TUYA_AGENTIC_ENABLE) && defined(TUYA_DOWNLINK_OPUS_ENABLE)
++        /* 下行 opus 重组(对齐 xiaozhi-esp32 tuya_protocol.cc 的 HandleAudio):云端发 raw
++         * 拼接的 CBR opus,每帧 80B(16kbps/40ms,xiaozhi 源码 TAI_OPUS_FRAME_SIZE_BYTES 确认)。
++         * TCP 分包可能把帧切到包边界外,若直接整包塞 cbuf,解码器首次跨帧就永久失步→啸叫/闷声。
++         * 故攒够整 80B 才写播放 cbuf,余数(<80B)留下包→cbuf 里永远是整帧,AC79 解码器按
++         * opus_cbr_pktlen=80 读绝不跨帧。CBR 帧长固定,整段 TTS 字节数恒为 80 倍数,流结束时
++         * hold 自然排空,不串到下一轮。*/
++        #define TUYA_DL_OPUS_FRAME 80
++        static unsigned char opus_hold[TUYA_DL_OPUS_FRAME];
++        static unsigned int opus_hold_len = 0;
++        const unsigned char *p = (const unsigned char *)data;
++        unsigned int left = len;
++
++        /* ① 上包余数 + 本包头部凑满一帧 */
++        if (opus_hold_len > 0 && left > 0) {
++            unsigned int need = TUYA_DL_OPUS_FRAME - opus_hold_len;
++            unsigned int take = need < left ? need : left;
++            memcpy(opus_hold + opus_hold_len, p, take);
++            opus_hold_len += take;
++            p += take;
++            left -= take;
++            if (opus_hold_len == TUYA_DL_OPUS_FRAME) {
++                if (cbuf_write(cbuf, opus_hold, TUYA_DL_OPUS_FRAME) == 0) {
++                    cbuf_clear(cbuf);
++                }
++                opus_hold_len = 0;
++            }
++        }
++        /* ② 本包剩余按整帧直写 cbuf */
++        while (left >= TUYA_DL_OPUS_FRAME) {
++            if (cbuf_write(cbuf, p, TUYA_DL_OPUS_FRAME) == 0) {
++                cbuf_clear(cbuf);
++            }
++            p += TUYA_DL_OPUS_FRAME;
++            left -= TUYA_DL_OPUS_FRAME;
++        }
++        /* ③ 尾部余数(<80B)存回 hold */
++        if (left > 0) {
++            memcpy(opus_hold, p, left);
++            opus_hold_len = left;
++        }
++#else
+         unsigned int write_len = cbuf_write(cbuf, data, len);
+-        /* printf("len=%d wite_len=%d", len, write_len); */
+-        if (0 == write_len) {
+-            //上层buf写不进去时清空一下，避免出现声音滞后的情况
+-            cbuf_clear(cbuf);
+-            //audio_debug("cbuf_write full");
+-        } else if (write_len != len) {
+-            unsigned int rlen = cbuf_get_data_size(cbuf);
+-            // audio_debug("wite_len %d len %d rlen %d", write_len, len, rlen);
++        if (write_len != len) {
++            /* 写不满(缓冲满)时【不】再 cbuf_clear——那会瞬间丢掉整缓冲→明显截断。
++             * 改丢本次新数据(丢最新一小段,缓冲里已存的继续平滑播放)。统计满溢次数便于诊断:
++             * 计数涨得快=云端突发/解码跟不上;不涨=是网络停顿 underrun(靠大缓冲扛)。*/
++            if (write_len == 0) {
++                static unsigned int dl_full_cnt = 0;
++                if (++dl_full_cnt % 50 == 1) {
++                    printf("[AUDIO] dl cbuf full drop #%u (level=%u)\r\n",
++                           dl_full_cnt, cbuf_get_data_size(cbuf));
++                }
++            }
+         }
++#endif
+     }
+ 
+     os_sem_set(&g_audio_ctrl.r_sem, 0);
+@@ -285,6 +345,14 @@
+     req.enc.format_mode = 0;
+     req.enc.frame_ms    = 60;
+ #endif
++#ifdef CONFIG_TUYA_AGENTIC_ENABLE
++    /* 涂鸦 AI 上行用 PCM:杰理 opus format_mode=0 是"百度无头"格式(非标准 opus),
++     * 涂鸦 ASR 解不了→秒回空。云端下行也用 PCM(codec=101=TAI_AUDIO_PCM),改 PCM 最匹配。 */
++    req.enc.format      = "pcm";
++    req.enc.bitrate     = 24000;
++    req.enc.format_mode = 0;
++    req.enc.frame_ms    = 60;
++#endif
+     req.enc.sample_source = "mic";
+     req.enc.vfs_ops = &recorder_vfs_ops;
+     req.enc.file = (FILE *)&g_audio_hdl.pcm_cbuff_w;
+@@ -299,6 +367,19 @@
+         req.enc.vad_start_threshold = 300;    //ms
+         req.enc.vad_stop_threshold  = 0;    //ms
+     }
++#ifdef CONFIG_TUYA_AGENTIC_ENABLE
++    /* 本地 VAD 阈值:起检调低(少丢话头、压低 barge-in/起轮延迟);收尾给真实值(原 0 不触发 SPEAK_STOP)。
++     * 起检从 150→100:VAD 更快开口,但多出的假触发由 turn-start/barge-in 两道能量门(BARGE_MIN_ENERGY)
++     * 兜底过滤,不会回流成自言自语。实测 barge-in 从发声到切 TTS ~345ms→~295ms。*/
++    if (req.enc.use_vad == 1) {
++        req.enc.vad_start_threshold = 100;    //ms
++#ifdef TUYA_BARGE_IN_ENABLE
++        req.enc.vad_stop_threshold  = 600;    //ms — 800→600 压低"说完→回话"等待(省 ~200ms);代价:长停顿可能被截断
++#else
++        req.enc.vad_stop_threshold  = 600;    //ms
++#endif
++    }
++#endif
+ 
+ #ifdef CONFIG_AEC_ENC_ENABLE
+     struct aec_s_attr aec_param = {0};
+@@ -441,6 +522,23 @@
+     req.dec.attr |= AUDIO_ATTR_OPUS_CBR_PKTLEN_TYPE;
+     req.dec.opus_cbr_pktlen = 180;
+ #endif
++#if defined(CONFIG_TUYA_AGENTIC_ENABLE) && defined(TUYA_DOWNLINK_OPUS_ENABLE)
++    /* === opus 下行(TUYA_DOWNLINK_OPUS_ENABLE 开启)=== 调试中(啸叫)。云端回 codec=111 sr=16000,✅支持。
++     * ① channel=1/sample_rate=16000 必须显式对齐(置 0 退到解码器 48k 默认→underrun)。
++     * ② opus_cbr_pktlen=80(16kbps×40ms/8,GCD 推得 + xiaozhi 源码 TAI_OPUS_FRAME_SIZE_BYTES 确认)。
++     * ③ 走 AUDIO_ATTR_OPUS_CBR_PKTLEN_TYPE(百度无头 CBR)。
++     * ⚠️啸叫待解:已加 _device_write_voice_data 帧重组(对齐 xiaozhi),仍啸叫则疑 AC79 opus 解码器
++     *   与云端编码器不兼容,明天看 __opus_input read 返回值定位。*/
++    req.dec.dec_type        = "opus";
++    req.dec.channel         = 1;
++    req.dec.sample_rate     = 16000;
++    req.dec.attr           |= AUDIO_ATTR_OPUS_CBR_PKTLEN_TYPE;
++    req.dec.opus_cbr_pktlen = 80;    /* GCD=80;16kbps×40ms/8 */
++#elif defined(CONFIG_TUYA_AGENTIC_ENABLE)
++    /* === PCM 下行(默认)=== 稳定能播,但 16k=32KB/s 拥挤测试网易卡顿。channel/sample_rate 沿用上面
++     * 已设的 CHANNEL(1)/SAMPLE_RATE(16k)。云端实测回 codec=101(PCM)。开 TUYA_DOWNLINK_OPUS_ENABLE 切 opus。*/
++    req.dec.dec_type        = "pcm";
++#endif
+     req.dec.sample_source   = "dac";
+     req.dec.file            = (FILE *)&g_audio_hdl.pcm_cbuff_r;
+     audio_debug("audio_player_net_init ");
+@@ -644,6 +742,13 @@
+ #elif defined CONFIG_TWETALK_ENABLE
+     pcm_buff_r = malloc(SAMPLE_RATE * CHANNEL * 1);
+     cbuf_init(&g_audio_hdl.pcm_cbuff_r, pcm_buff_r, SAMPLE_RATE * CHANNEL * 1);
++#elif defined CONFIG_TUYA_AGENTIC_ENABLE
++    /* 下行 TTS 播放缓冲:PCM 16k/16bit/mono=32KB/s。云端长答案(如金价)是突发下发(比播放快),
++     * 缓冲不够大会丢尾→"说到一半没了"。开到 64×=1MB(32s)吸收长突发,SDRAM 8MB 充足。
++     * 配合 tuya_agentic_demo.c 的"等缓冲排空再听"(超时 35s > 32s 排空),确保云端发完=喇叭播完
++     * 才开始听,不会把残留 TTS 当新问题(治自说自话)或和新 TTS 混音(治刺啦噪音)。*/
++    pcm_buff_r = malloc(SAMPLE_RATE * CHANNEL * 64);
++    cbuf_init(&g_audio_hdl.pcm_cbuff_r, pcm_buff_r, SAMPLE_RATE * CHANNEL * 64);
+ #else
+     pcm_buff_r = malloc(SAMPLE_RATE * CHANNEL * 4);
+     cbuf_init(&g_audio_hdl.pcm_cbuff_r, pcm_buff_r, SAMPLE_RATE * CHANNEL * 4);
+--- a/apps/common/LLM/audio/audio_input.h
++++ b/apps/common/LLM/audio/audio_input.h
+@@ -61,6 +61,8 @@
+ 
+ int _device_write_voice_data(void *data, unsigned int len);
+ int _device_get_voice_data(void *data, unsigned int max_len);
++void _device_wbuf_clear(void);   /* 清录音 cbuf:每轮对话开始前清掉轮间积压的旧音频 */
++unsigned int _device_get_voice_level(void);  /* 录音 cbuf 当前数据量(字节),诊断用 */
+ void audio_stream_init(int sample_rate, int bit_dept, int channel_num);
+ void start_audio_stream(void);
+ void stop_audio_stream(void);
+--- a/apps/common/config/user_cfg.c
++++ b/apps/common/config/user_cfg.c
+@@ -279,6 +279,25 @@
+     aec_param->AGC_echo_look_ahead = 100;
+     aec_param->AGC_echo_hold = 400;
+     aec_param->ES_Unconverge_OverDrive = aec_param->ES_MinSuppress;
++
++    /* === AEC 参数调优覆盖(syscfg 读取之后,覆盖 flash 值)==
++     * 默认参数可能不适配我们的喇叭/麦声学环境,试调激进:
++     * - AEC_DT_AggressiveFactor: 原值(通常1.0)→2.0,回声消除更激进
++     * - ES_AggressFactor: 原值(通常-3)→-6,非线性残留抑制更深
++     * - ES_MinSuppress: 原值(通常4)→2,允许更深的抑制
++     * 配合 tuya_agentic_demo.c 的 [AEC-DBG] 诊断日志验证效果(act 高=没消,低=消了)。*/
++    aec_param->AEC_DT_AggressiveFactor = 2.0f;
++    aec_param->ES_AggressFactor      = -6.0f;
++    aec_param->ES_MinSuppress        =  2.0f;
++    /* DNS 降噪增强 1.0→2.0:故事等连续密集 TTS 时 AEC 残留回声大,DNS 加强压回声,
++     * 让用户话音在 post-AEC 里更突出,encoder VAD 才能穿透触发(实测故事期间 VAD 完全不触发)。
++     * 代价:可能压掉一点小声话音;TTS 静默段无影响。范围 0~6。*/
++    aec_param->DNS_over_drive        =  2.0f;
++    log_info("AEC override: dt_aggr=%.1f es_aggr=%.1f es_min_supp=%.1f dns_od=%.1f\n",
++             (double)aec_param->AEC_DT_AggressiveFactor,
++             (double)aec_param->ES_AggressFactor,
++             (double)aec_param->ES_MinSuppress,
++             (double)aec_param->DNS_over_drive);
+ }
+ #endif
+ 
+--- a/apps/wifi_story_machine/app_music.c
++++ b/apps/wifi_story_machine/app_music.c
+@@ -3567,6 +3567,13 @@
+     return __play_voice_prompt(fname, dec_end_handler, 1);
+ }
+ 
++/* 供 tuya 配网流程跨任务周期播报"请配置网络"(NetCfgEnter.mp3)。
++ * 配网等待期设备空闲、未在解码,从此处发起提示音;实际解码仍走 audio_server。*/
++void app_music_play_netcfg_prompt(void)
++{
++    app_music_play_voice_prompt("NetCfgEnter.mp3", NULL);
++}
++
+ /*
+  * ****************************绘本识别*************************************
+  */
+@@ -4387,6 +4394,8 @@
+ #endif
+         break;
+     case KEY_POWER:
++        /* 电源键是自锁拨动开关,按不出长按事件,此分支实际不可达。原 TUYA 在此绑的
++         * "清配网"已移到 KEY_PHOTO(K6)长按;此处保留关机语义,与非 TUYA 一致。*/
+         app_music_shutdown(0);
+         break;
+     case KEY_MENU:
+@@ -4436,6 +4445,15 @@
+ #endif
+         break;
+     case KEY_PHOTO:
++#if defined CONFIG_TUYA_AGENTIC_ENABLE
++        /* 涂鸦模式:长按 PHOTO(K6) = 清配网并重启,重新进入 BLE 配网。板上 Reset/Update
++         * 是硬件键固件读不到,电源键是自锁开关按不出长按,故重置入口放这个原空槽位。
++         * K6 短按仍是绘本识别模式(click 分支不动)。*/
++        {
++            extern void tuya_clear_provision_and_reset(void);
++            tuya_clear_provision_and_reset();
++        }
++#endif
+         break;
+     case KEY_ENC:
+ #ifdef CONFIG_BT_ENABLE
+@@ -4503,6 +4521,9 @@
+ static int app_music_key_event_handler(struct key_event *key)
+ {
+     int ret = false;
++    /* 临时诊断:按下任意键打印 value/action,用来确认板上 reset/update 物理键对应代码里哪个 KEY_*。
++     * 确认后可删此行。action: CLICK/LONG/HOLD/UP(松开)。 */
++    printf("[KEY] value=%d action=%d\r\n", key->value, key->action);
+ 
+     if (__this->call_flag && (key->value != KEY_UP && key->value != KEY_DOWN && key->value != KEY_VOLUME_DEC && key->value != KEY_VOLUME_INC && key->value != KEY_OK && key->value != KEY_ENC)) {
+         return true;	//通话模式下只有音量键和暂停键能起作用
+--- a/apps/wifi_story_machine/app_main.c
++++ b/apps/wifi_story_machine/app_main.c
+@@ -129,7 +129,7 @@
+     {"#C0btstack",          18,      1024,  384   },
+ #else
+     {"btctrler",            19,      512,   384   },
+-    {"btstack",             18,      768,   384   },
++    {"btstack",             18,      2048,   384   },
+ #endif
+ #endif
+     {"wl80_test",            1,     2048,   64    },
+--- a/apps/wifi_story_machine/wifi_app_task.c
++++ b/apps/wifi_story_machine/wifi_app_task.c
+@@ -658,6 +658,9 @@
+         thread_fork("realtime_demo", 4, 5 * 1024, 0, 0, realtime_demo, NULL);
+ #endif
+ 
++/* 涂鸦 AgenticKit 流程改为由 tuya_agentic_main 在 boot 时(late_initcall)自启动,
++ * 它自己管理 BLE 配网 → WiFi → 激活 → 连 AI 的完整流程,不再挂在 DHCP 钩子上。*/
++
+ #ifdef CONFIG_TWETALK_ENABLE
+         // 联网成功后 初始化twetlak
+         extern int start_tc_iot_twetalk(void);
+--- a/apps/wifi_story_machine/include/app_config.h
++++ b/apps/wifi_story_machine/include/app_config.h
+@@ -226,6 +226,20 @@
+ // #define CONFIG_HTTP_SERVER_ENABLE            //HTTP服务器
+ // #define CONFIG_FTP_SERVER_ENABLE             //FTP服务器
+ // #define CONFIG_VOLC_LLM_ENABLE               //火山大模型
++#define CONFIG_TUYA_AGENTIC_ENABLE            //涂鸦 AgenticKit(连涂鸦 AI 云,apps/common/LLM/tuya_agentic)
++/* ===== 涂鸦下行 TTS 编码开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下生效)=====
++ * 不定义(默认)= PCM:稳定能播,但 16k/16bit/mono=32KB/s,拥挤测试网易卡顿。
++ * 定义下面宏 = opus:~2KB/s(1/16 带宽),云端确认支持(codec=111),帧长 80B/16kbps/40ms。
++ *   opus 解码目前还在调(啸叫,疑 TCP 分帧重组 / 解码器兼容问题),先留开关切回 PCM。
++ *   调 opus 时把下一行注释去掉即可。*/
++// #define TUYA_DOWNLINK_OPUS_ENABLE
++
++/* ===== 涂鸦 barge-in(用户打断 TTS)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
++ * 不定义(默认)= 不支持打断:TTS 期间不上行,简单稳定。
++ * 定义 = 支持:本地 VAD 在 TTS 期间检测到说话 → tai_chat_break 停 TTS → 发新一轮上行。
++ *   ⚠️ 强依赖 AEC:TTS 期间也上行,靠 AEC 去掉喇叭回声;AEC 不行则 VAD 被回声误触发→TTS 动辄自断。
++ *   ⚠️ 实验性,有竞态(老轮 END 可能让新轮提前结束)。误触发多就关掉先调 AEC。*/
++#define TUYA_BARGE_IN_ENABLE
+ // #define CONFIG_ONESDK_LLM_ENABLE
+ // #define CONFIG_SXY_QYAI_ENABLE
+ // #define CONFIG_DUER_LC_DEMO_ENABLE           //小度澜川AI对话DEMO
+@@ -341,7 +355,7 @@
+ 
+ #ifdef CONFIG_AEC_ENC_ENABLE
+ #define CONFIG_USB_AUDIO_AEC_ENABLE          //usb mic使能回声消除功能
+-// #define CONFIG_AEC_LINEIN_CHANNEL_ENABLE     //AEC回采使用硬件通道数据
++// #define CONFIG_AEC_LINEIN_CHANNEL_ENABLE   //AEC硬件回采(通道3采DAC)。实测未生效——自说自话照旧,通道3大概率没接DAC环采(喂垃圾参考)。已回退走软件参考(output_way=0)。要重试需先确认板子7916AB的ch3环采通路
+ // #define CONFIG_AEC_USE_PLAY_MUSIC_ENABLE       //播歌时需要使用AEC
+ 
+ // #define CONFIG_AEC_USE_SMS_TDE   //使用tde算法, 编码参数req.enc.aec_enable设置为2
+--- a/apps/wifi_story_machine/board/wl82/Makefile
++++ b/apps/wifi_story_machine/board/wl82/Makefile
+@@ -148,9 +148,11 @@
+ 
+ 
+ DEFINES += $(EXT_CFLAGS) # 额外的一些定义
++DEFINES += -DHTTP_DO_NOT_USE_CUSTOM_CONFIG -DMQTT_DO_NOT_USE_CUSTOM_CONFIG -DIOT_DO_NOT_USE_CUSTOM_CONFIG
+ 
+ # 头文件搜索路径
+ INCLUDES := \
++	-I../../../../apps/common/LLM/tuya_agentic/tuya_inc \
+ 	-I../../../../include_lib/c++ \
+ 	-I../../../../include_lib/c++/include \
+ 	-I../../../../include_lib/newlib/include \
+@@ -239,6 +241,18 @@
+ 	-I../../../../include_lib/net/network_download \
+ 	-I../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/inc \
+ 	-I../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws \
++	-I../../../../apps/common/LLM/tuya_agentic \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/pal \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/common \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/include \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/include \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/include \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/interface \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/dependency/3rdparty/llhttp/include \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/include \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/interface \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya-ble/include \
+ 
+ 
+ # 需要编译的 .c 文件
+@@ -618,6 +632,38 @@
+ 	../../../../cpu/wl82/key/rdec.c \
+ 	../../../../cpu/wl82/port_waked_up.c \
+ 	../../../../cpu/wl82/setup.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_attrs.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_client.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_crypto.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_packet.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_pkt_log.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_protocol.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_transport.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop_base.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/cipher_wrapper.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/http_client_interface.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client_message.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_dns.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_dp.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_on_boarding.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_ota.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/mqtt.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/common/tls.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/common/log.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/common/rng.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/core_http_client.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/dependency/3rdparty/llhttp/src/api.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/dependency/3rdparty/llhttp/src/http.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/dependency/3rdparty/llhttp/src/llhttp.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/core_mqtt.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/core_mqtt_serializer.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/core_mqtt_state.c \
++	../../../../apps/common/LLM/tuya_agentic/pal_ac791n.c \
++	../../../../apps/common/LLM/tuya_agentic/tuya_agentic_demo.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya-ble/src/tuya_ble_prov.c \
++	../../../../apps/common/LLM/tuya_agentic/le_net_cfg_tuya.c \
+ 
+ 
+ # 需要编译的 .S 文件
+--- a/apps/wifi_story_machine/board/wl82/board_7916A.c
++++ b/apps/wifi_story_machine/board/wl82/board_7916A.c
+@@ -24,7 +24,7 @@
+ // *INDENT-OFF*
+ 
+ UART0_PLATFORM_DATA_BEGIN(uart0_data)
+-    .baudrate = 1000000,
++    .baudrate = 115200,
+     /* .port = PORTA_5_6, */
+     .port = PORTA_3_4,
+     /* .tx_pin = IO_PORTA_05, */
+@@ -49,7 +49,7 @@
+ UART1_PLATFORM_DATA_END();
+ 
+ UART2_PLATFORM_DATA_BEGIN(uart2_data)
+-    .baudrate = 1000000,
++    .baudrate = 115200,
+     .port = PORT_REMAP,
+ #if CONFIG_AUDIO_ENC_SAMPLE_SOURCE == AUDIO_ENC_SAMPLE_SOURCE_PLNK0
+     .output_channel = OUTPUT_CHANNEL3,
+--- a/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp
++++ b/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp
+@@ -72,6 +72,19 @@
+ <Add option="-D_XOPEN_SOURCE=700" />
+ <Add option="-D_GNU_SOURCE" />
+ <Add option="-D__ELF__" />
++<Add directory="../../../../apps/common/LLM/tuya_agentic/tuya_inc" />
++<Add directory="../../../../apps/common/LLM/tuya_agentic" />
++<Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/pal" />
++<Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/common" />
++<Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/include" />
++<Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/include" />
++<Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src" />
++<Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya-ble/include" />
++<Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/include" />
++<Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/interface" />
++<Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/dependency/3rdparty/llhttp/include" />
++<Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/include" />
++<Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/interface" />
+ <Add directory="../../../../include_lib/c++" />
+ <Add directory="../../../../include_lib/c++/include" />
+ <Add directory="../../../../include_lib/newlib/include" />
+@@ -160,6 +173,9 @@
+ <Add directory="../../../../include_lib/net/network_download" />
+ <Add directory="../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/inc" />
+ <Add directory="../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws" />
++<Add option="-DHTTP_DO_NOT_USE_CUSTOM_CONFIG" />
++<Add option="-DMQTT_DO_NOT_USE_CUSTOM_CONFIG" />
++<Add option="-DIOT_DO_NOT_USE_CUSTOM_CONFIG" />
+ </Compiler>
+ <Linker>
+ <Add option="--plugin-opt=-pi32v2-always-use-itblock=false" />
+@@ -1569,5 +1585,37 @@
+ <Unit filename="../../../../lib/net/version.z.S" />
+ <Unit filename="../../../../lib/server/version.z.S" />
+ <Unit filename="../../../../lib/utils/version.z.S" />
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/pal_ac791n.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/tuya_agentic_demo.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/le_net_cfg_tuya.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_attrs.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_client.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_crypto.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_packet.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_pkt_log.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_protocol.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_transport.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop_base.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/cipher_wrapper.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/http_client_interface.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client_message.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_dns.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_dp.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_on_boarding.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_ota.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/mqtt.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/common/tls.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/common/log.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/common/rng.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/core_http_client.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/dependency/3rdparty/llhttp/src/api.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/dependency/3rdparty/llhttp/src/http.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/dependency/3rdparty/llhttp/src/llhttp.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/core_mqtt.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/core_mqtt_serializer.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/core_mqtt_state.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya-ble/src/tuya_ble_prov.c"><Option compilerVar="CC" /></Unit>
+ </Project>
+ </CodeBlocks_project_file>

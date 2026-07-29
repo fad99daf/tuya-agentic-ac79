@@ -1,0 +1,171 @@
+# 涂鸦 Agentic 集成 — 改动清单
+
+> 工程:`fw-AC79_AIoT_SDK-release-AC79NN_SDK_V1.2.0`(杰理 AC791N / wl82 AIoT SDK)
+> 说明:本工程**非 git 仓库**。区分"原版/改动"的依据是文件时间戳——SDK 原版统一为 `2026-03-03 10:09`,凡 `2026-07` 月修改/新增的即为本次涂鸦集成改动。
+> 配套方案文档:`agentic-kit-integration.md`(7-17,早期方案,与最终落地有出入,见文末"与方案文档的差异")。
+
+---
+
+## 0. 总览
+
+改动分三类:
+
+| 类别 | 说明 |
+|---|---|
+| **A. 新建集成模块** | `apps/common/LLM/tuya_agentic/` 下手写的胶水代码(PAL / 配网 / 对话主流程 / bool 补丁) |
+| **B. 改动的 SDK 原有文件** | 6 个:Makefile、user_cfg.c、app_music.c、app_config.h、wifi_app_task.c、audio_input.c/.h |
+| **C. 引入的依赖(原样,未改)** | 涂鸦开源 `rtc-tcp-client`/`iot-client`/`tuya-ble`/`common` + AWS `coreHTTP`/`coreMQTT` |
+
+---
+
+## A. 新建集成模块 `apps/common/LLM/tuya_agentic/`
+
+> 整个目录是本次新增。其中 `agentic-kit/` 子目录是从涂鸦 agentic-kit 复制引入的依赖(C 类,原样未改);其余是手写文件。
+
+### A1. `tuya_agentic_demo.c`(48 KB)— 对话主流程 ⭐改动最重
+
+入口由 `late_initcall(tuya_agentic_main_init)` **开机自启动**(fork 16KB 栈线程),不挂 DHCP 钩子(见 B5)。核心内容:
+
+**① 修复"无法打断"根因**
+- 文件顶 `#include "app_config.h"`(L12-14,带长注释)。原 demo.c 漏 include → `TUYA_BARGE_IN_ENABLE` 不可见 → barge-in 三处 `#ifdef` 全被编译掉,功能从未进固件。
+
+**② 设备三元组 / WiFi 凭据持久化(VM 176~180,裸 index,未进 syscfg_id.h)**
+- `176=devid` / `177=secret_key` / `178=local_key`(各 32B)
+- `179=ssid` / `180=pwd`(各 65B,直连路径开机重连用)
+
+**③ `tuya_agentic_main()` 启动流程**
+- **直连路径**(VM176 有 devid):读三元组 + ssid/pwd → `wifi_enter_sta_mode` → 等 DHCP → `iot_client_init` → `tuya_ai_run`
+- **首次配网路径**(无 devid):播"请配置网络"语音 → `tuya_ble_netcfg_start`(BLE 阻塞等 App 下发 ssid/pwd/token)→ 停 BLE 释放 RAM → 连 WiFi → `iot_client_init_on_boarding_with_token` 激活 → **写 176~180** → hold MQTT 8s 让 App 确认配网成功 → deinit MQTT 再连 AI(MQTT 与 AI TLS 并发云端会 SESSION_CLOSE,必须串行)→ `tuya_ai_run`
+- **历史 bug 修复**:`syscfg_read` 返回值判断从 `==0`(误判每次重配)改为 `>0`
+
+**④ `tuya_ai_run()` 对话循环**
+- **上行 ASR = 固定 PCM**:`tai_send_audio_start(ctx, TAI_AUDIO_PCM, 1, 16, 16000)`,帧长 `TUYA_OPUS_FRAME_LEN=1280`(16k/16bit/mono 40ms)。注释说明:上行**不用** opus——杰理 opus `format_mode=0` 是"百度无头"非标准格式,涂鸦 ASR 解不了会秒回空。
+- **下行 TTS = opus(可选)**:`#ifdef TUYA_DOWNLINK_OPUS_ENABLE` 分支把 `session_attrs` 改成请求 `opus/16k/1`;`on_audio` 前 5 帧核对 `opus_cbr_pktlen`(全一致=CBR)。真正 80B 帧重组在 `audio_input.c`(见 B6)。
+
+**⑤ Barge-in(打断,TUYA_BARGE_IN_ENABLE)** — 多层防护:
+- **1000ms 冷却**(`TUYA_BARGE_COOLDOWN_MS`/`g_barge_cooldown_until`/`barge_cooldown_expired()`):`chat_break` 后置位冷却,窗口内忽略老轮在途 TTS 残响二次触发误判;差值用 `(int)` 比较抗回绕。
+- **stale mic 排空**:barge-in 新上行前排掉 TTS 期间积压的旧 mic 数据(保留最近 3 帧 = 1280×3,封顶 6 帧 ≤240ms 防 session 卡死),否则 cbuf 压着旧残音,新上行先发静音/回声 → ASR 收垃圾。
+- **能量统计 `opus_frame_stat`**(已修):从旧的按字节 `s += p[i]` 累加(负样本高字节恒 0xFF,导致静音/说话 sum 全卡 ~15万、act 全卡 60-90% 区分不出)改为小端拼 int16 后 `Σ|v|`,`act=avg|sample|/100` 封顶 100。被 5 处复用(idle 底噪基线/turn-start 门/barge 确认/逐帧统计/AEC 诊断)。
+- **3 帧能量确认 `barge_in_energy_confirmed`**:VAD 触发后连读 3 帧,3-of-3 的 sum 均 ≥ `BARGE_MIN_ENERGY(100000)` 才算真话音,滤 ≤2 帧的 AEC 残留/噪音 spike。
+- **onset 帧补发 `g_barge_prebuf[1280*3]`**:barge-in 新上行时补发触发前最响那段(~120ms),否则只剩尾音/静音 → ASR 空。
+- **play-drain-wait**:`TAI_EVT_END` 后不立刻听,等 `_device_get_play_level()>640`(≈DAC 真播完,35s 兜底)再进入监听,治"云端发完 ≠ 喇叭播完"导致的自说自话。
+- **turn-start 能量门**(非 barge 轮):无唤醒词+单麦开麦易自言自语,VAD 触发后再核 1 帧能量才起轮。
+- **idle 持续排空**:空闲不断丢 mic,保证 VAD 触发时无积压;**绝不**在 VAD 触发时 clear(会吞刚触发的话音)。
+
+**⑥ `tuya_clear_provision_and_reset()`(L944)** — K6 长按入口:把 VM 176~180 全写 0 → **`tuya_ble_netcfg_stop()` 先停 BT 广播** → `os_time_dly(300)`(BT 控制器 idle + VM 落盘)→ `cpu_reset()` → 重启后读不到 devid 自动重新配网。
+
+   > **修复(软复位后 BT 脏状态 → 配网失败)**:`cpu_reset()` 内部走 `P33_SYSTEM_RESET`,虽是整机软复位,但**不像掉电 / reset 键那样彻底重置 BT 控制器**。若复位前 BT 处于广播/连接活跃态,带脏射频状态复位会导致重启后 BLE 链路异常(`conn nack` 雪崩 → 5s supervision timeout 断开,reason 0x08),配网必失败。**实测复现**:长按 K6(走软复位)后配网失败,紧接着按 reset 键(冷启动)则配网成功。**解法**:复位前先 `tuya_ble_netcfg_stop()` 停广播 + 延迟 3s 让 BT 控制器进 idle,再软复位。已验证修复。
+
+**⑦ 产品三件套**(L46-48,构建期硬编码):`TUYA_PRODUCT_KEY` / `TUYA_UUID` / `TUYA_AUTH_KEY`。
+
+### A2. `tuya_agentic.h`(695 B)— 对外头
+声明 3 个入口:`tai_pal_ac791n()`、`tuya_agentic_demo()`(文本对话)、`tuya_agentic_main()`(完整 boot)。无改动点。
+
+### A3. `pal_ac791n.c`(9 KB)— PAL 平台适配层
+把 agentic-kit 的 14 个 PAL 回调桥接到 AC79 宿主(FreeRTOS + lwIP + mbedTLS):
+- **TCP**:照搬 `pal_freertos.c`。`getaddrinfo` → 非阻塞 `connect`+`select` 限时 → 查 `SO_ERROR` → 回阻塞模式 + `TCP_NODELAY`;`EAGAIN/EWOULDBLOCK` 返 `PAL_ERR_AGAIN`。`MSG_NOSIGNAL/MSG_DONTWAIT` 自定义(AC79 无)。
+- **mutex — 必须递归锁**:`xSemaphoreCreateRecursiveMutex`(需 `configUSE_RECURSIVE_MUTEXES=1`)。iot-client 的 DP schema 更新会重入锁,普通锁死锁。
+- **thread**:`thread_fork`+trampoline 桥接 `void* fn(void*)` ↔ `void fn(void*)`,`thread_kill(KILL_WAIT)` 回收,栈 6KB(跑 mbedTLS 握手)。
+- **time**:`sys_timer_get_ms`;**malloc/free**:libc。
+- **配套兼容**:`flockfile/funlockfile` 空实现(AC79 newlib 缺,agentic-kit log 用到);配合 demo.c 的 `log_set_level(0)` 关日志绕过 `fprintf(stderr)` 崩溃(AC79 无 stderr)。
+
+### A4. `le_net_cfg_tuya.c`(10 KB)+ `.h` — 涂鸦 BLE 配网传输层(全新)
+AC79 上手写的涂鸦 BLE GATT 配网传输层(SDK 原版无):
+- `.h`:涂鸦 3 个 128-bit 特征 UUID(write/notify/read)、手写 `profile_data[]` GATT 服务表、handle 宏(`WRITE_VAL=0x0006`/`NOTIFY_VAL=0x0008`/`NOTIFY_CCC=0x0009`/`READ_VAL=0x000b`)、对外 API `tuya_ble_netcfg_start/stop`。
+- `.c`:`tuya_ble_hal_random`(协议随机数 HAL,简易 LCG,注释提正式应用 AC79 TRNG)、`tuya_hal_send`(`att_server_notify` 回传)、`prov_complete_cb`(解出凭据→post 信号量)、ATT read/write 回调(write 数据转发到大栈 worker 任务,**不在 btstack 4KB 栈里跑 mbedTLS**)、`tuya_pkt_handler`(HCI 连接/断开/MTU,断开重启广播)、`tuya_ble_netcfg_start`(init→换 profile→开广播→阻塞等配网)、worker 任务 `tuya_prov_w`(2KB 栈,`early_initcall`)。
+
+### A5. `tuya_bool_compat.h` + `tuya_inc/stdbool.h` — bool 冲突兼容补丁
+解决 **JL clang 4.0.1 的 `stdbool.h` `#define bool _Bool`** 与 **AC79 `cpu.h` `typedef unsigned char bool`** 在同一翻译单元冲突("cannot combine with previous 'char'")。两套机制:
+- `tuya_inc/stdbool.h`:放在**最高优先级 `-I` 目录**(Makefile L155),覆盖系统 stdbool.h,改成 `typedef unsigned char bool`(与 cpu.h 完全一致),从根本上消除 `_Bool` 宏冲突。
+- `tuya_bool_compat.h`:作为 **`-include` 强制头**,先 `#define __STDBOOL_H` 让后续任何 `<stdbool.h>` 整体跳过,再提供同款 typedef。
+- 同类型 typedef 重复,clang 作为扩展允许 + Makefile 已 `-w`。C++ 下整段跳过。
+
+---
+
+## B. 改动的 SDK 原有文件
+
+### B1. `apps/wifi_story_machine/board/wl82/Makefile`
+- **DEFINES**(L151):追加 `-DHTTP_DO_NOT_USE_CUSTOM_CONFIG -DMQTT_DO_NOT_USE_CUSTOM_CONFIG -DIOT_DO_NOT_USE_CUSTOM_CONFIG`(让 coreHTTP/coreMQTT/iot-client 用默认配置,不引各自 *_config.h)
+- **INCLUDES**(L155, L244-255):追加 12 条 `-I` —— `tuya_inc`(最高优先级覆盖 stdbool.h)、`tuya_agentic`、`pal`、`common`、`rtc-tcp-client/include`、`iot-client/include`+`src`、`coreHTTP` include+interface+llhttp、`coreMQTT` include+interface、`tuya-ble/include`
+- **c_SRC_FILES**(L635-666):追加 34 个涂鸦源文件 —— rtc-tcp-client(7)+iot-client(11)+common(3)+coreHTTP(4)+coreMQTT(3)+`pal_ac791n.c`+`tuya_agentic_demo.c`+`tuya_ble_prov.c`+`le_net_cfg_tuya.c`
+- **LFLAGS**:不动(复用宿主 `libmbedtls_3_4_0.a` / `cJSON.a` / `lwip_2_2_0.a` / `lib_mqtt.a`)
+
+### B2. `apps/common/config/user_cfg.c` — AEC 参数覆盖(为 barge-in)
+`get_cfg_file_aec_config()` 末尾(L283-301)硬覆盖 4 项 AEC 参数 + 中文注释,让连续 TTS 期间的回声残留被压住、用户话音能穿透触发 VAD(barge-in 前提):
+
+| 参数 | 原值 → 新值 | 作用 |
+|---|---|---|
+| `AEC_DT_AggressiveFactor` | 1.0 → **2.0** | 回声消除更激进 |
+| `ES_AggressFactor` | -3.0 → **-6.0** | 非线性残留抑制更深 |
+| `ES_MinSuppress` | 4.0 → **2.0** | 允许更深抑制 |
+| `DNS_over_drive` | 1.0 → **2.0** | 故事密集 TTS 时压回声 |
+
+> 注意:VM 176~180 的三元组存取**不在本文件**,而在 `tuya_agentic_demo.c`。本文件只有这一处 AEC 覆盖改动。
+
+### B3. `apps/wifi_story_machine/app_music.c` — 两处小改(无 TTS 解码)
+- `app_music_play_netcfg_prompt()`(L3572):播 `NetCfgEnter.mp3`,供 demo.c 配网提示任务周期播报。
+- K6(`KEY_PHOTO`)长按(L4447-4457,`#if CONFIG_TUYA_AGENTIC_ENABLE`):调 `tuya_clear_provision_and_reset()`。K6 短按仍是绘本识别(不动)。
+- KEY_POWER 长按注释(L4396-4400):说明电源键是自锁拨动开关按不出长按,原绑在此的"清配网"已移到 K6。
+- **下行 opus 解码不在本文件**,在 `audio_input.c`(见 B6)。
+
+### B4. `apps/wifi_story_machine/include/app_config.h` — 3 个新增宏(L229-242)
+```c
+#define CONFIG_TUYA_AGENTIC_ENABLE     // 涂鸦 AgenticKit 总开关(控制 Makefile 编入 + K6 重置分支 + DHCP 钩子行为)
+//#define TUYA_DOWNLINK_OPUS_ENABLE    // 下行 TTS opus(默认注释=PCM;opus 解码还在调,有啸叫)
+#define TUYA_BARGE_IN_ENABLE           // 用户打断 TTS 开关(已开启;强依赖 AEC、有竞态、实验性)
+```
+另有 AEC 段一行注释(L358):`CONFIG_AEC_LINEIN_CHANNEL_ENABLE` 硬件回采实测未生效、已回退软件参考(探索项,注释掉)。
+
+### B5. `apps/wifi_story_machine/wifi_app_task.c` — 仅注释
+`WIFI_EVENT_STA_NETWORK_STACK_DHCP_SUCC` 分支(L661-662)留注释:涂鸦流程改为 `tuya_agentic_main` boot 时 `late_initcall` 自启动(它要在 DHCP 前先跑 BLE 配网),**不再挂 DHCP 钩子**——这是与 SDK 原版"DHCP 成功后 thread_fork 启动第三方 LLM demo"(对比 `CONFIG_VOLC_LLM_ENABLE`/`CONFIG_ONESDK_LLM_ENABLE` 写法)最大的架构差异。
+
+### B6. `apps/common/LLM/audio/audio_input.c` + `.h` — 上行采集 + 下行播放桥(承载 opus 解码)
+用 SDK `audio_server` 起 enc(mic→`pcm_cbuff_w`)和 dec(`pcm_cbuff_r`→DAC),双 cbuf 环形缓冲,给 demo.c 提供全部音频接口。TUYA 分支关键点:
+- `AUDIO_RECORD_VOICE_UPLORD_LEN` = **1280**(PCM 16k/16bit/mono 40ms);`_device_get_voice_data` `mdelay(40)` 按帧节拍取数。
+- `audio_recoder_init` 的 `CONFIG_TUYA` 块:`format="pcm"`、bitrate 24000、frame_ms 60;**VAD 阈值调低** `vad_start_threshold=100`(原 150)、`vad_stop_threshold=600`(原 800,省 ~200ms);**AEC** `wideband=1`、`hw_delay_offset=50`、`output_way=1` 硬件回采。
+- **下行 opus 解码**(`audio_player_net_init`,L525-541):`TUYA_DOWNLINK_OPUS_ENABLE` 开时 `dec_type="opus"`、`channel=1`、`sample_rate=16000`(必须显式,置 0 退到 48k 默认→underrun)、`opus_cbr_pktlen=80`(16kbps×40ms/8,GCD 推得 + xiaozhi `TAI_OPUS_FRAME_SIZE_BYTES` 确认)。默认关→`dec_type="pcm"`(稳但拥挤网 32KB/s 易卡)。注释:opus 下行仍在调(啸叫),疑 AC79 opus 解码器与云端编码器不兼容。
+- **下行 opus 帧重组**(`_device_write_voice_data`,L213-253,`TUYA_DL_OPUS_FRAME=80`):TCP 分包会把 CBR opus 帧切到包边界外,直接整包塞会让解码器首次跨帧永久失步→啸叫。故三步:① 上包余数+本包头凑满 80B 才写;② 本包剩余按整 80B 直写;③ 尾部余数存回 `opus_hold`。cbuf 里永远是整帧。
+- PCM 下行缓冲满时**不再 `cbuf_clear`**(会瞬间丢整缓冲→截断),改丢本次新数据 + 计数 `dl_full_cnt` 诊断。
+- 下行播放缓冲 TUYA 分支开到 **64×=1MB(≈32s)**,吸收长答案突发下发,配合 demo.c play-drain-wait(35s > 32s)。
+- `AUDIO_PLAY_VOICE_VOLUME=50`(原 80 太大)。
+
+---
+
+## C. 引入的依赖(原样,未改本地源码)
+
+`apps/common/LLM/tuya_agentic/agentic-kit/` 下,从涂鸦 agentic-kit 复制引入,经甄别(`modules`/`common`/`pal` 下无中文注释、无宿主头 include、无 hack/适配标记)确认**未做本地源码改动**,所有适配都靠 PAL 层 + bool 补丁 + Makefile 完成:
+
+- `modules/rtc-tcp-client/` — 涂鸦开源 RTC TCP 客户端(`tai_*`)
+- `modules/iot-client/` — 涂鸦开源 IoT 客户端(激活/DP/OTA/MQTT)
+- `modules/tuya-ble/` — 涂鸦 BLE 配网协议(仅 `tuya_ble_prov.c` 被编入)
+- `common/` — `tls.c`(基于宿主 mbedTLS)、`rng.c`、`log.c`
+- `third_party/coreHTTP/`、`third_party/coreMQTT/` — AWS 第三方,AWS 原版(跳过甄别)
+
+---
+
+## 排除项(时间戳变化但与涂鸦无关 / 未改)
+
+| 文件 | 时间戳 | 实际情况 |
+|---|---|---|
+| `apps/demo/demo_DevKitBoard/include/app_config.h` | 07-24 | 无任何涂鸦/agentic/中文痕迹,与 wifi_story 版不同源。**非本次改动**(早期实验或 touch),排除 |
+| `apps/wifi_story_machine/app_main.c` | 07-27 | 涂鸦流程绕开 app_main,无 tuya 相关代码。**未实质改动** |
+| `apps/wifi_story_machine/board/wl82/board_7916A.c` | 07-27 | K6→`KEY_PHOTO` 的 AD 阶梯映射是 **SDK 原版**;涂鸦只借用该键,未改本文件 |
+
+---
+
+## 与方案文档(`agentic-kit-integration.md`)的差异
+
+文档是 7-17 早期方案,最终落地(7-26~29)有以下演进:
+
+| 方案文档说法 | 实际落地 |
+|---|---|
+| 不用 BLE 配网,不编 `tuya_ble_prov.c` | **用了 BLE 配网**:新增 `le_net_cfg_tuya.c/.h` + 编入 `tuya_ble_prov.c` |
+| DHCP 成功后 `thread_fork("tuya_agentic")` 启动 | 改为 `late_initcall` **开机自启动**(要在 DHCP 前先跑 BLE 配网) |
+| PAL 骨架 + 文本 demo | demo.c 实际 48KB,远超骨架:含完整配网/激活/barge-in/opus/AEC/能量统计 |
+| — | 新增 barge-in、下行 opus、AEC 调优、VM 三元组持久化(均为文档之后的工作) |
+
+---
+
+## 数据流一句话
+
+`mic → audio_input.c(enc+VAD+AEC)→ pcm_cbuff_w → demo.c _device_get_voice_data → tai_send_audio_chunk(上行 PCM)`;`云端 opus → demo.c on_audio → _device_write_voice_data(80B 帧重组)→ pcm_cbuff_r → audio_input.c dec(opus_cbr_pktlen=80)→ DAC`。barge-in = AEC + VAD + 3 帧能量确认,触发后 `chat_break` + 清 rbuf + 排 stale mic + 1000ms 冷却 + 补发 onset 帧。

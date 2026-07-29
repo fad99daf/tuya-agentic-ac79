@@ -1,0 +1,27 @@
+# 编译产物(防止在本仓内编译时污染)
+*.o
+*.bc
+*.elf
+*.bin
+*.map
+*.depend
+*.layout
+*.obj
+*.lst
+*.sym
+obj/
+objs/
+output/
+build/
+Release/
+cpu/wl82/tools/sdk.elf*
+
+# IDE / 编辑器临时文件
+.vscode/
+.claude/
+*.swp
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db
