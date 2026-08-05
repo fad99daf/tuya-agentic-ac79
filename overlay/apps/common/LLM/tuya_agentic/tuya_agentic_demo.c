@@ -80,6 +80,9 @@ static volatile int g_turn_done;          /* 本轮回复结束(TAI_EVT_END),可
 static volatile int g_barge_in;           /* barge-in 触发:跳过 TTS 后清缓冲/冷却,直接进新一轮(TUYA_BARGE_IN_ENABLE)*/
 static volatile int g_exit;               /* on_disconnect 置位:令语音循环退出 */
 static int g_audio_frame_logged;          /* 下行首帧帧长只打印一次,供核对 opus_cbr_pktlen */
+#ifdef TUYA_SERVER_VAD_ENABLE
+static volatile int g_server_vad_stop;    /* 云端VAD(TAI_EVT_SERVER_VAD)通知停说:上行循环据此收尾。on_event 在 worker 线程置位,主循环读 */
+#endif
 static volatile unsigned int g_barge_cooldown_until; /* barge-in 冷却到期 ms 时间戳;此前的 g_tts_playing 视为老轮在途残响,忽略(0=始终过期) */
 extern unsigned int timer_get_ms(void);   /* system/timer.h,单调 ms */
 /* barge-in 冷却是否已过:过期=可受理新 g_tts_playing 信号(云端真回话/真打断);
@@ -268,12 +271,23 @@ static void on_event(tai_ctx_t *ctx, const tai_event_msg_t *msg, void *ud)
         g_tts_playing = 0;
         printf("[TUYA-AI] === 回答结束 ===\r\n");
     } else if (msg->event_type == TAI_EVT_SERVER_VAD) {
-        printf("[TUYA-AI] server-vad\r\n");
+        /* 云端 VAD 检测到用户停说(endpointing)。TUYA_SERVER_VAD_ENABLE 模式下,
+         * 置位标志让上行循环退出收尾(发 audio_end → 等回复)。开口仍由本地VAD负责。*/
+        printf("[TUYA-AI] server-vad (end of speech)\r\n");
+#ifdef TUYA_SERVER_VAD_ENABLE
+        g_server_vad_stop = 1;
+#endif
     } else if (msg->event_type == TAI_EVT_CHAT_BREAK) {
-        /* 服务端中止 TTS(本地 tai_chat_break 的回执,或云端检测到打断)。中止≠本轮结束,
-         * 不置 g_turn_done——让新一轮的 TAI_EVT_END 来结束。*/
-        printf("[TUYA-AI] chat_break (TTS aborted)\r\n");
+        /* chat_break 有两种来源:
+         * 1) 本地 barge-in 的 tai_chat_break 回执(打断 TTS)
+         * 2) 云端 VAD 检测到说话结束(云端自动下发的打断标识)
+         * 云端确认:开了 asr.enableVad 后,云端判停说只发 chat_break,不发 server-vad。
+         * 所以在 TUYA_SERVER_VAD_ENABLE + 正在上行(说话中) 时,chat_break = 云端判停说。*/
+        printf("[TUYA-AI] chat_break\r\n");
         g_tts_playing = 0;
+#ifdef TUYA_SERVER_VAD_ENABLE
+        g_server_vad_stop = 1;   /* 上行中收到 = 云端VAD判停说; TTS中收到 = barge-in回执(两者都OK) */
+#endif
     } else if (msg->event_type == TAI_EVT_MCP_CMD) {
         /* 最小 MCP 响应:空工具 */
         const char *empty_result =
@@ -336,6 +350,8 @@ void tuya_agentic_demo(void *arg)
     cfg.region = AY; cfg.env = PROD;
     cfg.mqtt_disable_tls = false; cfg.mqtt_auto_connect = 1;
     cfg.cert_bundle_attach = NULL; cfg.cacert = NULL;
+    extern const char *tuya_get_effective_sw_ver(void);
+    cfg.sw_ver = tuya_get_effective_sw_ver();   /* 上报生效版本:VM>源码基线 */
     strncpy((char *)cfg.devid,      TUYA_DEVID,      sizeof(cfg.devid) - 1);
     strncpy((char *)cfg.secret_key, TUYA_SECRET_KEY, sizeof(cfg.secret_key) - 1);
     strncpy((char *)cfg.local_key,  TUYA_LOCAL_KEY,  sizeof(cfg.local_key) - 1);
@@ -367,7 +383,13 @@ void tuya_agentic_demo(void *arg)
 
     /* ⑤ 组装 tai_config */
     static const char SESSION_ATTRS[] = "{\"deviceMcp\":{\"supportCustomMCP\":true}}";
+#ifdef TUYA_SERVER_VAD_ENABLE
+    static const char EVENT_USER_DATA[] =
+        "{\"asr.enableVad\":\"true\","
+        "\"processing.interrupt\":\"true\"}";
+#else
     static const char EVENT_USER_DATA[] = "{\"sys.workflow\":\"asr-llm-tts\"}";
+#endif
 
     tai_config_t tc;
     memset(&tc, 0, sizeof(tc));
@@ -396,7 +418,6 @@ void tuya_agentic_demo(void *arg)
     tai_ctx_t *ctx = tai_ctx_init(mem, &tc);
     if (!ctx) { printf("[TUYA] tai_ctx_init fail\r\n"); pal->free(mem); return; }
 
-    tai_set_log_level(TAI_LOG_WARN);
 
     /* ⑥ 建会话 —— 阶段2 判定点 */
     printf("[TUYA] tai_connect...\r\n");
@@ -538,7 +559,15 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
 #else
     static const char SA[] = "{\"deviceMcp\":{\"supportCustomMCP\":true}}";
 #endif
+#ifdef TUYA_SERVER_VAD_ENABLE
+    /* 云端确认:asr.enableVad 放 chatAttributes,值是字符串"true"(不是布尔)。
+     * sys.workflow / vad_enable / vad_silence_ms 云端不用,已去掉。*/
+    static const char EU[] =
+        "{\"asr.enableVad\":\"true\","
+        "\"processing.interrupt\":\"true\"}";   /* 开启云端打断:检测到说话结束下发chat_break */
+#else
     static const char EU[] = "{\"sys.workflow\":\"asr-llm-tts\"}";
+#endif
     demo_ctx_t dc = {0};
     tai_config_t tc;
     memset(&tc, 0, sizeof(tc));
@@ -556,7 +585,6 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
     if (!mem) return;
     tai_ctx_t *ctx = tai_ctx_init(mem, &tc);
     if (!ctx) { pal->free(mem); return; }
-    tai_set_log_level(TAI_LOG_WARN);
     printf("[TUYA] tai_connect...\r\n");
     if (tai_connect(ctx) != TAI_OK) {
         printf("[TUYA] tai_connect fail\r\n");
@@ -574,11 +602,20 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
     g_turn_done          = 1;          /* 视为"上一轮已结束",直接进入听音 */
     g_exit               = 0;
     g_audio_frame_logged = 0;
-    printf("[TUYA] voice loop ready (local-VAD, opus 16k/mono/60ms/180B)\r\n");
+    printf("[TUYA] voice loop ready (local-VAD, uplink=PCM 16k/mono)"
+#ifdef TUYA_DOWNLINK_OPUS_ENABLE
+            " downlink=opus"
+#else
+            " downlink=pcm"
+#endif
+            "\r\n");
 
     /* ===== 对照实验:文本通道探针(音频流已起,若云端回 TTS 可顺带验证下行播放)=====
      *   文本正常回复 → 会话通,问题锁定在音频上行(云端 ASR 不认我们的 opus)
-     *   文本回空/超时 → 会话或 biz_code/agent 配置问题(语音也跟着废) */
+     *   文本回空/超时 → 会话或 biz_code/agent 配置问题(语音也跟着废)
+     * ⚠️ 默认关闭(TUYA_PROBE_ENABLE 未定义):探针会阻塞 ~2s 等云端文本回复,期间不收音,
+     *   拖慢开机到可对话的延迟。功能已验证通,仅调试会话问题时手动开启。*/
+#ifdef TUYA_PROBE_ENABLE
     {
         const char *probe = "你好";
         printf("[TUYA] PROBE send-text: \"%s\"\r\n", probe);
@@ -593,12 +630,20 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
         }
         _device_wbuf_clear();   /* 探针期间 mic 采到环境音/自身 TTS,清掉再进语音循环 */
     }
+#endif
 
 #define TUYA_OPUS_FRAME_LEN 1280   /* PCM 16k/16bit/mono 40ms = 1280B/帧(原 opus 180B 改 PCM) */
     unsigned char abuf[TUYA_OPUS_FRAME_LEN];
     /* 上行诊断:本轮帧计数/有效帧数 + 空闲排空的底噪基线 */
     unsigned int uplink_frames = 0, uplink_active = 0;
     unsigned int idle_cnt = 0, idle_sum = 0, idle_act_sum = 0;
+#ifdef TUYA_SERVER_VAD_ENABLE
+    /* 云端VAD模式的本地超时兜底:本地VAD连续判静音的帧数计数。
+     * 超过 LOCAL_SILENCE_TIMEOUT_FRAMES 帧强制收尾,防云端SERVER_VAD丢失导致一直上行。
+     * 每帧~40ms,50帧≈2秒持续静音。保留2s给云端VAD足够时间响应(上班后确认云端VAD开通)。*/
+    #define LOCAL_SILENCE_TIMEOUT_FRAMES  50
+    unsigned int silence_frames = 0;
+#endif
 
     while (!g_exit) {
         /* ① 等待:未在播放 TTS 且本地 VAD 检测到开口。
@@ -671,6 +716,10 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
 #endif
         g_turn_done = 0;
         uplink_frames = 0; uplink_active = 0;
+#ifdef TUYA_SERVER_VAD_ENABLE
+        g_server_vad_stop = 0;   /* 清掉上轮残留的云端VAD标志 */
+        silence_frames = 0;       /* 清掉上轮残留的静音兜底计数 */
+#endif
         printf("[TUYA] speak-start: uplink begin (cbuf_level=%u B)\r\n", _device_get_voice_level());
         if (tai_send_audio_start(ctx, TAI_AUDIO_PCM, 1, 16, 16000) != TAI_OK) {
 #ifdef TUYA_BARGE_IN_ENABLE
@@ -710,11 +759,32 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
                 if (fact > 3) uplink_active++;   /* 新度量下 fact=avg|sample|/100;>3 即 avg>300(远超 idle 底噪 avg<50)≈有效话音帧 */
                 printf("[TUYA] uplink f#%u sum=%u act=%u%%\r\n", uplink_frames, fsum, fact);
             }
+#ifdef TUYA_SERVER_VAD_ENABLE
+            /* 云端VAD模式:停说由云端 TAI_EVT_SERVER_VAD 决定(更准),本地只做超时兜底。
+             * 开口仍由本地VAD负责(循环顶部 get_recoder_state),这里只切换"停说"判定。*/
+            if (g_server_vad_stop) {
+                printf("[TUYA] speak-stop: server-vad (frames=%u active=%u)\r\n",
+                       uplink_frames, uplink_active);
+                break;
+            }
+            /* 本地超时兜底:云端VAD事件丢失/延迟时,本地VAD连续判静音超过阈值则强制收尾。
+             * 本地VAD还在说话(=1)就重置计数;持续静音(=0)累积,到50帧(≈2s)兜底。*/
+            if (!get_recoder_state()) {
+                if (++silence_frames > LOCAL_SILENCE_TIMEOUT_FRAMES) {
+                    printf("[TUYA] speak-stop: local timeout fallback (frames=%u)\r\n", uplink_frames);
+                    break;
+                }
+            } else {
+                silence_frames = 0;
+            }
+#else
+            /* 本地VAD模式:本地VAD直接判停说(原逻辑) */
             if (!get_recoder_state()) {     /* enc VAD 已 debounce 判定停说(stop 阈值) */
                 printf("[TUYA] speak-stop: uplink end (frames=%u active=%u)\r\n",
                        uplink_frames, uplink_active);
                 break;
             }
+#endif
         }
         tai_send_audio_end(ctx);
 
@@ -803,12 +873,70 @@ static void tuya_prov_prompt_task(void *arg)
 {
     extern void app_music_play_netcfg_prompt(void);
     while (s_prov_prompt_run) {
+        app_music_play_netcfg_prompt();   /* 先播"请配置网络",别让用户干等 */
         for (int i = 0; i < 300 && s_prov_prompt_run; i++) {
             os_time_dly(10);   /* 100ms × 300 = 30s;100ms 粒度查退出标志 */
         }
-        if (!s_prov_prompt_run) break;
-        app_music_play_netcfg_prompt();
     }
+}
+
+/* 把涂鸦配网/直连用的 ssid/pwd 同步到杰理 wifi 模块的存储(VM)。
+ * 修复 bug:杰理 app_music 的 wifi_return_sta_mode() 会读 VM 里的 ssid 重连,
+ * 若 VM 残留旧 ssid(如换网络/换路由器后),会覆盖涂鸦配的 ssid 导致断网。
+ * 涂鸦每次连 WiFi 后调本函数,让杰理 VM 和涂鸦保持一致,wifi_return_sta_mode
+ * 读到的就是涂鸦配的正确 ssid。*/
+static void tuya_sync_wifi_to_jl(const char *ssid, const char *pwd)
+{
+    if (ssid && ssid[0] && ssid[0] != 0xFF) {
+        wifi_store_mode_info(STA_MODE, (char *)ssid, (char *)pwd);
+        printf("[TUYA] synced wifi to JL store: ssid=%s\r\n", ssid);
+    }
+}
+
+/* ========================================================================= */
+/* 涂鸦 SDK 日志重定向:把 SDK 的日志输出从 fprintf(stderr) 改成 printf(UART)。*/
+/*                                                                           */
+/* 背景:涂鸦 SDK 默认 log_default_handler 用 fprintf(stderr,...) 输出日志。  */
+/*   但杰理 AC791N 的 newlib stdio 没有完整初始化,stderr 指向的 FILE 结构体  */
+/*   悬空(buffer/write 函数指针无效),fprintf(stderr) 会访问野指针崩溃。       */
+/*   之前用 log_set_level(0) 关掉所有日志规避,但导致 SDK 层日志全不可见      */
+/*   (云端VAD配置响应、SERVER_VAD事件接收等都没法调试)。                      */
+/*                                                                           */
+/* 方案:注册自定义 log handler,用 vsnprintf 格式化到本地 buffer 后用 printf  */
+/*   输出。printf 在杰理上重定向到 UART(串口),不会崩溃。加互斥锁防多线程    */
+/*   并发(SDK 的 on_event/on_audio 回调在 worker 线程,主循环在 agentic 线程)。*/
+/*   参考 xiaozhi-esp32 的 iot_log_cb 实现(tuya_protocol.cc:102)。           */
+/* ========================================================================= */
+#include "tai_log.h"   /* log_set_handler / LOG_* 枚举 */
+
+/* 日志级别控制:改这个值即可控制 SDK 日志输出量。
+ * LOG_ERROR=1(只看错误) / LOG_WARN=2(+警告) / LOG_INFO=3(+信息) / LOG_DEBUG=4(全开)
+ * 调试云端VAD等问题时设 LOG_DEBUG;平时设 LOG_WARN 减少刷屏。*/
+/* 日志级别:LOG_INFO(3) 能看到激活/连接/ASR等关键流程,又避开 LOG_DEBUG 里的
+ * %llu(64位格式符,杰理 newlib 可能不支持)包日志路径。调云端VAD等问题时够用。
+ * 如需更详细日志改 LOG_DEBUG(4),但注意 tai_pkt_log.c 有 %llu 可能崩溃。*/
+#define TUYA_SDK_LOG_LEVEL  LOG_INFO
+
+static OS_MUTEX tuya_log_mutex;   /* 防多线程并发输出交叉 */
+static int tuya_log_mutex_inited;
+
+static void tuya_log_redirect(log_level_t level, const char *fmt, va_list args)
+{
+    static const char level_char[] = {'-', 'E', 'W', 'I', 'D'};
+    char lc = (level >= 0 && level <= 4) ? level_char[level] : '?';
+
+    /* 格式化到本地 buffer(vsnprintf 安全:超长截断不溢出)。
+     * SDK 单条日志通常 < 200 字节,256 够用。*/
+    char buf[256];
+    int n = vsnprintf(buf, sizeof(buf), fmt ? fmt : "", args);
+    if (n < 0) return;
+    if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;   /* 截断 */
+
+    /* 互斥锁保护:printf 不是线程安全的,多线程并发会交叉输出。
+     * log_emit 在 worker 线程(回调)和 agentic 线程都可能触发。*/
+    if (tuya_log_mutex_inited) os_mutex_pend(&tuya_log_mutex, 0);
+    printf("[TUYA-SDK/%c] %s\r\n", lc, buf);
+    if (tuya_log_mutex_inited) os_mutex_post(&tuya_log_mutex);
 }
 
 void tuya_agentic_main(void *arg)
@@ -822,13 +950,21 @@ void tuya_agentic_main(void *arg)
     os_time_dly(400);    /* 400 * 10ms = 4s */
 
     printf("===== tuya_agentic_main start =====\r\n");
+    {
+        extern const char *tuya_get_effective_sw_ver(void);
+        printf("[TUYA] fw ver: base=%s effective=%s\r\n",
+               TUYA_FIRMWARE_VERSION, tuya_get_effective_sw_ver());
+    }
 
     if (iot_init(pal) != 0) { printf("[TUYA] iot_init fail\r\n"); return; }
 
-    /* log_default_handler 用 fprintf(stderr,...),AC79 没有 stderr → axi_rd_inv 崩溃。
-     * 直接把 log level 设成 NONE,关掉所有日志,绕过 fprintf。 */
-    extern void log_set_level(int);
-    log_set_level(0); /* LOG_NONE */
+    /* 注册自定义日志 handler:把 SDK 日志从 fprintf(stderr)(会崩溃)重定向到 printf(UART)。
+     * 原来用 log_set_level(0) 关掉所有日志规避崩溃,但导致云端VAD配置响应等无法调试。
+     * 现在用 tuya_log_redirect 替代,既能看日志又不会崩溃。*/
+    os_mutex_create(&tuya_log_mutex);
+    tuya_log_mutex_inited = 1;
+    log_set_handler(tuya_log_redirect);
+    log_set_level(TUYA_SDK_LOG_LEVEL);   /* 见上方宏,改它即可控制日志量 */
 
     char devid[32] = {0}, secret[32] = {0}, localkey[32] = {0};
     /* syscfg_read 成功返回字节数(>0),失败返回负数;之前误写成 ==0,导致每次开机都判
@@ -846,16 +982,12 @@ void tuya_agentic_main(void *arg)
         syscfg_read(VM_TUYA_SSID_IDX, ssid, sizeof(ssid) - 1);
         syscfg_read(VM_TUYA_PWD_IDX,  pwd,  sizeof(pwd) - 1);
         if (ssid[0] != 0 && ssid[0] != 0xFF) {
-            printf("[TUYA] reconnect wifi ssid=%s\r\n", ssid);
-            wifi_enter_sta_mode(ssid, pwd);
-            for (int i = 0; i < 100; i++) {   /* 最多 ~20s,一连上就继续 */
-                if (wifi_get_sta_connect_state() == WIFI_STA_CONNECT_SUCC) {
-                    printf("[TUYA] wifi STA connected, wait DHCP...\r\n");
-                    break;
-                }
-                msleep(200);
-            }
-            msleep(1500);   /* 给 DHCP ~1.5s 拿 IP */
+            /* wifi_app_task 开机已自动连 VM 里的 SSID 并播报过提示音。
+             * 不再重复重连(wifi_get_sta_connect_state 在 wifi_app_task 被杀后返回值不可靠,
+             * 且 wifi_enter_sta_mode 会断开再重连,导致第二次提示音)。直接用现有连接即可。*/
+            printf("[TUYA] wifi already connected by wifi_app_task (ssid=%s)\r\n", ssid);
+            /* 同步到杰理 wifi 存储:防 app_music 的 wifi_return_sta_mode 读到旧 ssid 覆盖 */
+            tuya_sync_wifi_to_jl(ssid, pwd);
         } else {
             /* devid 在但 ssid 空:本修复前烧的设备没存 ssid → 没法联网,直连 AI 必失败。
              * 提示一下,重配一次网即补上 ssid。*/
@@ -867,11 +999,24 @@ void tuya_agentic_main(void *arg)
         cfg.region = AY; cfg.env = PROD;
         cfg.mqtt_disable_tls = false; cfg.mqtt_auto_connect = 1;
         cfg.cert_bundle_attach = NULL; cfg.cacert = NULL;
+        extern const char *tuya_get_effective_sw_ver(void);
+        cfg.sw_ver = tuya_get_effective_sw_ver();   /* 上报生效版本:VM>源码基线 */
         strncpy((char *)cfg.devid, devid, sizeof(cfg.devid) - 1);
         strncpy((char *)cfg.secret_key, secret, sizeof(cfg.secret_key) - 1);
         strncpy((char *)cfg.local_key, localkey, sizeof(cfg.local_key) - 1);
         iot_client_t *iot = iot_client_init(&cfg);
-        if (iot) { tuya_ai_run(pal, iot, localkey); }
+        if (iot) {
+            /* 连 AI 之前先检查涂鸦云 OTA(此时 iot_client 活着,且 AI 会话还没起,
+             * 无并发冲突;OTA 走 ATOP over HTTPS,与 MQTT 串行无妨)。
+             * 有升级则下载烧写并自动重启(不返回);无升级则正常连 AI。*/
+#if TUYA_OTA_ENABLE
+            extern int tuya_ota_check_and_upgrade(iot_client_t *client);
+            if (tuya_ota_check_and_upgrade(iot) == 1) {
+                return;   /* 升级成功,等待自动重启,不再连 AI */
+            }
+#endif
+            tuya_ai_run(pal, iot, localkey);
+        }
         else { printf("[TUYA] iot_client_init fail\r\n"); }
         return;
     }
@@ -901,6 +1046,10 @@ void tuya_agentic_main(void *arg)
     }
     msleep(1500);   /* 关联成功后给 DHCP ~1.5s 拿 IP(实测 DHCP 在 SUCC 后 ~0.4s 完成) */
 
+    /* 同步到杰理 wifi 存储:防 app_music 的 wifi_return_sta_mode 读到旧 ssid 覆盖。
+     * 之前换网络后,杰理 VM 里残留旧 ssid(GJ1)覆盖了涂鸦配的 ssid,导致断网连不上 AI。*/
+    tuya_sync_wifi_to_jl(s_main_creds.ssid, s_main_creds.password);
+
     /* ---- on_boarding 激活 ---- */
     iot_on_boarding_config_t ob;
     memset(&ob, 0, sizeof(ob));
@@ -909,6 +1058,8 @@ void tuya_agentic_main(void *arg)
     strncpy((char *)ob.product_key, TUYA_PRODUCT_KEY, sizeof(ob.product_key) - 1);
     ob.env = PROD; ob.mqtt_disable_tls = false; ob.mqtt_auto_connect = 1; ob.timeout_ms = 30000;
     ob.cert_bundle_attach = NULL; ob.cacert = NULL;
+    extern const char *tuya_get_effective_sw_ver(void);
+    ob.sw_ver = tuya_get_effective_sw_ver();   /* 上报生效版本:VM>源码基线 */
     iot_client_t *iot = iot_client_init_on_boarding_with_token(&ob, s_main_creds.token);
     if (!iot) { printf("[TUYA] on_boarding_with_token fail\r\n"); return; }
     printf("[TUYA] activated, devid=%s\r\n", iot->devid);
@@ -927,9 +1078,24 @@ void tuya_agentic_main(void *arg)
      * on_boarding 已建好 MQTT(涂鸦IoT云,设备上线绑定)。App 判"配网成功"靠它,需保持
      * 几秒让云端同步给 App。之后 tuya_ai_run 会 deinit 断 MQTT 再连 AI(MQTT 与 AI TLS
      * 并发时云端会 SESSION_CLOSE 关掉 AI 会话,必须串行)。
-     * 代价:之后 App 里该设备显示离线(控制暂不可用),但配网已成功、语音能用。 */
-    printf("[TUYA] hold MQTT ~8s for app to confirm provisioning...\r\n");
-    msleep(8000);
+     * 代价:之后 App 里该设备显示离线(控制暂不可用),但配网已成功、语音能用。
+     * ⚠️ 原 8s 过长(配网后用户要干等 8s 才能说话);涂鸦 App 同步配网成功通常 1~2s,
+     *   改 3s 足够,缩短开机到可对话的延迟。*/
+    printf("[TUYA] hold MQTT ~3s for app to confirm provisioning...\r\n");
+    msleep(3000);
+
+    /* ---- 连 AI 之前先检查涂鸦云 OTA(与直连路径保持一致)----
+     * 配网首次激活后云端一般无待升级固件,但保持检查可应对"激活即升级"场景。
+     * 有升级则下载烧写并自动重启;无升级则正常连 AI。*/
+#if TUYA_OTA_ENABLE
+    {
+        extern int tuya_ota_check_and_upgrade(iot_client_t *client);
+        if (tuya_ota_check_and_upgrade(iot) == 1) {
+            printf("===== tuya_agentic_main end (OTA, wait reboot) =====\r\n");
+            return;   /* 升级成功,等待自动重启,不再连 AI */
+        }
+    }
+#endif
 
     /* ---- 连 AI ---- */
     tuya_ai_run(pal, iot, lk);

@@ -662,6 +662,7 @@ c_SRC_FILES := \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/core_mqtt_state.c \
 	../../../../apps/common/LLM/tuya_agentic/pal_ac791n.c \
 	../../../../apps/common/LLM/tuya_agentic/tuya_agentic_demo.c \
+	../../../../apps/common/LLM/tuya_agentic/tuya_ota.c \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya-ble/src/tuya_ble_prov.c \
 	../../../../apps/common/LLM/tuya_agentic/le_net_cfg_tuya.c \
 

@@ -115,10 +115,10 @@
 
 #if defined CONFIG_VOICE_PROMPT_FILE_SAVE_IN_RESERVED_EXPAND_ZONE
 #if defined CONFIG_UI_FILE_SAVE_IN_RESERVED_EXPAND_ZONE
-#define CONFIG_AUDIO_PACKRES_LEN 0x180000
+#define CONFIG_AUDIO_PACKRES_LEN 0x80000
 #define CONFIG_AUDIO_PACKRES_ADR ((__FLASH_SIZE__) - (CONFIG_UI_PACKRES_LEN) - 0x1000 - CONFIG_AUDIO_PACKRES_LEN)
 #else
-#define CONFIG_AUDIO_PACKRES_LEN 0x180000
+#define CONFIG_AUDIO_PACKRES_LEN 0x80000
 #define CONFIG_AUDIO_PACKRES_ADR ((__FLASH_SIZE__) - CONFIG_AUDIO_PACKRES_LEN - 0x1000)
 #endif
 #else
@@ -229,10 +229,10 @@
 #define CONFIG_TUYA_AGENTIC_ENABLE            //涂鸦 AgenticKit(连涂鸦 AI 云,apps/common/LLM/tuya_agentic)
 /* ===== 涂鸦下行 TTS 编码开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下生效)=====
  * 不定义(默认)= PCM:稳定能播,但 16k/16bit/mono=32KB/s,拥挤测试网易卡顿。
- * 定义下面宏 = opus:~2KB/s(1/16 带宽),云端确认支持(codec=111),帧长 80B/16kbps/40ms。
- *   opus 解码目前还在调(啸叫,疑 TCP 分帧重组 / 解码器兼容问题),先留开关切回 PCM。
- *   调 opus 时把下一行注释去掉即可。*/
-// #define TUYA_DOWNLINK_OPUS_ENABLE
+ * 定义下面宏 = opus:~2KB/s(1/16 带宽),云端确认支持(codec=111)。
+ *   实现已调通:CBR 模式 + opus_cbr_pktlen=80 + sample_rate=0(解码器自动 48k 重采样到 DAC)。
+ *   出问题可注释掉切回 PCM。*/
+#define TUYA_DOWNLINK_OPUS_ENABLE
 
 /* ===== 涂鸦 barge-in(用户打断 TTS)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
  * 不定义(默认)= 不支持打断:TTS 期间不上行,简单稳定。
@@ -240,6 +240,28 @@
  *   ⚠️ 强依赖 AEC:TTS 期间也上行,靠 AEC 去掉喇叭回声;AEC 不行则 VAD 被回声误触发→TTS 动辄自断。
  *   ⚠️ 实验性,有竞态(老轮 END 可能让新轮提前结束)。误触发多就关掉先调 AEC。*/
 #define TUYA_BARGE_IN_ENABLE
+
+/* ===== 涂鸦云端 VAD(停说判定)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
+ * 涂鸦语音对话的"开口"永远由本地 VAD(get_recoder_state)负责(云端无法做开口检测)。
+ * 这里控制的是"停说"判定:
+ * 定义(默认)= 云端 VAD:本地VAD开口后持续上行,云端ASR+VAD分析,云端检测到停说
+ *   下发 TAI_EVT_SERVER_VAD 事件 → 设备结束上行。云端模型更强,停说更准。
+ *   带"本地超时兜底":云端事件丢失时,本地VAD持续判静音超2秒则强制收尾。
+ * 不定义 = 本地 VAD:本地VAD直接判停说(get_recoder_state 由1变0即收尾)。
+ *   简单但易误判(话没说好就触发→ASR收空文本)。*/
+#define TUYA_SERVER_VAD_ENABLE
+
+/* ===== 涂鸦云 OTA(固件升级)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
+ * TUYA_FIRMWARE_VERSION:出厂基线版本号(固件编译期写死)。每次发版前改成和涂鸦平台
+ *   上传固件时填的版本号一致,然后编译+出 OTA 包+传平台。
+ *   (跨 OTA 自动持久化版本号已验证不可靠——VM/USER/BTIF/RTC 均会被擦除/覆盖,
+ *   故采用手动版本号方案。)
+ * TUYA_OTA_ENABLE:1=开机连 AI 前检查一次涂鸦云 OTA;0=关闭(不检查)。
+ *   检查到新固件会:播报提示音 -> HTTPS 下载 -> 烧写 flash -> 自动重启。
+ *   实现见 apps/common/LLM/tuya_agentic/tuya_ota.c。*/
+#define TUYA_FIRMWARE_VERSION   "1.0.11"
+#define TUYA_OTA_ENABLE         1
+
 // #define CONFIG_ONESDK_LLM_ENABLE
 // #define CONFIG_SXY_QYAI_ENABLE
 // #define CONFIG_DUER_LC_DEMO_ENABLE           //小度澜川AI对话DEMO
@@ -427,7 +449,7 @@
 #endif
 #endif
 
-#define CONFIG_DOUBLE_BANK_ENABLE           0//1: 双备份方式升级 0:单备份方式升级
+#define CONFIG_DOUBLE_BANK_ENABLE           1//1: 双备份方式升级(OTA 需要) 0:单备份方式升级
 
 #define CONFIG_UPGRADE_FILE_NAME            "update.ufw"
 #define CONFIG_UPGRADE_PATH                 CONFIG_ROOT_PATH\

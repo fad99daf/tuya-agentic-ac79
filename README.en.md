@@ -10,13 +10,15 @@ End-side port of **Tuya agentic-kit** (AI Agent cloud voice chat) onto the **Jie
 
 - **Voice chat** — realtime interaction (ASR + LLM + TTS)
 - **Uplink ASR** — PCM 16k / 16bit / mono (JieLi's opus is a Baidu headerless format that Tuya cannot decode, so uplink stays PCM)
-- **Downlink TTS** — opus (optional, fights stutter on congested networks) / PCM (default, stable)
+- **Downlink TTS** — opus (default, ~2KB/s fights stutter on congested networks) / PCM (optional, stable). Opus now works: CBR + `sample_rate=0` auto-resampling
 - **Barge-in (interrupt)** — AEC + VAD + multi-frame energy confirmation (experimental, depends heavily on AEC)
+- **Cloud VAD end-of-speech** — wakeup is always local VAD; end-of-speech is decided by the cloud `TAI_EVT_SERVER_VAD` (stronger model, more accurate), with a local 2s silence timeout fallback
+- **Tuya cloud OTA** — checks for upgrade before connecting to AI on boot; downloads, flashes, and auto-reboots if a new firmware exists (dual-bank)
 - **Tuya BLE one-click provisioning** — via the "Tuya Smart" App
 - **Persistent credentials** — device triple (devid/secret/localkey) written to VM after activation; direct-connect on later boots
 - **K6 long-press resets provisioning** — clears credentials and re-enters provisioning
 
-> Note: this port does **not** include OTA, image understanding/generation, or device MCP (not implemented on the device side). Cloud AI capabilities depend on the Tuya platform configuration.
+> Note: this port does **not** include image understanding/generation or device MCP (not implemented on the device side). Cloud AI capabilities depend on the Tuya platform configuration.
 
 ---
 
@@ -148,7 +150,7 @@ Edit `apps/wifi_story_machine/include/app_config.h`:
 |---|---|
 | **Tuya App can't find the Bluetooth device** | You flashed the placeholder build; `demo.c` L46-48 still say `YOUR_PID_HERE`. Fill in real PID/uuid/authkey and rebuild |
 | **Provisioning fails after long-press K6** (but works after the reset key) | Soft reset (P33) doesn't fully reset the BT controller like a power cycle. Fixed by stopping BT + delay before reset; if it still happens occasionally, use the reset key (cold boot) or retry |
-| **Downlink TTS has squeal/noise** | opus decoding is still being tuned. Use the default PCM (keep `TUYA_DOWNLINK_OPUS_ENABLE` commented) |
+| **Downlink TTS has squeal/noise** | If opus behaves abnormally, fall back to PCM (comment out `TUYA_DOWNLINK_OPUS_ENABLE`). Opus is now working (CBR + sample_rate=0 auto-resampling) |
 | **Connects then drops (conn nack → timeout) during provisioning** | Usually 2.4G RF interference. Turn off phone WiFi, move closer, retry a few times |
 | **Patch won't apply / line numbers off** | Wrong SDK version. Must be `AC79NN_SDK_V1.2.0` |
 
@@ -156,7 +158,8 @@ Edit `apps/wifi_story_machine/include/app_config.h`:
 
 ## 7. Known issues / notes
 
-- **Downlink opus is still being tuned** (squeal; suspected AC79 opus-decoder vs cloud-encoder incompatibility); PCM is the default.
+- **Downlink opus is now working** (CBR + `sample_rate=0` lets the decoder auto-output 48k and resample to DAC); enabled by default. Earlier `sample_rate=16000` forced alignment caused slow/low-pitched audio, and removing CBR hung the decoder — both fixed.
+- **OTA version is a manual scheme**: `TUYA_FIRMWARE_VERSION` must be updated before each release to match what's filled in on the Tuya platform. Auto-persisting the version across OTA (VM/USER/BTIF/RTC) was verified unreliable, so it's not used.
 - **Barge-in depends heavily on AEC**; experimental with a single mic. Tuning details in [`docs/CHANGES.md`](docs/CHANGES.md).
 - **Version-bound**: this repo only fits `AC79NN_SDK_V1.2.0`. To track a newer official SDK, regenerate the patch.
 

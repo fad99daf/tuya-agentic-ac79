@@ -10,13 +10,15 @@
 
 - **语音对话** — 实时语音交互(ASR + LLM + TTS)
 - **上行 ASR** — PCM 16k / 16bit / mono(杰理 opus 为百度无头格式,涂鸦解不了,故上行固定 PCM)
-- **下行 TTS** — opus(可选,治拥挤网络卡顿)/ PCM(默认,稳定)
+- **下行 TTS** — opus(默认,~2KB/s 治拥挤网络卡顿)/ PCM(可选,稳定)。opus 已调通:CBR + `sample_rate=0` 自动重采样
 - **打断 (barge-in)** — AEC + VAD + 多帧能量确认,用户可随时打断 TTS(实验性,强依赖 AEC)
+- **云端 VAD 停说判定** — 开口永远本地 VAD;停说由云端 `TAI_EVT_SERVER_VAD` 决定(模型更强更准),带本地 2s 静音超时兜底
+- **涂鸦云 OTA** — 开机连 AI 前检查升级,有新固件则下载烧写自动重启(双备份方式)
 - **涂鸦 BLE 一键配网** — 用「涂鸦智能 App」蓝牙配网,速度快
 - **凭据掉电保存** — 设备三元组(devid/secret/localkey)激活后写入 VM,后续开机直连
 - **K6 长按重置配网** — 清除凭据并重新进入配网
 
-> 说明:本端侧实现**不包含** OTA、图片理解/生成、设备 MCP 等功能(端侧未实现)。云端 AI 能力以涂鸦平台配置为准。
+> 说明:本端侧实现**不包含** 图片理解/生成、设备 MCP 等功能(端侧未实现)。云端 AI 能力以涂鸦平台配置为准。
 
 ---
 
@@ -148,7 +150,7 @@ make ac791n_wifi_story_machine
 |---|---|
 | **涂鸦 App 搜不到蓝牙** | 烧的是占位符版,`demo.c` L46-48 还是 `YOUR_PID_HERE`。填入真实 PID/uuid/authkey 重新编译 |
 | **长按 K6 后配网失败**(按 reset 键却成功) | 软复位(P33)不像掉电那样彻底重置 BT 控制器。已在复位前停 BT + 延迟修复;若仍偶发,按 reset 键冷启动或重试 |
-| **下行 TTS 有啸叫/杂音** | opus 解码仍在调试。用默认 PCM(保持 `TUYA_DOWNLINK_OPUS_ENABLE` 注释) |
+| **下行 TTS 有啸叫/杂音** | 若开 opus 后有异常,可切回 PCM(注释掉 `TUYA_DOWNLINK_OPUS_ENABLE`)。当前 opus 已调通(CBR + sample_rate=0 自动重采样) |
 | **配网时连上就断(conn nack → 超时)** | 多为 2.4G 射频干扰。关掉手机 WiFi 再配、靠近设备、多试几次 |
 | **patch 打不上 / 行号错位** | SDK 版本不对。必须 `AC79NN_SDK_V1.2.0` |
 
@@ -156,7 +158,8 @@ make ac791n_wifi_story_machine
 
 ## 7. 已知问题 / 注意
 
-- **下行 opus 仍在调试**(啸叫,疑 AC79 opus 解码器与云端编码器不完全兼容),默认走 PCM。
+- **下行 opus 已调通**(CBR + `sample_rate=0` 让解码器自动输出 48k 重采样到 DAC),默认开启。早期 `sample_rate=16000` 强制对齐会致慢速低沉音、去掉 CBR 会致解码器卡死,均已修复。
+- **OTA 版本号为手动方案**:`TUYA_FIRMWARE_VERSION` 每次发版前要改成与涂鸦平台填的一致。跨 OTA 自动持久化版本号(VM/USER/BTIF/RTC)经验证全部不可靠,故不采用。
 - **barge-in 强依赖 AEC**,单麦环境下属实验性功能,调参细节见 [`docs/CHANGES.md`](docs/CHANGES.md)。
 - **版本绑定**:本仓只适配 `AC79NN_SDK_V1.2.0`。跟随官方 SDK 升级需重新生成 patch。
 
