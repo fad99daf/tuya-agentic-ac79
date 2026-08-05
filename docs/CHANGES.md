@@ -12,8 +12,8 @@
 
 | 类别 | 说明 |
 |---|---|
-| **A. 新建集成模块** | `apps/common/LLM/tuya_agentic/` 下手写的胶水代码(PAL / 配网 / 对话主流程 / bool 补丁) |
-| **B. 改动的 SDK 原有文件** | 6 个:Makefile、user_cfg.c、app_music.c、app_config.h、wifi_app_task.c、audio_input.c/.h |
+| **A. 新建集成模块** | `apps/common/LLM/tuya_agentic/` 下手写的胶水代码(PAL / 配网 / 对话主流程 / bool 补丁 / **OTA 编排**) |
+| **B. 改动的 SDK 原有文件** | 10 个:Makefile、user_cfg.c、app_music.c、app_main.c、app_config.h、wifi_app_task.c、audio_input.c/.h、board_7916A.c、AC791N_...cbp |
 | **C. 引入的依赖(原样,未改)** | 涂鸦开源 `rtc-tcp-client`/`iot-client`/`tuya-ble`/`common` + AWS `coreHTTP`/`coreMQTT` |
 
 ---
@@ -40,7 +40,8 @@
 
 **④ `tuya_ai_run()` 对话循环**
 - **上行 ASR = 固定 PCM**:`tai_send_audio_start(ctx, TAI_AUDIO_PCM, 1, 16, 16000)`,帧长 `TUYA_OPUS_FRAME_LEN=1280`(16k/16bit/mono 40ms)。注释说明:上行**不用** opus——杰理 opus `format_mode=0` 是"百度无头"非标准格式,涂鸦 ASR 解不了会秒回空。
-- **下行 TTS = opus(可选)**:`#ifdef TUYA_DOWNLINK_OPUS_ENABLE` 分支把 `session_attrs` 改成请求 `opus/16k/1`;`on_audio` 前 5 帧核对 `opus_cbr_pktlen`(全一致=CBR)。真正 80B 帧重组在 `audio_input.c`(见 B6)。
+- **下行 TTS = opus(可选)**:`#ifdef TUYA_DOWNLINK_OPUS_ENABLE` 分支把 `session_attrs` 改成请求 `opus/16k/1`;`on_audio` 前 5 帧核对 `opus_cbr_pktlen`(全一致=CBR)。真正的 opus 解码在 `audio_input.c`(见 B6)。
+- **停说判定(云端 VAD,TUYA_SERVER_VAD_ENABLE)**:开口永远由本地 VAD(`get_recoder_state`)负责,这里切换的是"停说"——开云端 VAD 后,上行循环等云端 `TAI_EVT_SERVER_VAD` 事件收尾(云端模型更强,更准);带本地超时兜底(本地 VAD 持续判静音 >2s 强制收尾,防云端事件丢失导致一直上行)。`asr.enableVad:true` 放 `chatAttributes`。
 
 **⑤ Barge-in(打断,TUYA_BARGE_IN_ENABLE)** — 多层防护:
 - **1000ms 冷却**(`TUYA_BARGE_COOLDOWN_MS`/`g_barge_cooldown_until`/`barge_cooldown_expired()`):`chat_break` 后置位冷却,窗口内忽略老轮在途 TTS 残响二次触发误判;差值用 `(int)` 比较抗回绕。
@@ -80,6 +81,14 @@ AC79 上手写的涂鸦 BLE GATT 配网传输层(SDK 原版无):
 - `tuya_bool_compat.h`:作为 **`-include` 强制头**,先 `#define __STDBOOL_H` 让后续任何 `<stdbool.h>` 整体跳过,再提供同款 typedef。
 - 同类型 typedef 重复,clang 作为扩展允许 + Makefile 已 `-w`。C++ 下整段跳过。
 
+### A6. `tuya_ota.c`(11 KB)+ `tuya_ota.h`(2.9 KB)— 涂鸦云 OTA 编排层 ⭐新增
+把涂鸦的云协议(ATOP over HTTPS)和杰理的下载烧写链路(`get_update_data`)串起来。`TUYA_OTA_ENABLE` 门控。
+- **`tuya_ota_check_and_upgrade(client)`**:开机连 AI 之前调(此时 iot_client 活着,无并发冲突)。独立线程 `tuya_ota_chk` 跑 `tuya_iot_ota_check_upgrade`,主线程信号量限时等待 `TUYA_OTA_CHECK_TIMEOUT_MS=7000`——防 ATOP HTTPS 握手失败时卡满 SDK 内部 5s 超时拖慢开机。
+- **流程**:无升级返回 0;有升级→`report_status(UPGRADING)`→播"正在升级"→`get_update_data(url)` 下载烧写(成功则内部 `net_fclose` 自动 `system_reset`)。成功抢在 2s reset 窗口内上报 FINI。
+- **版本号管理(手动方案)**:`tuya_get_effective_sw_ver()` 直接返回 `TUYA_FIRMWARE_VERSION`。跨 OTA 自动持久化版本号(VM/USER/BTIF/RTC)经实测**全部不可靠**(均会被擦除/覆盖),故采用手动方案——每次发版前在 `app_config.h` 改 `TUYA_FIRMWARE_VERSION` 与涂鸦平台一致。`tuya_save_upgraded_sw_ver`/`tuya_clear_upgraded_sw_ver` 保留为空实现(调用方仍调用,不报错)。
+- **`TUYA_OTA_ENABLE=0` 时**提供空实现,调用方无需 `#ifdef` 包裹。
+- **双备份**:配合 `CONFIG_DOUBLE_BANK_ENABLE=1`(两份固件并存 ~4.6MB),`CONFIG_AUDIO_PACKRES_LEN` 缩到 512KB 腾空间。OTA 提示音(OtaInUpdate/OtaSuccess/OtaFailed.mp3)是杰理官方 SDK 自带的,overlay 不含。
+
 ---
 
 ## B. 改动的 SDK 原有文件
@@ -102,18 +111,26 @@ AC79 上手写的涂鸦 BLE GATT 配网传输层(SDK 原版无):
 
 > 注意:VM 176~180 的三元组存取**不在本文件**,而在 `tuya_agentic_demo.c`。本文件只有这一处 AEC 覆盖改动。
 
-### B3. `apps/wifi_story_machine/app_music.c` — 两处小改(无 TTS 解码)
+### B3. `apps/wifi_story_machine/app_music.c` — 三处小改(无 TTS 解码)
 - `app_music_play_netcfg_prompt()`(L3572):播 `NetCfgEnter.mp3`,供 demo.c 配网提示任务周期播报。
+- `app_music_play_ota_prompt(int type)`(L3580):**OTA 提示音播报**,供 `tuya_ota.c` 跨文件调用(0=正在升级 / 1=升级成功 / 2=升级失败)。`app_music_play_voice_prompt` 是 static,需在 app_music.c 内包一层导出。
 - K6(`KEY_PHOTO`)长按(L4447-4457,`#if CONFIG_TUYA_AGENTIC_ENABLE`):调 `tuya_clear_provision_and_reset()`。K6 短按仍是绘本识别(不动)。
 - KEY_POWER 长按注释(L4396-4400):说明电源键是自锁拨动开关按不出长按,原绑在此的"清配网"已移到 K6。
 - **下行 opus 解码不在本文件**,在 `audio_input.c`(见 B6)。
 
-### B4. `apps/wifi_story_machine/include/app_config.h` — 3 个新增宏(L229-242)
+### B4. `apps/wifi_story_machine/include/app_config.h` — 5 个新增宏 + 2 处 flash 布局
 ```c
 #define CONFIG_TUYA_AGENTIC_ENABLE     // 涂鸦 AgenticKit 总开关(控制 Makefile 编入 + K6 重置分支 + DHCP 钩子行为)
-//#define TUYA_DOWNLINK_OPUS_ENABLE    // 下行 TTS opus(默认注释=PCM;opus 解码还在调,有啸叫)
+#define TUYA_DOWNLINK_OPUS_ENABLE      // 下行 TTS opus(已开启;已调通,~2KB/s 治拥挤网卡顿。注释掉切回 PCM)
 #define TUYA_BARGE_IN_ENABLE           // 用户打断 TTS 开关(已开启;强依赖 AEC、有竞态、实验性)
+#define TUYA_SERVER_VAD_ENABLE         // 云端 VAD 停说判定(已开启;开口仍本地VAD,停说由云端TAI_EVT_SERVER_VAD决定,带本地2s超时兜底)
+#define TUYA_OTA_ENABLE         1      // 涂鸦云 OTA(开机连 AI 前检查一次,有升级则下载烧写重启)
+#define TUYA_FIRMWARE_VERSION   "1.0.11"// 出厂基线版本号;发版前改成与涂鸦平台填的一致
 ```
+flash 布局改动(为双备份 OTA 腾空间):
+- `CONFIG_AUDIO_PACKRES_LEN` 0x180000(1.5MB)→ **0x80000(512KB)**:提示音实际只占 222KB,512KB 够装;省下的 1MB 给双备份固件区。
+- `CONFIG_DOUBLE_BANK_ENABLE` 0→**1**:开启双备份升级(OTA 需要,两份固件 ~4.6MB 并存)。
+
 另有 AEC 段一行注释(L358):`CONFIG_AEC_LINEIN_CHANNEL_ENABLE` 硬件回采实测未生效、已回退软件参考(探索项,注释掉)。
 
 ### B5. `apps/wifi_story_machine/wifi_app_task.c` — 仅注释
@@ -123,8 +140,9 @@ AC79 上手写的涂鸦 BLE GATT 配网传输层(SDK 原版无):
 用 SDK `audio_server` 起 enc(mic→`pcm_cbuff_w`)和 dec(`pcm_cbuff_r`→DAC),双 cbuf 环形缓冲,给 demo.c 提供全部音频接口。TUYA 分支关键点:
 - `AUDIO_RECORD_VOICE_UPLORD_LEN` = **1280**(PCM 16k/16bit/mono 40ms);`_device_get_voice_data` `mdelay(40)` 按帧节拍取数。
 - `audio_recoder_init` 的 `CONFIG_TUYA` 块:`format="pcm"`、bitrate 24000、frame_ms 60;**VAD 阈值调低** `vad_start_threshold=100`(原 150)、`vad_stop_threshold=600`(原 800,省 ~200ms);**AEC** `wideband=1`、`hw_delay_offset=50`、`output_way=1` 硬件回采。
-- **下行 opus 解码**(`audio_player_net_init`,L525-541):`TUYA_DOWNLINK_OPUS_ENABLE` 开时 `dec_type="opus"`、`channel=1`、`sample_rate=16000`(必须显式,置 0 退到 48k 默认→underrun)、`opus_cbr_pktlen=80`(16kbps×40ms/8,GCD 推得 + xiaozhi `TAI_OPUS_FRAME_SIZE_BYTES` 确认)。默认关→`dec_type="pcm"`(稳但拥挤网 32KB/s 易卡)。注释:opus 下行仍在调(啸叫),疑 AC79 opus 解码器与云端编码器不兼容。
-- **下行 opus 帧重组**(`_device_write_voice_data`,L213-253,`TUYA_DL_OPUS_FRAME=80`):TCP 分包会把 CBR opus 帧切到包边界外,直接整包塞会让解码器首次跨帧永久失步→啸叫。故三步:① 上包余数+本包头凑满 80B 才写;② 本包剩余按整 80B 直写;③ 尾部余数存回 `opus_hold`。cbuf 里永远是整帧。
+- **下行 opus 解码**(`audio_player_net_init`,L496-512,`TUYA_DOWNLINK_OPUS_ENABLE` 开):`dec_type="opus"`、**`channel=0`**(让解码器自动)、**`sample_rate=0`**(让解码器自动输出 48k,audio_server 自动重采样到 DAC 16k)、`AUDIO_ATTR_OPUS_CBR_PKTLEN_TYPE` + `opus_cbr_pktlen=80`(CBR 模式必须保留,解码器靠它确定帧边界,去掉会卡死)。默认关→`dec_type="pcm"`(稳但拥挤网 32KB/s 易卡)。
+  > **调通历程**:① `sample_rate=16000` + 80B帧重组→啸叫/低沉慢速(48k PCM 按 16k 播);② 去掉 CBR→解码器初始化卡死(audio_server timeout);③ 最终 `sample_rate=0` 自动重采样 + CBR pktlen=80 + 整包直写→**调通,实测云端 codec=111 帧长 400/640B 变长,解码器内部按标准 Opus 帧边界切分**。
+- **下行 opus 整包直写**(`_device_write_voice_data`,L213):云端帧长可变(400B/640B),整包直写 cbuf,**不做帧重组**(早期 80B 重组方案已废弃——解码器内部按标准 Opus 帧边界自行切分)。
 - PCM 下行缓冲满时**不再 `cbuf_clear`**(会瞬间丢整缓冲→截断),改丢本次新数据 + 计数 `dl_full_cnt` 诊断。
 - 下行播放缓冲 TUYA 分支开到 **64×=1MB(≈32s)**,吸收长答案突发下发,配合 demo.c play-drain-wait(35s > 32s)。
 - `AUDIO_PLAY_VOICE_VOLUME=50`(原 80 太大)。
@@ -168,4 +186,4 @@ AC79 上手写的涂鸦 BLE GATT 配网传输层(SDK 原版无):
 
 ## 数据流一句话
 
-`mic → audio_input.c(enc+VAD+AEC)→ pcm_cbuff_w → demo.c _device_get_voice_data → tai_send_audio_chunk(上行 PCM)`;`云端 opus → demo.c on_audio → _device_write_voice_data(80B 帧重组)→ pcm_cbuff_r → audio_input.c dec(opus_cbr_pktlen=80)→ DAC`。barge-in = AEC + VAD + 3 帧能量确认,触发后 `chat_break` + 清 rbuf + 排 stale mic + 1000ms 冷却 + 补发 onset 帧。
+`mic → audio_input.c(enc+VAD+AEC)→ pcm_cbuff_w → demo.c _device_get_voice_data → tai_send_audio_chunk(上行 PCM)`;`云端 opus → demo.c on_audio → _device_write_voice_data(整包直写)→ pcm_cbuff_r → audio_input.c dec(CBR opus_cbr_pktlen=80, sample_rate=0 自动重采样 48k→DAC)→ DAC`。barge-in = AEC + VAD + 3 帧能量确认,触发后 `chat_break` + 清 rbuf + 排 stale mic + 1000ms 冷却 + 补发 onset 帧。停说判定:`TUYA_SERVER_VAD_ENABLE` 时等云端 `TAI_EVT_SERVER_VAD`(本地 2s 静音兜底),否则本地 VAD 直接判停说。OTA = 开机连 AI 前 `tuya_ota_check_and_upgrade`(ATOP 查升级 → 下载烧写 → 自动重启)。

@@ -211,45 +211,16 @@ int _device_write_voice_data(void *data, unsigned int len)
     cbuffer_t *cbuf = (cbuffer_t *)&g_audio_hdl.pcm_cbuff_r;
     if (len > 0) {
 #if defined(CONFIG_TUYA_AGENTIC_ENABLE) && defined(TUYA_DOWNLINK_OPUS_ENABLE)
-        /* 下行 opus 重组(对齐 xiaozhi-esp32 tuya_protocol.cc 的 HandleAudio):云端发 raw
-         * 拼接的 CBR opus,每帧 80B(16kbps/40ms,xiaozhi 源码 TAI_OPUS_FRAME_SIZE_BYTES 确认)。
-         * TCP 分包可能把帧切到包边界外,若直接整包塞 cbuf,解码器首次跨帧就永久失步→啸叫/闷声。
-         * 故攒够整 80B 才写播放 cbuf,余数(<80B)留下包→cbuf 里永远是整帧,AC79 解码器按
-         * opus_cbr_pktlen=80 读绝不跨帧。CBR 帧长固定,整段 TTS 字节数恒为 80 倍数,流结束时
-         * hold 自然排空,不串到下一轮。*/
-        #define TUYA_DL_OPUS_FRAME 80
-        static unsigned char opus_hold[TUYA_DL_OPUS_FRAME];
-        static unsigned int opus_hold_len = 0;
-        const unsigned char *p = (const unsigned char *)data;
-        unsigned int left = len;
-
-        /* ① 上包余数 + 本包头部凑满一帧 */
-        if (opus_hold_len > 0 && left > 0) {
-            unsigned int need = TUYA_DL_OPUS_FRAME - opus_hold_len;
-            unsigned int take = need < left ? need : left;
-            memcpy(opus_hold + opus_hold_len, p, take);
-            opus_hold_len += take;
-            p += take;
-            left -= take;
-            if (opus_hold_len == TUYA_DL_OPUS_FRAME) {
-                if (cbuf_write(cbuf, opus_hold, TUYA_DL_OPUS_FRAME) == 0) {
-                    cbuf_clear(cbuf);
+        /* Opus 下行:云端帧长可变(400B/640B 实测),整包直写 cbuf,不做帧重组。
+         * 杰理 opus 解码器内部按标准 Opus 帧边界自行切分。*/
+        unsigned int write_len = cbuf_write(cbuf, data, len);
+        if (write_len != len) {
+            if (write_len == 0) {
+                static unsigned int dl_full_cnt = 0;
+                if (++dl_full_cnt % 50 == 1) {
+                    printf("[AUDIO] dl cbuf full drop #%u\r\n", dl_full_cnt);
                 }
-                opus_hold_len = 0;
             }
-        }
-        /* ② 本包剩余按整帧直写 cbuf */
-        while (left >= TUYA_DL_OPUS_FRAME) {
-            if (cbuf_write(cbuf, p, TUYA_DL_OPUS_FRAME) == 0) {
-                cbuf_clear(cbuf);
-            }
-            p += TUYA_DL_OPUS_FRAME;
-            left -= TUYA_DL_OPUS_FRAME;
-        }
-        /* ③ 尾部余数(<80B)存回 hold */
-        if (left > 0) {
-            memcpy(opus_hold, p, left);
-            opus_hold_len = left;
         }
 #else
         unsigned int write_len = cbuf_write(cbuf, data, len);
@@ -523,17 +494,17 @@ static void audio_player_net_init()
     req.dec.opus_cbr_pktlen = 180;
 #endif
 #if defined(CONFIG_TUYA_AGENTIC_ENABLE) && defined(TUYA_DOWNLINK_OPUS_ENABLE)
-    /* === opus 下行(TUYA_DOWNLINK_OPUS_ENABLE 开启)=== 调试中(啸叫)。云端回 codec=111 sr=16000,✅支持。
-     * ① channel=1/sample_rate=16000 必须显式对齐(置 0 退到解码器 48k 默认→underrun)。
-     * ② opus_cbr_pktlen=80(16kbps×40ms/8,GCD 推得 + xiaozhi 源码 TAI_OPUS_FRAME_SIZE_BYTES 确认)。
-     * ③ 走 AUDIO_ATTR_OPUS_CBR_PKTLEN_TYPE(百度无头 CBR)。
-     * ⚠️啸叫待解:已加 _device_write_voice_data 帧重组(对齐 xiaozhi),仍啸叫则疑 AC79 opus 解码器
-     *   与云端编码器不兼容,明天看 __opus_input read 返回值定位。*/
+    /* === opus 下行 ===
+     * ★ sample_rate=0:让解码器自动输出(内部 48k),audio_server 自动重采样到 DAC。
+     *   之前 sample_rate=16000 导致 48k PCM 按 16k 播 → 3倍慢速低沉音。
+     * ★ CBR 模式必须保留:杰理 opus 解码器靠 CBR pktlen 确定帧边界,去掉会卡死。
+     * ★ channel=0:让解码器自动(参考 twetalk)。
+     * ★ opus_cbr_pktlen=80:16kbps×40ms/8。*/
     req.dec.dec_type        = "opus";
-    req.dec.channel         = 1;
-    req.dec.sample_rate     = 16000;
+    req.dec.channel         = 0;
+    req.dec.sample_rate     = 0;     /* ★ 自动:让解码器输出 48k,重采样到 DAC 16k */
     req.dec.attr           |= AUDIO_ATTR_OPUS_CBR_PKTLEN_TYPE;
-    req.dec.opus_cbr_pktlen = 80;    /* GCD=80;16kbps×40ms/8 */
+    req.dec.opus_cbr_pktlen = 80;
 #elif defined(CONFIG_TUYA_AGENTIC_ENABLE)
     /* === PCM 下行(默认)=== 稳定能播,但 16k=32KB/s 拥挤测试网易卡顿。channel/sample_rate 沿用上面
      * 已设的 CHANNEL(1)/SAMPLE_RATE(16k)。云端实测回 codec=101(PCM)。开 TUYA_DOWNLINK_OPUS_ENABLE 切 opus。*/

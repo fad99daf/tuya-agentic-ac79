@@ -1586,7 +1586,8 @@
 <Unit filename="../../../../lib/server/version.z.S" />
 <Unit filename="../../../../lib/utils/version.z.S" />
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/pal_ac791n.c"><Option compilerVar="CC" /></Unit>
-<Unit filename="../../../../apps/common/LLM/tuya_agentic/tuya_agentic_demo.c"><Option compilerVar="CC" /></Unit>
+	<Unit filename="../../../../apps/common/LLM/tuya_agentic/tuya_agentic_demo.c"><Option compilerVar="CC" /></Unit>
+	<Unit filename="../../../../apps/common/LLM/tuya_agentic/tuya_ota.c"><Option compilerVar="CC" /></Unit>
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/le_net_cfg_tuya.c"><Option compilerVar="CC" /></Unit>
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_attrs.c"><Option compilerVar="CC" /></Unit>
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_client.c"><Option compilerVar="CC" /></Unit>

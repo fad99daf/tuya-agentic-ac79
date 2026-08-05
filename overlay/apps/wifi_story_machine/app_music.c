@@ -3574,6 +3574,20 @@ void app_music_play_netcfg_prompt(void)
     app_music_play_voice_prompt("NetCfgEnter.mp3", NULL);
 }
 
+/* 涂鸦 OTA 提示音播报(供 tuya_ota.c 跨文件调用;照搬 app_music_play_netcfg_prompt
+ * 的导出模式——app_music_play_voice_prompt 是 static,需在 app_music.c 内包一层导出)。
+ * type: 0=正在升级(OtaInUpdate.mp3) 1=升级成功(OtaSuccess.mp3) 2=升级失败(OtaFailed.mp3) */
+void app_music_play_ota_prompt(int type)
+{
+    const char *fname = "OtaInUpdate.mp3";
+    if (type == 1) {
+        fname = "OtaSuccess.mp3";
+    } else if (type == 2) {
+        fname = "OtaFailed.mp3";
+    }
+    app_music_play_voice_prompt(fname, NULL);
+}
+
 /*
  * ****************************绘本识别*************************************
  */
