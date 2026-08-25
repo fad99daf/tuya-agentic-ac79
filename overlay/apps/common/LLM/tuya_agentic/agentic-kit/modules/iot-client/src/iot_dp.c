@@ -882,11 +882,17 @@ int iot_dp_schema_check_update(iot_client_t *client)
     uint16_t port = IOT_DEFAULT_PORT;
     iot_client_resolve_atop_host(client, host, sizeof(host), &port);
 
+    /* When the device has no schema body in memory (direct-connect restart path:
+     * only schema_id was restored, not the full schema JSON), pass version="0"
+     * to force the cloud to return the full schema. An empty version is treated
+     * by some cloud deployments as "already up to date" -> no schema returned. */
+    const char *req_version = (!client->schema || client->schema[0] == '\0') ? "0" : "";
+
     schema_newest_request_t req = {
         .devid     = client->devid,
         .key       = client->secret_key,
         .schema_id = client->schema_id,
-        .version   = "",
+        .version   = req_version,
         .node_id   = NULL,
         .host      = host[0] ? host : NULL,
         .port      = port,

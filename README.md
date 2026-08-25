@@ -12,7 +12,9 @@
 - **上行 ASR** — PCM 16k / 16bit / mono(杰理 opus 为百度无头格式,涂鸦解不了,故上行固定 PCM)
 - **下行 TTS** — opus(默认,~2KB/s 治拥挤网络卡顿)/ PCM(可选,稳定)。opus 已调通:CBR + `sample_rate=0` 自动重采样
 - **打断 (barge-in)** — AEC + VAD + 多帧能量确认,用户可随时打断 TTS(实验性,强依赖 AEC)
-- **云端 VAD 停说判定** — 开口永远本地 VAD;停说由云端 `TAI_EVT_SERVER_VAD` 决定(模型更强更准),带本地 2s 静音超时兜底
+- **云端 VAD 停说判定** — 开口永远本地 VAD;停说由云端事件决定(TAI 2.1 协议经 ChatBreak 通知停说,代码兼容处理 ServerVad),带本地 2s 静音超时兜底
+- **MQTT 常驻 + DP 下行** — MQTT 与 AI 的 TLS 各自独立连接并存,`tuya_mqtt_ka` 线程维持心跳收 DP 下行;App 里设备保持在线,云端下发的 DP/MCP 命令实时可收(`on_dp_downlink` / `on_event`)
+- **TTS 首字预蓄水** — 每轮 TTS 开头先攒 ~160ms 音频再喂解码器,治首帧短包 underrun 卡顿
 - **涂鸦云 OTA** — 开机连 AI 前检查升级,有新固件则下载烧写自动重启(双备份方式)
 - **涂鸦 BLE 一键配网** — 用「涂鸦智能 App」蓝牙配网,速度快
 - **凭据掉电保存** — 设备三元组(devid/secret/localkey)激活后写入 VM,后续开机直连
@@ -50,7 +52,7 @@
 1. 在平台**创建产品**,获得 **产品 PID**
 2. 为产品配置 **AI Agent**(系统提示词、TTS 语音类型、语言等)
 3. **领取测试授权码**(uuid + authkey)
-4. 把 PID / uuid / authkey 填入 `tuya_agentic_demo.c` 第 46~48 行(见下文「快速开始」第 4 步)
+4. 把 PID / uuid / authkey 填入 `tuya_agentic_demo.c` `YOUR_PID_HERE` 处(文件内搜索定位)(见下文「快速开始」第 4 步)
 
 > 测试阶段可在平台免费领取少量授权码;量产需联系涂鸦商务。
 
@@ -74,7 +76,7 @@ bash ../tuya-agentic-ac79/apply.sh .
 #    ..\tuya-agentic-ac79\apply.bat .
 
 # 4) 填你自己的涂鸦凭证:编辑 SDK 里
-#    apps/common/LLM/tuya_agentic/tuya_agentic_demo.c 第 46~48 行
+#    apps/common/LLM/tuya_agentic/tuya_agentic_demo.c `YOUR_PID_HERE` 处(文件内搜索定位)
 #    (仓库里是占位符,见下文「涂鸦凭证」)
 
 # 5) 编译
@@ -101,7 +103,7 @@ make ac791n_wifi_story_machine
 
 ## 3. 涂鸦凭证
 
-合并后,在 `apps/common/LLM/tuya_agentic/tuya_agentic_demo.c` **第 46~48 行**填**你自己**的涂鸦产品三件套。仓库里是占位符(**不含任何作者私有凭证**),请替换:
+合并后,在 `apps/common/LLM/tuya_agentic/tuya_agentic_demo.c` **`YOUR_PID_HERE` 处(文件内搜索定位)**填**你自己**的涂鸦产品三件套。仓库里是占位符(**不含任何作者私有凭证**),请替换:
 
 ```c
 #define TUYA_PRODUCT_KEY    "YOUR_PID_HERE"      /* PID:     涂鸦 IoT 平台 → 你的产品 → 产品ID */
@@ -148,7 +150,7 @@ make ac791n_wifi_story_machine
 
 | 现象 | 原因 / 解决 |
 |---|---|
-| **涂鸦 App 搜不到蓝牙** | 烧的是占位符版,`demo.c` L46-48 还是 `YOUR_PID_HERE`。填入真实 PID/uuid/authkey 重新编译 |
+| **涂鸦 App 搜不到蓝牙** | 烧的是占位符版,`demo.c` 里还是 `YOUR_PID_HERE`。填入真实 PID/uuid/authkey 重新编译 |
 | **长按 K6 后配网失败**(按 reset 键却成功) | 软复位(P33)不像掉电那样彻底重置 BT 控制器。已在复位前停 BT + 延迟修复;若仍偶发,按 reset 键冷启动或重试 |
 | **下行 TTS 有啸叫/杂音** | 若开 opus 后有异常,可切回 PCM(注释掉 `TUYA_DOWNLINK_OPUS_ENABLE`)。当前 opus 已调通(CBR + sample_rate=0 自动重采样) |
 | **配网时连上就断(conn nack → 超时)** | 多为 2.4G 射频干扰。关掉手机 WiFi 再配、靠近设备、多试几次 |
