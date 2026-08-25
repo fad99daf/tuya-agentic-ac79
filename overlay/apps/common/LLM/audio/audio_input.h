@@ -63,6 +63,8 @@ int _device_write_voice_data(void *data, unsigned int len);
 int _device_get_voice_data(void *data, unsigned int max_len);
 void _device_wbuf_clear(void);   /* 清录音 cbuf:每轮对话开始前清掉轮间积压的旧音频 */
 unsigned int _device_get_voice_level(void);  /* 录音 cbuf 当前数据量(字节),诊断用 */
+void _device_rbuf_clear(void);   /* 清播放 cbuf:barge-in 打断 TTS 时清掉残留音频 */
+void tts_prebuffer_arm(void);    /* TTS 本轮预蓄水:on_audio 收到 START 帧时调用 */
 void audio_stream_init(int sample_rate, int bit_dept, int channel_num);
 void start_audio_stream(void);
 void stop_audio_stream(void);

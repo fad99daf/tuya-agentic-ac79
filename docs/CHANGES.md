@@ -35,7 +35,7 @@
 
 **③ `tuya_agentic_main()` 启动流程**
 - **直连路径**(VM176 有 devid):读三元组 + ssid/pwd → `wifi_enter_sta_mode` → 等 DHCP → `iot_client_init` → `tuya_ai_run`
-- **首次配网路径**(无 devid):播"请配置网络"语音 → `tuya_ble_netcfg_start`(BLE 阻塞等 App 下发 ssid/pwd/token)→ 停 BLE 释放 RAM → 连 WiFi → `iot_client_init_on_boarding_with_token` 激活 → **写 176~180** → hold MQTT 8s 让 App 确认配网成功 → deinit MQTT 再连 AI(MQTT 与 AI TLS 并发云端会 SESSION_CLOSE,必须串行)→ `tuya_ai_run`
+- **首次配网路径**(无 devid):播"请配置网络"语音 → `tuya_ble_netcfg_start`(BLE 阻塞等 App 下发 ssid/pwd/token)→ 停 BLE 释放 RAM → 连 WiFi → `iot_client_init_on_boarding_with_token` 激活 → **写 176~182**(三元组+WiFi 凭据+DP schema_id)→ hold MQTT ~3s 让 App 确认配网成功 → 注册 DP 下行回调 → `tuya_ai_run`(**MQTT 常驻**:与 AI 的 TLS 是各自独立 TCP 连接可并存;`tuya_mqtt_ka` 线程每 5s `iot_client_process` 维持心跳并收 DP 下行,App 里设备保持在线可控制)
 - **历史 bug 修复**:`syscfg_read` 返回值判断从 `==0`(误判每次重配)改为 `>0`
 
 **④ `tuya_ai_run()` 对话循环**

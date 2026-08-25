@@ -12,7 +12,9 @@ End-side port of **Tuya agentic-kit** (AI Agent cloud voice chat) onto the **Jie
 - **Uplink ASR** — PCM 16k / 16bit / mono (JieLi's opus is a Baidu headerless format that Tuya cannot decode, so uplink stays PCM)
 - **Downlink TTS** — opus (default, ~2KB/s fights stutter on congested networks) / PCM (optional, stable). Opus now works: CBR + `sample_rate=0` auto-resampling
 - **Barge-in (interrupt)** — AEC + VAD + multi-frame energy confirmation (experimental, depends heavily on AEC)
-- **Cloud VAD end-of-speech** — wakeup is always local VAD; end-of-speech is decided by the cloud `TAI_EVT_SERVER_VAD` (stronger model, more accurate), with a local 2s silence timeout fallback
+- **Cloud VAD end-of-speech** — wakeup is always local VAD; end-of-speech is decided by the cloud (TAI 2.1 signals it via ChatBreak; ServerVad is also handled for compatibility), with a local 2s silence timeout fallback
+- **Persistent MQTT + DP downlink** — MQTT and the AI TLS connection are independent TCP links that coexist; a `tuya_mqtt_ka` thread keeps the heartbeat and receives DP downlink. The device stays online in the App, and cloud DP/MCP commands arrive in real time (`on_dp_downlink` / `on_event`)
+- **TTS first-byte prebuffering** — buffers ~160ms of audio at the start of each TTS turn before feeding the decoder, fixing first-frame underrun stutter
 - **Tuya cloud OTA** — checks for upgrade before connecting to AI on boot; downloads, flashes, and auto-reboots if a new firmware exists (dual-bank)
 - **Tuya BLE one-click provisioning** — via the "Tuya Smart" App
 - **Persistent credentials** — device triple (devid/secret/localkey) written to VM after activation; direct-connect on later boots
@@ -50,7 +52,7 @@ Rough flow:
 1. **Create a product** → get the **Product PID**
 2. Configure the **AI Agent** for the product (system prompt, TTS voice, language, etc.)
 3. **Claim test auth codes** (uuid + authkey)
-4. Fill PID / uuid / authkey into `tuya_agentic_demo.c` lines 46–48 (see "Quick start" step 4)
+4. Fill PID / uuid / authkey into `tuya_agentic_demo.c` (search for `YOUR_PID_HERE`; see "Quick start" step 4)
 
 > A small number of auth codes can be claimed for free during testing; for mass production contact Tuya sales.
 
@@ -74,7 +76,7 @@ bash ../tuya-agentic-ac79/apply.sh .
 #    ..\tuya-agentic-ac79\apply.bat .
 
 # 4) Fill in your own Tuya credentials: edit
-#    apps/common/LLM/tuya_agentic/tuya_agentic_demo.c lines 46–48
+#    apps/common/LLM/tuya_agentic/tuya_agentic_demo.c search for `YOUR_PID_HERE`
 #    (repo ships placeholders, see "Tuya credentials" below)
 
 # 5) Build
@@ -101,7 +103,7 @@ After merging, `apps/common/LLM/tuya_agentic/` holds the integration code, and `
 
 ## 3. Tuya credentials
 
-After merging, fill in **your own** Tuya product triple at **lines 46–48** of `apps/common/LLM/tuya_agentic/tuya_agentic_demo.c`. The repo ships placeholders (**no real credentials included**) — replace them:
+After merging, fill in **your own** Tuya product triple in `apps/common/LLM/tuya_agentic/tuya_agentic_demo.c` (**search for `YOUR_PID_HERE`**). The repo ships placeholders (**no real credentials included**) — replace them:
 
 ```c
 #define TUYA_PRODUCT_KEY    "YOUR_PID_HERE"      /* PID:     Tuya IoT platform -> your product -> Product ID */
@@ -148,7 +150,7 @@ Edit `apps/wifi_story_machine/include/app_config.h`:
 
 | Symptom | Cause / Fix |
 |---|---|
-| **Tuya App can't find the Bluetooth device** | You flashed the placeholder build; `demo.c` L46-48 still say `YOUR_PID_HERE`. Fill in real PID/uuid/authkey and rebuild |
+| **Tuya App can't find the Bluetooth device** | You flashed the placeholder build; `demo.c` still says `YOUR_PID_HERE`. Fill in real PID/uuid/authkey and rebuild |
 | **Provisioning fails after long-press K6** (but works after the reset key) | Soft reset (P33) doesn't fully reset the BT controller like a power cycle. Fixed by stopping BT + delay before reset; if it still happens occasionally, use the reset key (cold boot) or retry |
 | **Downlink TTS has squeal/noise** | If opus behaves abnormally, fall back to PCM (comment out `TUYA_DOWNLINK_OPUS_ENABLE`). Opus is now working (CBR + sample_rate=0 auto-resampling) |
 | **Connects then drops (conn nack → timeout) during provisioning** | Usually 2.4G RF interference. Turn off phone WiFi, move closer, retry a few times |

@@ -35,12 +35,24 @@ int  _device_get_voice_data(void *data, unsigned int max_len);
 int  _device_write_voice_data(void *data, unsigned int len);
 void _device_wbuf_clear(void);
 void _device_rbuf_clear(void);          /* 清下行播放 cbuf:barge-in 时立刻停 TTS */
+void tts_prebuffer_arm(void);           /* TTS 本轮预蓄水:on_audio 收到 START 帧时调用 */
 void audio_stream_init(int sample_rate, int bit_dept, int channel_num);
 void start_audio_stream(void);
 void stop_audio_stream(void);
 int  get_recoder_state(void);
 unsigned int _device_get_voice_level(void);   /* 录音 cbuf 水位,诊断上行是否丢话头 */
 unsigned int _device_get_play_level(void);    /* 下行播放 cbuf 水位:排空≈DAC 播完 */
+
+/* ===== 上行延迟诊断开关(定位"打断不佳"用)=====
+ * 打开后在 tai_send_audio_chunk 前后打时间戳,超 UPLINK_LAT_WARN_MS 才打印(避免刷屏)。
+ * 同时打印 send 期间的 mic cbuf 水位变化,判断"send 慢→堆积→丢音"是否成立。
+ * 以及 send 发生时 TTS 是否在播(锁竞争假说: TTS drain 期间 worker 频繁持 yield_mutex)。
+ * 用法: 定位上行延迟/丢音问题时打开(取消下一行注释),默认关闭。*/
+/* #define TUYA_UPLINK_LATENCY_DEBUG */
+#ifdef TUYA_UPLINK_LATENCY_DEBUG
+  #define UPLINK_LAT_WARN_MS     30      /* send 单帧耗时超过此值才打印(正常 ~5-15ms) */
+  #define UPLINK_LAT_CBUF_WARN   2560    /* cbuf 水位超过此值(2 帧=80ms)才告警 */
+#endif
 
 /* === 产品三件套(涂鸦 IoT 平台创建产品时获得,构建期固定)===(前端填这个)*/
 #define TUYA_PRODUCT_KEY    "YOUR_PID_HERE"              /* PID */
@@ -234,6 +246,74 @@ static int parse_token(const char *raw_token, tai_conn_params_t *p)
 /* ------------------------------------------------------------------------- */
 /* TAI 回调(均在 SDK worker 线程触发)                                       */
 /* ------------------------------------------------------------------------- */
+/* MQTT 下行消息回调(MQTT 常驻后收 DP/控制命令)。
+ * 涂鸦平台下发的 DP 在这里收到(topic=smart/device/in/{devid},data 是加密后的 JSON)。
+ * agentic-kit 的 iot_client 已解密,data 是明文 JSON。打印完整内容看 DP 值。*/
+static void on_mqtt_message(const char *topic, size_t topic_len,
+                            const uint8_t *data, size_t data_len)
+{
+    printf("[TUYA-MQTT] topic=%.*s len=%u: %.*s\r\n",
+           (int)(topic_len < 64 ? topic_len : 64), topic,
+           (unsigned)data_len,
+           (int)(data_len < 512 ? data_len : 512),
+           data ? (const char *)data : "(null)");
+}
+
+/* MQTT 心跳维持线程(MQTT 常驻模式)。 */
+static void tuya_mqtt_keepalive_task(void *arg)
+{
+    iot_client_t *iot = (iot_client_t *)arg;
+    if (!iot) return;
+    while (!g_exit) {
+        iot_client_process(iot, 0);
+        os_time_dly(500);
+    }
+}
+
+/* DP 下行回调:云端下发 DP 值时触发(如说"音量调到20"→云端识别后下发 DP)。
+ * dp_id:涂鸦平台配的 DP 点编号(如 102)
+ * value:DP 值(按 type 区分 bool/int/string/enum/raw)。
+ * 指针仅在回调期间有效,需要保留请拷贝。*/
+#include "iot_dp.h"
+void on_dp_downlink(uint8_t dp_id, const iot_dp_value_t *value, void *user_data)
+{
+    (void)user_data;
+    if (!value) { printf("[TUYA-DP] dp=%u (null value)\r\n", dp_id); return; }
+    switch (value->type) {
+    case IOT_DP_TYPE_BOOL:
+        printf("[TUYA-DP] dp=%u bool=%d\r\n", dp_id, value->value.boolean ? 1 : 0);
+        break;
+    case IOT_DP_TYPE_VALUE:
+        printf("[TUYA-DP] dp=%u value=%d\r\n", dp_id, value->value.integer);
+        break;
+    case IOT_DP_TYPE_STRING:
+        printf("[TUYA-DP] dp=%u string=%s\r\n", dp_id, value->value.string ? value->value.string : "(null)");
+        break;
+    case IOT_DP_TYPE_ENUM:
+        printf("[TUYA-DP] dp=%u enum=%d\r\n", dp_id, value->value.enum_index);
+        break;
+    case IOT_DP_TYPE_RAW:
+        printf("[TUYA-DP] dp=%u raw len=%u\r\n", dp_id, (unsigned)value->value.raw.len);
+        break;
+    default:
+        printf("[TUYA-DP] dp=%u type=%d(unknown)\r\n", dp_id, value->type);
+        break;
+    }
+}
+
+/* DP schema 更新回调:从云端拉到 DP schema 时触发。
+ * schema_id:版本标识(用于增量查询)
+ * new_schema:DP schema JSON(含 DP id/类型/范围等,设备侧据此解析 DP 下发)*/
+void on_dp_schema_update(const char *schema_id, const char *new_schema, void *user_data)
+{
+    (void)user_data;
+    printf("[TUYA-DP] schema updated: id=%s\r\n", schema_id ? schema_id : "(null)");
+    if (new_schema) {
+        printf("[TUYA-DP] schema: %.512s\r\n", new_schema);  /* 最多打 512 字节 */
+    }
+}
+
+/* ------------------------------------------------------------------------- */
 static void on_text(tai_ctx_t *ctx, const tai_text_msg_t *msg, void *ud)
 {
     (void)ctx; (void)ud;
@@ -248,6 +328,14 @@ static void on_audio(tai_ctx_t *ctx, const tai_audio_msg_t *msg, void *ud)
     }
     /* 任意下行帧到达即视为 TTS 正在播放;END 显式清(TAI_EVT_END 再兜底清一次) */
     g_tts_playing = (msg->stream_flag == TAI_STREAM_END) ? 0 : 1;
+
+    /* 本轮 TTS START 帧:清播放 cbuf(上一轮残留)+ 触发预蓄水(首字抗卡顿)。
+     * 预蓄水:本轮首次 fread 会等 cbuf 攒够 TTS_PREBUFFER_BYTES 再喂解码器,
+     * 避免首帧 80B 直接播→40ms underrun 卡顿。START 才触发,后续帧不动。*/
+    if (msg->stream_flag == TAI_STREAM_START) {
+        _device_rbuf_clear();
+        tts_prebuffer_arm();
+    }
 #ifdef TUYA_DOWNLINK_OPUS_ENABLE
     if (g_audio_frame_logged < 5) {
         /* 打印前 5 帧 len:核对 opus_cbr_pktlen。全一致=CBR(该值即每帧字节);忽大忽小=云端非 CBR */
@@ -289,6 +377,12 @@ static void on_event(tai_ctx_t *ctx, const tai_event_msg_t *msg, void *ud)
         g_server_vad_stop = 1;   /* 上行中收到 = 云端VAD判停说; TTS中收到 = barge-in回执(两者都OK) */
 #endif
     } else if (msg->event_type == TAI_EVT_MCP_CMD) {
+        /* MCP 命令:云端智能体识别意图后下发(如自定义DP"运动一下")。
+         * 数据在 msg->data(JSON-RPC 格式),含 method/params 等。
+         * 这里打印完整内容,看云端有没有下发 DP 及其值。*/
+        printf("[TUYA-MCP] recv len=%u: %.*s\r\n",
+               (unsigned)msg->len, (int)(msg->len < 512 ? msg->len : 512),
+               msg->data ? (const char *)msg->data : "(null)");
         /* 最小 MCP 响应:空工具 */
         const char *empty_result =
             "{\"jsonrpc\":\"2.0\",\"id\":1,"
@@ -350,8 +444,10 @@ void tuya_agentic_demo(void *arg)
     cfg.region = AY; cfg.env = PROD;
     cfg.mqtt_disable_tls = false; cfg.mqtt_auto_connect = 1;
     cfg.cert_bundle_attach = NULL; cfg.cacert = NULL;
+    cfg.message_callback = on_mqtt_message;   /* MQTT 常驻:收 DP 下行 */
     extern const char *tuya_get_effective_sw_ver(void);
     cfg.sw_ver = tuya_get_effective_sw_ver();   /* 上报生效版本:VM>源码基线 */
+
     strncpy((char *)cfg.devid,      TUYA_DEVID,      sizeof(cfg.devid) - 1);
     strncpy((char *)cfg.secret_key, TUYA_SECRET_KEY, sizeof(cfg.secret_key) - 1);
     strncpy((char *)cfg.local_key,  TUYA_LOCAL_KEY,  sizeof(cfg.local_key) - 1);
@@ -379,16 +475,24 @@ void tuya_agentic_demo(void *arg)
     if (cp.biz_tag  == 0) cp.biz_tag  = 119;
     printf("[TUYA] TAI server: %s:%u (SNI %s)\r\n", cp.host, cp.port, cp.tls_sni);
     free(token);
-    iot_client_deinit(iot);
-
-    /* ⑤ 组装 tai_config */
+    /* MQTT 常驻:不再 deinit。保留 iot_client 实例让 MQTT 保持连接,
+     * 用于接收云端 DP 下行(如自定义DP"运动一下")。
+     * iot 和 MQTT 连接的生命周期现在贯穿整个 AI 对话期间。
+     * 注意:iot 实例不能在本函数结束后被释放,需要保持可达——
+     *   配网路径里 iot 是局部变量,本函数返回后栈释放。但 iot_client_init
+     *   内部已把 PAL/连接存到全局,deinit 才会断。不 deinit = MQTT 不断。
+     *   如果出问题(SESSION_CLOSE),改回 deinit 即可。*/
+    /* iot_client_deinit(iot); */
     static const char SESSION_ATTRS[] = "{\"deviceMcp\":{\"supportCustomMCP\":true}}";
 #ifdef TUYA_SERVER_VAD_ENABLE
     static const char EVENT_USER_DATA[] =
         "{\"asr.enableVad\":\"true\","
+        "\"tts.alternate\":\"true\","
         "\"processing.interrupt\":\"true\"}";
 #else
-    static const char EVENT_USER_DATA[] = "{\"sys.workflow\":\"asr-llm-tts\"}";
+    static const char EVENT_USER_DATA[] =
+        "{\"sys.workflow\":\"asr-llm-tts\","
+        "\"tts.alternate\":\"true\"}";
 #endif
 
     tai_config_t tc;
@@ -461,6 +565,8 @@ void tuya_agentic_demo(void *arg)
 #define VM_TUYA_LOCALKEY_IDX  178
 #define VM_TUYA_SSID_IDX      179   /* 直连路径开机重连 WiFi 用(配网时一并存)*/
 #define VM_TUYA_PWD_IDX       180
+#define VM_TUYA_SCHEMAID_IDX  181   /* DP schema_id(激活时云端返回,DP 下行解析需要)*/
+#define VM_TUYA_SCHEMA_IDX    182   /* DP schema JSON(激活时云端返回)*/
 
 /* BLE 配网拿到的凭据(tuya_ble_netcfg_start 阻塞返回后用)*/
 static tuya_ble_wifi_creds_t s_main_creds;
@@ -543,11 +649,12 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
     if (cp.biz_tag  == 0) cp.biz_tag  = 119;
     printf("[TUYA] TAI cfg: biz_code=%ld biz_tag=%ld host=%s:%u sni=%s agentToken=%s\r\n",
            cp.biz_code, cp.biz_tag, cp.host, cp.port, cp.tls_sni,
-           cp.agent_token[0] ? cp.agent_token : "(none)");
+           cp.agent_token[0] ? "(set)" : "(none)");   /* token 是会话凭证,只打有无不打值 */
     free(token);
-    iot_client_deinit(iot);   /* 必须断 MQTT:保活(并发)时云端会 SESSION_CLOSE 关掉 AI 会话
-     * (iot MQTT 与 AI TLS 共用 PAL/设备身份,并发冲突)。改为在 tuya_agentic_main 里
-     * 先 hold MQTT 几秒让 App 判定配网成功,再进这里 deinit 断 MQTT 连 AI(串行)。 */
+    /* MQTT 常驻:不再 deinit。让 MQTT 保持在线,接收云端 DP 下行(如"运动一下"的自定义DP)。
+     * 之前注释说"并发冲突/SESSION_CLOSE",经查 MQTT 和 AI 各有独立 TCP 连接,
+     * TuyaOpen 也是 MQTT+AI 并存不断开。如果实测出现 SESSION_CLOSE,再改回 deinit。*/
+    /* iot_client_deinit(iot); */
 
     /* 下行 TTS 编码开关 TUYA_DOWNLINK_OPUS_ENABLE(app_config.h,默认关=PCM):
      *   开 = 请求 opus(~2KB/s,治拥挤网卡顿;云端确认支持 codec=111,帧 80B/16kbps/40ms,解码仍在调);
@@ -560,13 +667,17 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
     static const char SA[] = "{\"deviceMcp\":{\"supportCustomMCP\":true}}";
 #endif
 #ifdef TUYA_SERVER_VAD_ENABLE
-    /* 云端确认:asr.enableVad 放 chatAttributes,值是字符串"true"(不是布尔)。
-     * sys.workflow / vad_enable / vad_silence_ms 云端不用,已去掉。*/
+    /* chatAttributes(event_user_data):asr.enableVad / tts.alternate / processing.interrupt。
+     * tts.alternate:"true" 让云端"一句文字→这句音频→下一句文字→下一句音频"交替下发,
+     *   而不是"文字全发完→音频慢慢发"。文字和音频天然按句对齐,接屏幕做字幕不需额外计时。*/
     static const char EU[] =
         "{\"asr.enableVad\":\"true\","
-        "\"processing.interrupt\":\"true\"}";   /* 开启云端打断:检测到说话结束下发chat_break */
+        "\"tts.alternate\":\"true\","
+        "\"processing.interrupt\":\"true\"}";
 #else
-    static const char EU[] = "{\"sys.workflow\":\"asr-llm-tts\"}";
+    static const char EU[] =
+        "{\"sys.workflow\":\"asr-llm-tts\","
+        "\"tts.alternate\":\"true\"}";
 #endif
     demo_ctx_t dc = {0};
     tai_config_t tc;
@@ -609,6 +720,12 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
             " downlink=pcm"
 #endif
             "\r\n");
+
+    /* MQTT 常驻:fork 独立线程维持心跳 + 收 DP 下行(见 tuya_mqtt_keepalive_task)。
+     * 不能在语音循环里调 iot_client_process——它内部 TLS recv 会阻塞语音线程。*/
+    if (iot) {
+        thread_fork("tuya_mqtt_ka", 5, 6 * 1024, 0, 0, tuya_mqtt_keepalive_task, iot);
+    }
 
     /* ===== 对照实验:文本通道探针(音频流已起,若云端回 TTS 可顺带验证下行播放)=====
      *   文本正常回复 → 会话通,问题锁定在音频上行(云端 ASR 不认我们的 opus)
@@ -682,6 +799,8 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
 #endif
             unsigned char _trash[TUYA_OPUS_FRAME_LEN];
             int tn = _device_get_voice_data(_trash, sizeof(_trash));   /* 丢弃,保持缓冲新鲜 */
+            /* MQTT 心跳由独立线程维持(见 tuya_ai_run 入口的 tuya_mqtt_keepalive_task),
+             * 不在这里调 iot_client_process——它内部的 TLS recv 会阻塞语音循环线程。*/
             if (tn == TUYA_OPUS_FRAME_LEN) {   /* 攒够整帧才统计,得到稳定的静音底噪基线 */
                 unsigned int s, a;
                 opus_frame_stat(_trash, TUYA_OPUS_FRAME_LEN, &s, &a);
@@ -751,10 +870,35 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
             if (n == TUYA_OPUS_FRAME_LEN) {
                 unsigned int fsum, fact;
                 opus_frame_stat(abuf, TUYA_OPUS_FRAME_LEN, &fsum, &fact);
+
+#ifdef TUYA_UPLINK_LATENCY_DEBUG
+                /* 测 send 耗时 + 前后 cbuf 水位 + TTS 上下文。
+                 * 正常: send 5-15ms,cbuf 水位接近 0(每帧 mdelay40 消费节拍)。
+                 * 异常: send 几十~几百ms,cbuf 水位涨(锁竞争/网络抖动/被抢占)。
+                 * 只在超阈值时打印,避免刷屏;阈值见文件顶 UPLINK_LAT_WARN_MS。*/
+                unsigned int _lvl_pre = _device_get_voice_level();
+                unsigned int _t0 = timer_get_ms();
+                int _tts_flag = g_tts_playing;   /* 快照:send 时 TTS 是否在播(锁竞争假说关键信号)*/
+                int _snd_rt = tai_send_audio_chunk(ctx, abuf, TUYA_OPUS_FRAME_LEN);
+                unsigned int _dt = timer_get_ms() - _t0;
+                unsigned int _lvl_post = _device_get_voice_level();
+                if (_snd_rt != TAI_OK) {
+                    printf("[TUYA] tai_send_audio_chunk fail\r\n");
+                    break;
+                }
+                /* 超时 或 水位异常高 才打印 */
+                if (_dt >= UPLINK_LAT_WARN_MS || _lvl_pre >= UPLINK_LAT_CBUF_WARN) {
+                    printf("[LAT] send=%ums lvl=%u→%u (+%u) %s\r\n",
+                           _dt, _lvl_pre, _lvl_post, _lvl_post - _lvl_pre,
+                           _tts_flag ? "[TTS!]" : "");
+                }
+#else
                 if (tai_send_audio_chunk(ctx, abuf, TUYA_OPUS_FRAME_LEN) != TAI_OK) {
                     printf("[TUYA] tai_send_audio_chunk fail\r\n");
                     break;
                 }
+#endif
+
                 uplink_frames++;
                 if (fact > 3) uplink_active++;   /* 新度量下 fact=avg|sample|/100;>3 即 avg>300(远超 idle 底噪 avg<50)≈有效话音帧 */
                 printf("[TUYA] uplink f#%u sum=%u act=%u%%\r\n", uplink_frames, fsum, fact);
@@ -817,6 +961,31 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
              * 几秒 TTS,喇叭仍在播。若这时去听,麦克风采到正在播的 TTS→当新问题→自说自话。
              * 改成等下行 cbuf(pcm_cbuff_r)排空(≈DAC 播完)再听,从根上消除"云端发完≠喇叭播完"。
              * 然后排空 mic cbuf ~300ms,清掉播放期间积压的回声/混响尾巴。*/
+            /* ★ 先等 TTS 真正开始下发(cbuf 有数据),再等它排空。
+             *   修复 bug:云端有时"先发 event:end 再发音频",EVT_END 时 cbuf 是空的,
+             *   原来的 while(play_level>640) 会立刻判"播完了"跳过 → 回到循环顶 →
+             *   喇叭随后播 TTS 触发 VAD → TTS 被截断("没说完")。先等 cbuf 出现数据,
+             *   确认本轮 TTS 确实到达,再进入排空等待。超时 3s:云端无音频(纯文本/异常)时不卡死。
+             * barge-in 在此阶段也必须检测:用户改口(如说错了换第二个问题)不等 TTS 播完,
+             *   不论 TTS 是否在播,只要本地确认是话音就打断当前轮、发新一轮。*/
+            unsigned int wait_start = 0;
+            while (!g_exit && _device_get_play_level() == 0 && wait_start < 3000) {
+                msleep(20); wait_start += 20;
+#ifdef TUYA_BARGE_IN_ENABLE
+                /* TTS 未到达阶段也检测 barge-in:用户改口不等 TTS,确认话音即打断当前轮。*/
+                if (get_recoder_state() && barge_cooldown_expired()) {
+                    if (barge_in_energy_confirmed()) {
+                        printf("[TUYA] barge-in (pre-TTS): cancel before audio arrives\r\n");
+                        tai_chat_break(ctx);
+                        _device_rbuf_clear();
+                        g_tts_playing = 0;
+                        g_barge_in = 1;
+                        g_barge_cooldown_until = timer_get_ms() + TUYA_BARGE_COOLDOWN_MS;
+                        break;
+                    }
+                }
+#endif
+            }
             unsigned int wait_ms = 0;
             while (!g_exit && _device_get_play_level() > 640 && wait_ms < 35000) {  /* 等 32s 缓冲排空(≈喇叭真播完);35s 是兜底,正常排完就提前退 */
                 msleep(20); wait_ms += 20;
@@ -847,6 +1016,18 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
                         opus_frame_stat(_aec_t, TUYA_OPUS_FRAME_LEN, &es, &ea);
                         printf("[AEC-DBG] TTS playing, mic post-AEC: sum=%u act=%u%% rec=%d\r\n", es, ea, get_recoder_state());
                     }
+#ifdef TUYA_UPLINK_LATENCY_DEBUG
+                    /* TTS 播放期间 mic cbuf 水位监控:验证"TTS 期间堆积"假说。
+                     * cbuf 容量 = SAMPLE_RATE*CHANNEL*1 = 16000B(0.5 秒)。
+                     * 水位涨 = 上行循环没在消费(此时本就在 play-drain,正常不消费);
+                     * 水位接近 16000 = 快溢出,新话音会被环形覆盖(丢音风险)。*/
+                    unsigned int _wlvl = _device_get_voice_level();
+                    if (_wlvl >= UPLINK_LAT_CBUF_WARN) {
+                        printf("[LAT] TTS drain: mic cbuf=%u/%uB (%u%% full)%s\r\n",
+                               _wlvl, 16000u, (_wlvl * 100u) / 16000u,
+                               _wlvl >= 16000u ? " [OVERFLOW!]" : "");
+                    }
+#endif
                 }
             }
             unsigned char _trash[TUYA_OPUS_FRAME_LEN];
@@ -1001,9 +1182,22 @@ void tuya_agentic_main(void *arg)
         cfg.cert_bundle_attach = NULL; cfg.cacert = NULL;
         extern const char *tuya_get_effective_sw_ver(void);
         cfg.sw_ver = tuya_get_effective_sw_ver();   /* 上报生效版本:VM>源码基线 */
+
         strncpy((char *)cfg.devid, devid, sizeof(cfg.devid) - 1);
         strncpy((char *)cfg.secret_key, secret, sizeof(cfg.secret_key) - 1);
         strncpy((char *)cfg.local_key, localkey, sizeof(cfg.local_key) - 1);
+
+        /* DP schema 恢复:只恢复 schema_id(非空才能触发云端查询),不恢复 schema。
+         * 原因:schema JSON 601 字节,VM 单 entry 有大小限制(~68B),直接存会截断→JSON 不完整。
+         * 改为:开机时 schema_id 恢复(小,32B 够),schema 留空→iot_dp_schema_check_update 从云端全量拉取。*/
+        static char vm_schema_id[64] = {0};
+        if (syscfg_read(VM_TUYA_SCHEMAID_IDX, vm_schema_id, sizeof(vm_schema_id)) > 0
+            && vm_schema_id[0] != 0 && vm_schema_id[0] != 0xFF) {
+            cfg.schema_id = vm_schema_id;
+            printf("[TUYA] restored schema_id=%s\r\n", vm_schema_id);
+        }
+        /* cfg.schema 不从 VM 恢复(会截断),靠下方 iot_dp_schema_check_update 从云端拉 */
+
         iot_client_t *iot = iot_client_init(&cfg);
         if (iot) {
             /* 连 AI 之前先检查涂鸦云 OTA(此时 iot_client 活着,且 AI 会话还没起,
@@ -1015,6 +1209,22 @@ void tuya_agentic_main(void *arg)
                 return;   /* 升级成功,等待自动重启,不再连 AI */
             }
 #endif
+            /* DP:从涂鸦云端拉取 DP schema(设备知道自己在平台配了哪些 DP),
+             * 并注册 DP 下行回调(云端下发 DP 值时触发)。
+             * 不拉 schema → iot_dp_dispatch_downlink 无法解析 DP 下发(不知道 dp_id 对应什么类型)。*/
+            {
+                extern void on_dp_downlink(uint8_t dp_id, const iot_dp_value_t *value, void *user_data);
+                extern void on_dp_schema_update(const char *schema_id, const char *new_schema, void *user_data);
+                iot_dp_set_callback(iot, (iot_dp_callback_t)on_dp_downlink, NULL);
+                iot_dp_set_schema_update_callback(iot, (iot_schema_update_callback_t)on_dp_schema_update, NULL);
+                printf("[TUYA] pulling DP schema from cloud...\r\n");
+                int dp_ret = iot_dp_schema_check_update(iot);
+                printf("[TUYA] DP schema check_update ret=%d schema=%s len=%d\r\n",
+                       dp_ret, iot->schema ? "NON-NULL" : "NULL",
+                       iot->schema ? (int)strlen(iot->schema) : 0);
+                /* 若 check_update 未拉到 schema(version 门控/云端无更新),
+                 * 当前 loose 模式会吞掉所有 DP 下行。打印状态辅助排查。*/
+            }
             tuya_ai_run(pal, iot, localkey);
         }
         else { printf("[TUYA] iot_client_init fail\r\n"); }
@@ -1073,12 +1283,27 @@ void tuya_agentic_main(void *arg)
     syscfg_write(VM_TUYA_LOCALKEY_IDX, iot->local_key,        32);
     syscfg_write(VM_TUYA_SSID_IDX,     s_main_creds.ssid,     65);
     syscfg_write(VM_TUYA_PWD_IDX,      s_main_creds.password, 65);
+    /* DP schema:激活时云端在 response 里返回 schema_id + schema JSON。
+     * 存到 VM,下次开机直连时读出来恢复→iot_dp_schema_check_update 才能工作→DP 下行才能解析。*/
+    if (iot->schema_id[0] != '\0') {
+        syscfg_write(VM_TUYA_SCHEMAID_IDX, iot->schema_id, sizeof(iot->schema_id));
+        printf("[TUYA] saved schema_id=%s\r\n", iot->schema_id);
+    } else {
+        printf("[TUYA] WARNING: schema_id is empty after activation!\r\n");
+    }
+    if (iot->schema && iot->schema[0] != '\0') {
+        int slen = (int)strlen(iot->schema);
+        syscfg_write(VM_TUYA_SCHEMA_IDX, iot->schema, slen + 1);
+        printf("[TUYA] saved schema len=%d: %.80s\r\n", slen, iot->schema);
+    } else {
+        printf("[TUYA] WARNING: schema body is NULL/empty after activation! "
+               "(cloud did not return schema in activate response)\r\n");
+    }
 
     /* ---- hold MQTT 让 App 判定配网成功 ----
      * on_boarding 已建好 MQTT(涂鸦IoT云,设备上线绑定)。App 判"配网成功"靠它,需保持
-     * 几秒让云端同步给 App。之后 tuya_ai_run 会 deinit 断 MQTT 再连 AI(MQTT 与 AI TLS
-     * 并发时云端会 SESSION_CLOSE 关掉 AI 会话,必须串行)。
-     * 代价:之后 App 里该设备显示离线(控制暂不可用),但配网已成功、语音能用。
+     * 几秒让云端同步给 App。之后 tuya_ai_run 保持 MQTT 常驻不断开(MQTT 与 AI 是各自
+     * 独立的 TCP 连接,可并存;tuya_mqtt_ka 线程维持心跳并收 DP 下行)。
      * ⚠️ 原 8s 过长(配网后用户要干等 8s 才能说话);涂鸦 App 同步配网成功通常 1~2s,
      *   改 3s 足够,缩短开机到可对话的延迟。*/
     printf("[TUYA] hold MQTT ~3s for app to confirm provisioning...\r\n");
@@ -1096,6 +1321,16 @@ void tuya_agentic_main(void *arg)
         }
     }
 #endif
+
+    /* DP:注册 DP 下行回调(配网路径也要加,和直连路径保持一致)。
+     * on_boarding 时云端已返回 schema 并已存 VM(上方 saved schema_id/schema),
+     * 但 iot_client 本身已有 schema_id/schema(从 activate_device 返回的),
+     * 可直接注册回调,无需再 check_update。*/
+    {
+        extern void on_dp_downlink(uint8_t dp_id, const iot_dp_value_t *value, void *user_data);
+        iot_dp_set_callback(iot, (iot_dp_callback_t)on_dp_downlink, NULL);
+        printf("[TUYA] DP callback registered (provisioning path)\r\n");
+    }
 
     /* ---- 连 AI ---- */
     tuya_ai_run(pal, iot, lk);
@@ -1116,6 +1351,10 @@ void tuya_clear_provision_and_reset(void)
     syscfg_write(VM_TUYA_LOCALKEY_IDX, zero, 32);
     syscfg_write(VM_TUYA_SSID_IDX,     zero, 65);
     syscfg_write(VM_TUYA_PWD_IDX,      zero, 65);
+    /* 同时清杰理 WiFi VM:设回 SMP_CFG_MODE(配网模式)+ 空 ssid。
+     * 否则 wifi_app_task 开机读到旧 STA_MODE ssid 自动连网→播"网络连接成功"→
+     * 然后才进配网,用户听到两条提示音("网络连接成功"+"请配置网络"),迷惑。*/
+    wifi_store_mode_info(SMP_CFG_MODE, zero, zero);
     /* ★复位前先停 BT 广播,让蓝牙控制器进入 idle 再软复位。
      *   软复位(P33_SYSTEM_RESET)不像掉电/reset 键那样完全重置 BT 控制器,带活跃
      *   射频状态复位会导致重启后 BLE 链路异常(conn nack → supervision timeout),

@@ -245,6 +245,25 @@ int _device_write_voice_data(void *data, unsigned int len)
     return len;
 }
 
+#if defined(CONFIG_TUYA_AGENTIC_ENABLE)
+/* ===== TTS 首字抗卡顿:预蓄水 =====
+ * 问题:云端智能体回复开头常带语气词(嗯/好的/…),TTS 生成时首帧音频很短(80B=40ms),
+ *       解码器拿到就播,40ms 后缓冲空 → underrun 卡顿。
+ * 解法:本轮 TTS 首次 fread 时,先等 cbuf 攒够 TTS_PREBUFFER_BYTES 再返回给解码器。
+ *       后续 fread 不再蓄水(只要消费≤生产就持续,蓄水只在开头做一次)。
+ * g_tts_prebuffer_done:0=本轮还没蓄够,1=已蓄够(后续直接走原逻辑)。
+ *       新一帧 stream_flag=START 时 on_audio 清零,触发本轮重新蓄水。*/
+static volatile int g_tts_prebuffer_done = 1;   /* 默认1:开机/纯文本demo不蓄水 */
+#define TTS_PREBUFFER_BYTES   (80 * 4)          /* 4 帧 opus ≈ 160ms,够 DAC 平滑启动不卡顿 */
+
+/* on_audio 收到本轮 START 帧时调:标记需要预蓄水(cbuf 清空 + 标志清零)。
+ * 由 tuya_agentic_demo.c 的 on_audio 在 stream_flag==START 时调用。*/
+void tts_prebuffer_arm(void)
+{
+    g_tts_prebuffer_done = 0;
+}
+#endif
+
 //编码器输出PCM数据
 static int recorder_vfs_fwrite(void *file, void *data, unsigned int len)
 {
@@ -416,6 +435,28 @@ static int audio_play_net_vfs_fread(void *file, void *data, unsigned int len)
     unsigned int rlen = 0;
     unsigned int c_rlen = 0;
     cbuf = (cbuffer_t *)file;
+
+#if defined(CONFIG_TUYA_AGENTIC_ENABLE)
+    /* TTS 首字预蓄水:本轮首次 fread 时,cbuf 水位 < 阈值则等 on_audio 继续写,
+     * 攒够 TTS_PREBUFFER_BYTES 再返回。避免首帧 80B 直接播→40ms 后 underrun 卡顿。
+     * g_tts_prebuffer_done 蓄够后置 1,本轮后续 fread 走原逻辑(不再蓄水)。
+     * 超时保护:最长等 _AUDIO_WAIT_TIMEOUT×若干次(≈2s),防云端半路断流卡死解码器。*/
+    if (!g_tts_prebuffer_done) {
+        unsigned int pb_wait = 0;
+        unsigned int pb_lvl0 = cbuf_get_data_size(cbuf);
+        while (cbuf_get_data_size(cbuf) < TTS_PREBUFFER_BYTES &&
+               g_audio_hdl.is_audio_play_open && pb_wait < 2000) {
+            g_audio_ctrl.pcm_wait_sem = 1;
+            os_sem_pend(&g_audio_ctrl.r_sem, _AUDIO_WAIT_TIMEOUT);
+            g_audio_ctrl.pcm_wait_sem = 0;
+            pb_wait += _AUDIO_WAIT_TIMEOUT;
+        }
+        g_tts_prebuffer_done = 1;   /* 无论蓄够还是超时,都放行(超时则有多少播多少) */
+        printf("[TTS-PB] armed lvl0=%u→%u wait=%ums %s\r\n",
+               pb_lvl0, cbuf_get_data_size(cbuf), pb_wait,
+               cbuf_get_data_size(cbuf) >= TTS_PREBUFFER_BYTES ? "OK" : "TIMEOUT");
+    }
+#endif
 
     do {
         cbuf_len = cbuf_get_data_size(cbuf);
