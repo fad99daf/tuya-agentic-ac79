@@ -29,13 +29,15 @@
 **① 修复"无法打断"根因**
 - 文件顶 `#include "app_config.h"`(L12-14,带长注释)。原 demo.c 漏 include → `TUYA_BARGE_IN_ENABLE` 不可见 → barge-in 三处 `#ifdef` 全被编译掉,功能从未进固件。
 
-**② 设备三元组 / WiFi 凭据持久化(VM 176~180,裸 index,未进 syscfg_id.h)**
+**② 设备三元组 / WiFi 凭据持久化(VM 176~183,裸 index,未进 syscfg_id.h)**
 - `176=devid` / `177=secret_key` / `178=local_key`(各 32B)
 - `179=ssid` / `180=pwd`(各 65B,直连路径开机重连用)
+- `181=schema_id` / `182=schema JSON`(DP 用,见 A1⑥/iot_dp)
+- `183=region`(1B,配网激活时云端下发;直连重启据此选 ATOP/MQTT 域名,**不硬编码**——设备不预知部署区,海外区设备重启后才不会打到中国区域名)
 
 **③ `tuya_agentic_main()` 启动流程**
-- **直连路径**(VM176 有 devid):读三元组 + ssid/pwd → `wifi_enter_sta_mode` → 等 DHCP → `iot_client_init` → `tuya_ai_run`
-- **首次配网路径**(无 devid):播"请配置网络"语音 → `tuya_ble_netcfg_start`(BLE 阻塞等 App 下发 ssid/pwd/token)→ 停 BLE 释放 RAM → 连 WiFi → `iot_client_init_on_boarding_with_token` 激活 → **写 176~182**(三元组+WiFi 凭据+DP schema_id)→ hold MQTT ~3s 让 App 确认配网成功 → 注册 DP 下行回调 → `tuya_ai_run`(**MQTT 常驻**:与 AI 的 TLS 是各自独立 TCP 连接可并存;`tuya_mqtt_ka` 线程每 5s `iot_client_process` 维持心跳并收 DP 下行,App 里设备保持在线可控制)
+- **直连路径**(VM176 有 devid):读三元组 + ssid/pwd + region(VM183,无效兜底 AY)→ `wifi_enter_sta_mode` → 等 DHCP → `iot_client_init` → `tuya_ai_run`
+- **首次配网路径**(无 devid):播"请配置网络"语音 → `tuya_ble_netcfg_start`(BLE 阻塞等 App 下发 ssid/pwd/token)→ 停 BLE 释放 RAM → 连 WiFi → `iot_client_init_on_boarding_with_token` 激活(region 由 token 前 2 字符自动解析,激活响应再回 `region` 字段确认)→ **写 176~183**(三元组+WiFi 凭据+DP schema_id+region)→ hold MQTT ~3s 让 App 确认配网成功 → 注册 DP 下行回调 → `tuya_ai_run`(**MQTT 常驻**:与 AI 的 TLS 是各自独立 TCP 连接可并存;`tuya_mqtt_ka` 线程每 5s `iot_client_process` 维持心跳并收 DP 下行,App 里设备保持在线可控制)
 - **历史 bug 修复**:`syscfg_read` 返回值判断从 `==0`(误判每次重配)改为 `>0`
 
 **④ `tuya_ai_run()` 对话循环**

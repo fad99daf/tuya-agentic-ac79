@@ -567,6 +567,22 @@ void tuya_agentic_demo(void *arg)
 #define VM_TUYA_PWD_IDX       180
 #define VM_TUYA_SCHEMAID_IDX  181   /* DP schema_id(激活时云端返回,DP 下行解析需要)*/
 #define VM_TUYA_SCHEMA_IDX    182   /* DP schema JSON(激活时云端返回)*/
+#define VM_TUYA_REGION_IDX    183   /* region(1B):配网时云端下发(token前缀+激活响应),直连重启据此选 ATOP/MQTT 域名 */
+
+/* region 枚举转可读名(打日志用;枚举定义在 iot_client.h,AY=中国区...) */
+static const char *region_name(iot_region_t r)
+{
+    switch (r) {
+    case AY:   return "AY(中国区)";
+    case AZ:   return "AZ(美国区)";
+    case UEAZ: return "UEAZ(美东区)";
+    case EU:   return "EU(欧洲区)";
+    case WEAZ: return "WEAZ(美西区)";
+    case IN:   return "IN(印度区)";
+    case SG:   return "SG(新加坡区)";
+    default:   return "?(未知区)";
+    }
+}
 
 /* BLE 配网拿到的凭据(tuya_ble_netcfg_start 阻塞返回后用)*/
 static tuya_ble_wifi_creds_t s_main_creds;
@@ -1177,7 +1193,19 @@ void tuya_agentic_main(void *arg)
 
         iot_client_config_t cfg;
         memset(&cfg, 0, sizeof(cfg));
-        cfg.region = AY; cfg.env = PROD;
+        /* region 从 VM 恢复(配网时下发存的),不硬编码——设备不预知会被部署到哪个区,
+         * region 决定 ATOP/MQTT 域名(schema 拉取/OTA/AI token/MQTT 接入)。
+         * 读不到(旧固件升级/异常)时兜底中国区 AY。*/
+        {
+            uint8_t vm_region = AY;
+            if (syscfg_read(VM_TUYA_REGION_IDX, &vm_region, 1) <= 0 || vm_region > SG) {
+                printf("[TUYA] VM region absent/invalid, fallback AY\r\n");
+                vm_region = AY;
+            }
+            cfg.region = (iot_region_t)vm_region;
+            printf("[TUYA] region=%s (from VM)\r\n", region_name(cfg.region));
+        }
+        cfg.env = PROD;
         cfg.mqtt_disable_tls = false; cfg.mqtt_auto_connect = 1;
         cfg.cert_bundle_attach = NULL; cfg.cacert = NULL;
         extern const char *tuya_get_effective_sw_ver(void);
@@ -1299,6 +1327,14 @@ void tuya_agentic_main(void *arg)
         printf("[TUYA] WARNING: schema body is NULL/empty after activation! "
                "(cloud did not return schema in activate response)\r\n");
     }
+    /* region 落 VM:激活时云端已明确下发(token 前缀 + 激活响应 region 字段,
+     * iot->region 即解析结果)。不落盘的话重启直连只能靠硬编码,海外区设备
+     * 重启后会打到中国区域名(a1.tuyacn.com)导致 AI token/MQTT 全失败。*/
+    {
+        uint8_t region_byte = (uint8_t)iot->region;
+        syscfg_write(VM_TUYA_REGION_IDX, &region_byte, 1);
+        printf("[TUYA] saved region=%s\r\n", region_name(iot->region));
+    }
 
     /* ---- hold MQTT 让 App 判定配网成功 ----
      * on_boarding 已建好 MQTT(涂鸦IoT云,设备上线绑定)。App 判"配网成功"靠它,需保持
@@ -1351,6 +1387,7 @@ void tuya_clear_provision_and_reset(void)
     syscfg_write(VM_TUYA_LOCALKEY_IDX, zero, 32);
     syscfg_write(VM_TUYA_SSID_IDX,     zero, 65);
     syscfg_write(VM_TUYA_PWD_IDX,      zero, 65);
+    syscfg_write(VM_TUYA_REGION_IDX,   zero, 1);   /* region 一并清:重配网时重新下发(可能换了区)*/
     /* 同时清杰理 WiFi VM:设回 SMP_CFG_MODE(配网模式)+ 空 ssid。
      * 否则 wifi_app_task 开机读到旧 STA_MODE ssid 自动连网→播"网络连接成功"→
      * 然后才进配网,用户听到两条提示音("网络连接成功"+"请配置网络"),迷惑。*/
