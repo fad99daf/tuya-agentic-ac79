@@ -213,8 +213,6 @@ INCLUDES := \
 	-I../../../../include_lib/utils/btmesh \
 	-I../../../../include_lib/utils/btmesh/adaptation \
 	-I../../../../apps/common/LLM/audio \
-	-I../../../../apps/common/LLM/volc/inc \
-	-I../../../../apps/common/LLM/volc \
 	-I../../../../apps/common/LLM/extra \
 	-I../../../../include_lib/net/cJSON_common \
 	-I../../../../include_lib/net/curl/include \
@@ -223,24 +221,8 @@ INCLUDES := \
 	-I../../../../include_lib/system/os \
 	-I../../../../include_lib/net/libwebsockets/include \
 	-I../../../../include_lib/net/libwebsockets/include/libwebsockets \
-	-I../../../../apps/common/LLM/onesdk/src \
-	-I../../../../apps/common/LLM/onesdk/src/aigw \
-	-I../../../../apps/common/LLM/onesdk/src/util \
-	-I../../../../apps/common/LLM/onesdk/src/aws \
-	-I../../../../apps/common/LLM/onesdk/include \
-	-I../../../../apps/common/LLM/onesdk/include/iot \
-	-I../../../../apps/common/LLM/onesdk/include/protocols \
-	-I../../../../apps/common/LLM/onesdk/include/thing_model \
-	-I../../../../apps/common/LLM/onesdk/include/platform/plat \
-	-I../../../../apps/common/LLM/onesdk/platform \
-	-I../../../../apps/common/LLM/onesdk \
 	-I../../../../include_lib/net/web_socket \
-	-I../../../../apps/common/LLM/ifly_aiui/include \
-	-I../../../../apps/common/LLM/duer/intelligent_duer \
-	-I../../../../apps/common/LLM/duer/my_platform \
 	-I../../../../include_lib/net/network_download \
-	-I../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/inc \
-	-I../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws \
 	-I../../../../apps/common/LLM/tuya_agentic \
 	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/pal \
 	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/common \
@@ -257,177 +239,8 @@ INCLUDES := \
 
 # 需要编译的 .c 文件
 c_SRC_FILES := \
-	../../../../apps/common/LLM/QYAI/net_music.c \
-	../../../../apps/common/LLM/QYAI/qyai_instruct_word.c \
-	../../../../apps/common/LLM/QYAI/qyai_pcm.c \
-	../../../../apps/common/LLM/QYAI/qyai_platform.c \
-	../../../../apps/common/LLM/aitoye2e/e2e_demo.c \
 	../../../../apps/common/LLM/audio/audio_input.c \
-	../../../../apps/common/LLM/duer/intelligent_duer/duer_auth_algorithm.c \
-	../../../../apps/common/LLM/duer/intelligent_duer/duer_http_req.c \
-	../../../../apps/common/LLM/duer/intelligent_duer/duer_json_parse.c \
-	../../../../apps/common/LLM/duer/intelligent_duer/duer_json_request.c \
-	../../../../apps/common/LLM/duer/intelligent_duer/duer_record.c \
-	../../../../apps/common/LLM/duer/intelligent_duer/duer_socket.c \
-	../../../../apps/common/LLM/duer/intelligent_duer/test_demo.c \
-	../../../../apps/common/LLM/duer/my_platform/my_platform_http.c \
-	../../../../apps/common/LLM/duer/my_platform/my_platform_http_api.c \
-	../../../../apps/common/LLM/duer/my_platform/my_platform_list_download.c \
-	../../../../apps/common/LLM/duer/my_platform/my_platform_record.c \
-	../../../../apps/common/LLM/duer/my_platform/my_platform_url_list.c \
 	../../../../apps/common/LLM/extra/g711.c \
-	../../../../apps/common/LLM/ifly_aiui/ifly_aiui_demo.c \
-	../../../../apps/common/LLM/ifly_aiui/ifly_aiui_user.c \
-	../../../../apps/common/LLM/ifly_aiui/ifly_model_parse.c \
-	../../../../apps/common/LLM/onesdk/examples/onesdk_realtime/chat_agent/realtime_demo.c \
-	../../../../apps/common/LLM/onesdk/platform/plat/alloc.c \
-	../../../../apps/common/LLM/onesdk/platform/plat/platform.c \
-	../../../../apps/common/LLM/onesdk/platform/plat/util.c \
-	../../../../apps/common/LLM/onesdk/src/aigw/auth.c \
-	../../../../apps/common/LLM/onesdk/src/aigw/llm.c \
-	../../../../apps/common/LLM/onesdk/src/aws/common/allocator.c \
-	../../../../apps/common/LLM/onesdk/src/aws/common/array_list.c \
-	../../../../apps/common/LLM/onesdk/src/aws/common/assert.c \
-	../../../../apps/common/LLM/onesdk/src/aws/common/atomics.c \
-	../../../../apps/common/LLM/onesdk/src/aws/common/byte_buf.c \
-	../../../../apps/common/LLM/onesdk/src/aws/common/byte_order.c \
-	../../../../apps/common/LLM/onesdk/src/aws/common/clock.c \
-	../../../../apps/common/LLM/onesdk/src/aws/common/common.c \
-	../../../../apps/common/LLM/onesdk/src/aws/common/data_time.c \
-	../../../../apps/common/LLM/onesdk/src/aws/common/encoding.c \
-	../../../../apps/common/LLM/onesdk/src/aws/common/error.c \
-	../../../../apps/common/LLM/onesdk/src/aws/common/hash_table.c \
-	../../../../apps/common/LLM/onesdk/src/aws/common/json.c \
-	../../../../apps/common/LLM/onesdk/src/aws/common/linked_list.c \
-	../../../../apps/common/LLM/onesdk/src/aws/common/math.c \
-	../../../../apps/common/LLM/onesdk/src/aws/common/string.c \
-	../../../../apps/common/LLM/onesdk/src/aws/common/time.c \
-	../../../../apps/common/LLM/onesdk/src/aws/common/zero.c \
-	../../../../apps/common/LLM/onesdk/src/infer_inner_chat.c \
-	../../../../apps/common/LLM/onesdk/src/infer_realtime_ws.c \
-	../../../../apps/common/LLM/onesdk/src/iot/dynreg.c \
-	../../../../apps/common/LLM/onesdk/src/iot/iot_kv.c \
-	../../../../apps/common/LLM/onesdk/src/iot/iot_mqtt.c \
-	../../../../apps/common/LLM/onesdk/src/iot/iot_popen.c \
-	../../../../apps/common/LLM/onesdk/src/iot/iot_utils.c \
-	../../../../apps/common/LLM/onesdk/src/iot/log/iot_log.c \
-	../../../../apps/common/LLM/onesdk/src/iot/log/iot_log_report.c \
-	../../../../apps/common/LLM/onesdk/src/iot/ota/iot_ota_api.c \
-	../../../../apps/common/LLM/onesdk/src/iot/ota/iot_ota_utils.c \
-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/custom_topic.c \
-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/device_delay.c \
-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/event.c \
-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/gateway.c \
-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/iot_ntp.c \
-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/iot_tm_api.c \
-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/property.c \
-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/service.c \
-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/shadow.c \
-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/webshell.c \
-	../../../../apps/common/LLM/onesdk/src/iot_basic.c \
-	../../../../apps/common/LLM/onesdk/src/onesdk.c \
-	../../../../apps/common/LLM/onesdk/src/onesdk_chat.c \
-	../../../../apps/common/LLM/onesdk/src/onesdk_iot.c \
-	../../../../apps/common/LLM/onesdk/src/onesdk_rt.c \
-	../../../../apps/common/LLM/onesdk/src/protocols/http.c \
-	../../../../apps/common/LLM/onesdk/src/protocols/http_libs.c \
-	../../../../apps/common/LLM/onesdk/src/protocols/lws_http_client.c \
-	../../../../apps/common/LLM/onesdk/src/protocols/lws_http_download.c \
-	../../../../apps/common/LLM/onesdk/src/protocols/lws_http_upload.c \
-	../../../../apps/common/LLM/onesdk/src/util/aes.c \
-	../../../../apps/common/LLM/onesdk/src/util/aes_decode.c \
-	../../../../apps/common/LLM/onesdk/src/util/aws_json.c \
-	../../../../apps/common/LLM/onesdk/src/util/hmac_sha256.c \
-	../../../../apps/common/LLM/onesdk/src/util/md5.c \
-	../../../../apps/common/LLM/onesdk/src/util/sha256.c \
-	../../../../apps/common/LLM/onesdk/src/util/util.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_File_free_rtos.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_OS_free_rtos.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_SoftAP_ac79.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_TCP_free_rtos.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_Timer_free_rtos.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_UDP_free_rtos.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_nvs_ac79.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_ota_ac79.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_wifi_ac79.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/qcloud_iot_link_ble_ac79.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/ble_llsync_device_info.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/ble_llsync_service.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/cos_download.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_action.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_cloud.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_config.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_event.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_mqtt.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_parse.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_property.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/dynreg_request.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/dynreg_signature.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/http_ca.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/http_client.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/http_signed.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_client.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_client_common.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_client_connect.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_client_publish.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_client_subscribe.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_client_yield.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_packet_deserialize.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_packet_serialize.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/network_interface.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/ota_mqtt.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/qcloud_iot_device.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/qcloud_iot_link.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/qcloud_iot_timer.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/qcloud_iot_tls_client.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/sevice_mqtt.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/system_mqtt.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_aes.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_base64.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_crc.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_downloader.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_hmac.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_json.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_list.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_log.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_md5.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_min_heap.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_ringbuffer.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_sha1.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_sha256.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_signature.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/wifi_bind.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/wifi_config.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/wifi_llsync.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/wifi_softap.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/wifi_udp.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws/data_template_app.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws/ota_downloader.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws/test_audio_opus.c \
-	../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws/twetalk_app.c \
-	../../../../apps/common/LLM/volc/VolcEngineRTCLiteDemo.c \
-	../../../../apps/common/LLM/volc/access_token.c \
-	../../../../apps/common/LLM/volc/net_request.c \
-	../../../../apps/common/LLM/volc/src/common/volc_crypto.c \
-	../../../../apps/common/LLM/volc/src/common/volc_sprintf.c \
-	../../../../apps/common/LLM/volc/src/common/volc_string.c \
-	../../../../apps/common/LLM/volc/src/common/volc_tls.c \
-	../../../../apps/common/LLM/volc/src/platform/volc_atomic.c \
-	../../../../apps/common/LLM/volc/src/platform/volc_device.c \
-	../../../../apps/common/LLM/volc/src/platform/volc_device_finger_print.c \
-	../../../../apps/common/LLM/volc/src/platform/volc_directory.c \
-	../../../../apps/common/LLM/volc/src/platform/volc_errno.c \
-	../../../../apps/common/LLM/volc/src/platform/volc_fileio.c \
-	../../../../apps/common/LLM/volc/src/platform/volc_log.c \
-	../../../../apps/common/LLM/volc/src/platform/volc_memory.c \
-	../../../../apps/common/LLM/volc/src/platform/volc_mutex.c \
-	../../../../apps/common/LLM/volc/src/platform/volc_network.c \
-	../../../../apps/common/LLM/volc/src/platform/volc_socket.c \
-	../../../../apps/common/LLM/volc/src/platform/volc_thread.c \
-	../../../../apps/common/LLM/volc/src/platform/volc_time.c \
-	../../../../apps/common/LLM/volc/src/platform/volc_uuid.c \
-	../../../../apps/common/LLM/volc/src/platform/volc_zlib.c \
 	../../../../apps/common/asr/aisp/aisp.c \
 	../../../../apps/common/asr/jlkws/jlkws.c \
 	../../../../apps/common/asr/roobo/roobo.c \
@@ -446,10 +259,6 @@ c_SRC_FILES := \
 	../../../../apps/common/ble/le_hogp.c \
 	../../../../apps/common/ble/le_net_central.c \
 	../../../../apps/common/ble/le_net_cfg.c \
-	../../../../apps/common/ble/le_net_cfg_dui.c \
-	../../../../apps/common/ble/le_net_cfg_qyai.c \
-	../../../../apps/common/ble/le_net_cfg_tencent.c \
-	../../../../apps/common/ble/le_net_cfg_turing.c \
 	../../../../apps/common/ble/le_trans_data.c \
 	../../../../apps/common/ble/mesh/examples/AliGenie_fan.c \
 	../../../../apps/common/ble/mesh/examples/AliGenie_light.c \
@@ -599,8 +408,6 @@ c_SRC_FILES := \
 	../../../../apps/common/usb/usb_host_config.c \
 	../../../../apps/wifi_story_machine/app_main.c \
 	../../../../apps/wifi_story_machine/app_music.c \
-	../../../../apps/wifi_story_machine/app_music_dui.c \
-	../../../../apps/wifi_story_machine/app_music_tencent.c \
 	../../../../apps/wifi_story_machine/board/wl82/board_7911B.c \
 	../../../../apps/wifi_story_machine/board/wl82/board_7911D.c \
 	../../../../apps/wifi_story_machine/board/wl82/board_7912D.c \
@@ -662,6 +469,7 @@ c_SRC_FILES := \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/core_mqtt_state.c \
 	../../../../apps/common/LLM/tuya_agentic/pal_ac791n.c \
 	../../../../apps/common/LLM/tuya_agentic/tuya_agentic_demo.c \
+	../../../../apps/common/LLM/tuya_agentic/tuya_music.c \
 	../../../../apps/common/LLM/tuya_agentic/tuya_ota.c \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya-ble/src/tuya_ble_prov.c \
 	../../../../apps/common/LLM/tuya_agentic/le_net_cfg_tuya.c \
@@ -807,25 +615,18 @@ LFLAGS := \
 	../../../../cpu/wl82/liba/https_cli.a \
 	../../../../cpu/wl82/liba/http_server.a \
 	../../../../cpu/wl82/liba/json.a \
-	../../../../cpu/wl82/liba/libduer-device.a \
 	../../../../cpu/wl82/liba/network_download.a \
 	../../../../cpu/wl82/liba/lib_mqtt.a \
 	../../../../cpu/wl82/liba/lib_sound_wave.a \
-	../../../../cpu/wl82/liba/libturing.a \
-	../../../../cpu/wl82/liba/libdui.a \
 	../../../../cpu/wl82/liba/libJlCloud.a \
 	../../../../cpu/wl82/liba/libecho_cloud.a \
 	../../../../cpu/wl82/liba/libmpeg.a \
 	../../../../cpu/wl82/liba/libdcl.a \
 	../../../../cpu/wl82/liba/libdlna.a \
 	../../../../cpu/wl82/liba/libqrcode.a \
-	../../../../cpu/wl82/liba/libwt.a \
 	../../../../cpu/wl82/liba/libvtbk.a \
-	../../../../cpu/wl82/liba/libtencent.a \
 	../../../../cpu/wl82/liba/websocket.a \
 	../../../../cpu/wl82/liba/iperf.a \
-	../../../../cpu/wl82/liba/tmallgenie.a \
-	../../../../cpu/wl82/liba/tmallgenie_todo.a \
 	../../../../cpu/wl82/liba/cJSON.a \
 	../../../../cpu/wl82/liba/ftpserver_new.a \
 	../../../../cpu/wl82/liba/http_server.a  \
@@ -842,18 +643,13 @@ LFLAGS := \
 	../../../../cpu/wl82/liba/res.a \
 	../../../../cpu/wl82/liba/font.a \
 	../../../../cpu/wl82/liba/ui_draw.a \
-	../../../../cpu/wl82/liba/libVolcEngineRTCLite.a \
 	../../../../cpu/wl82/liba/libcurl.a \
 	../../../../cpu/wl82/liba/libwebsockets.a \
 	../../../../cpu/wl82/liba/cJSON.a  \
 	../../../../cpu/wl82/liba/libmbedtls_3_4_0.a  \
-	../../../../cpu/wl82/liba/sxy_qyai.a \
-	../../../../cpu/wl82/liba/libe2e.a \
 	../../../../cpu/wl82/liba/websocket.a  \
-	../../../../cpu/wl82/liba/libifly_aiui_lib.a \
 	../../../../cpu/wl82/liba/websocket.a   \
 	../../../../cpu/wl82/liba/cJSON.a   \
-	../../../../cpu/wl82/liba/lib_twetalk.a \
 	-T../../../../cpu/wl82/sdk.ld \
 	-M=../../../../cpu/wl82/tools/sdk.map \
 	--end-group  \

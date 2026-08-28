@@ -12,7 +12,7 @@
 
 | 类别 | 说明 |
 |---|---|
-| **A. 新建集成模块** | `apps/common/LLM/tuya_agentic/` 下手写的胶水代码(PAL / 配网 / 对话主流程 / bool 补丁 / **OTA 编排**) |
+| **A. 新建集成模块** | `apps/common/LLM/tuya_agentic/` 下手写的胶水代码(PAL / 配网 / 对话主流程 / bool 补丁 / **OTA 编排** / **音乐技能**) |
 | **B. 改动的 SDK 原有文件** | 10 个:Makefile、user_cfg.c、app_music.c、app_main.c、app_config.h、wifi_app_task.c、audio_input.c/.h、board_7916A.c、AC791N_...cbp |
 | **C. 引入的依赖(原样,未改)** | 涂鸦开源 `rtc-tcp-client`/`iot-client`/`tuya-ble`/`common` + AWS `coreHTTP`/`coreMQTT` |
 
@@ -91,6 +91,14 @@ AC79 上手写的涂鸦 BLE GATT 配网传输层(SDK 原版无):
 - **`TUYA_OTA_ENABLE=0` 时**提供空实现,调用方无需 `#ifdef` 包裹。
 - **双备份**:配合 `CONFIG_DOUBLE_BANK_ENABLE=1`(两份固件并存 ~4.6MB),`CONFIG_AUDIO_PACKRES_LEN` 缩到 512KB 腾空间。OTA 提示音(OtaInUpdate/OtaSuccess/OtaFailed.mp3)是杰理官方 SDK 自带的,overlay 不含。
 
+### A7. `tuya_music.c` + `.h` — 涂鸦音乐技能(解析)⭐新增
+"播放XXX的歌"时云端回音乐 SKILL JSON(带试听 mp3 URL)。本文件并行重组文本流并解析出 URL/歌名/歌手,播放交给 `app_music` 网络解码链(demo.c ⑤ 交接块编排):
+- **并行重组**:on_text 每片 `tuya_music_text_accum`(START 开缓冲 / MIDDLE 追加 / END 交付解析),on_event `TAI_EVT_END` 兜底 flush(SDK 会丢空文本帧);4KB 会话级缓冲,新会话 `tuya_music_reset` 清残留。
+- **判音乐(两级,照搬 agentic-kit music_play_demo)**:① 快速通道——带引号字面量 `"code":"music"` 在全流任意位置命中即算;② 变体兜底——取 data 一刀截断验 code,验完还原。**关键坑**:一轮文本流是 ASR/SKILL/NLG 多个完整 JSON 信封首尾拼接,全文档第一个 `"data"` 属 ASR 信封——按 `"data"` 钻取永远轮不到音乐信封(实测踩坑,歌播不出来即此);钻取必须从只在音乐信封出现的 `"general"` 键进(general→data→audios→[0])。
+- **demo.c ⑤ DAC 交接**:TTS 排空(播完"正在为您播放…")→ `_device_net_audio_play(0)` 停 TTS 解码器让出 DAC(前后各 300ms,防 subdevice_dac 格式重配断言)→ `app_music_tuya_play_url` → 等播完(dec_end 回调/busy=0/600s 兜底)→ 恢复 TTS 播放器回听音。barge-in 打断 TTS 报幕时丢弃 pending 音乐(请求已过时)。
+- **音乐 barge-in(说话可停乐)**:等待循环逐帧 `opus_frame_stat`,VAD 在线 + **3 帧连续**(120ms)sum≥`BARGE_MIN_ENERGY` 才停乐(判据同 `barge_in_energy_confirmed`,断一帧重数,滤音乐瞬态拍子);开头 1s 不设防(DAC 交接瞬态/曲首重拍);每秒打 `[MUSIC-DBG]` 能量基线供调门槛(AEC 对连续音乐的效果未验证,若"音乐自己把自己打断"就调高门槛);停乐后排 ~300ms 残响再回听音。**打断词本身与音乐混叠不作数**——语义是"停乐后听",下一句等音乐停了再说。
+- **⚠️ 试听版仅 ~30s 片段**;完整歌曲需在涂鸦平台购买音乐高级能力授权。
+
 ---
 
 ## B. 改动的 SDK 原有文件
@@ -98,7 +106,7 @@ AC79 上手写的涂鸦 BLE GATT 配网传输层(SDK 原版无):
 ### B1. `apps/wifi_story_machine/board/wl82/Makefile`
 - **DEFINES**(L151):追加 `-DHTTP_DO_NOT_USE_CUSTOM_CONFIG -DMQTT_DO_NOT_USE_CUSTOM_CONFIG -DIOT_DO_NOT_USE_CUSTOM_CONFIG`(让 coreHTTP/coreMQTT/iot-client 用默认配置,不引各自 *_config.h)
 - **INCLUDES**(L155, L244-255):追加 12 条 `-I` —— `tuya_inc`(最高优先级覆盖 stdbool.h)、`tuya_agentic`、`pal`、`common`、`rtc-tcp-client/include`、`iot-client/include`+`src`、`coreHTTP` include+interface+llhttp、`coreMQTT` include+interface、`tuya-ble/include`
-- **c_SRC_FILES**(L635-666):追加 34 个涂鸦源文件 —— rtc-tcp-client(7)+iot-client(11)+common(3)+coreHTTP(4)+coreMQTT(3)+`pal_ac791n.c`+`tuya_agentic_demo.c`+`tuya_ble_prov.c`+`le_net_cfg_tuya.c`
+- **c_SRC_FILES**(L635-666):追加 35 个涂鸦源文件 —— rtc-tcp-client(7)+iot-client(11)+common(3)+coreHTTP(4)+coreMQTT(3)+`pal_ac791n.c`+`tuya_agentic_demo.c`+`tuya_ble_prov.c`+`le_net_cfg_tuya.c`+`tuya_music.c`(音乐SKILL解析);另**删掉**未用到的第三方 LLM 源文件/头路径(volc/onesdk/duer/QYAI/tc_iot 等,见与 SDK 原版 Makefile 的 diff)
 - **LFLAGS**:不动(复用宿主 `libmbedtls_3_4_0.a` / `cJSON.a` / `lwip_2_2_0.a` / `lib_mqtt.a`)
 
 ### B2. `apps/common/config/user_cfg.c` — AEC 参数覆盖(为 barge-in)
@@ -113,7 +121,8 @@ AC79 上手写的涂鸦 BLE GATT 配网传输层(SDK 原版无):
 
 > 注意:VM 176~180 的三元组存取**不在本文件**,而在 `tuya_agentic_demo.c`。本文件只有这一处 AEC 覆盖改动。
 
-### B3. `apps/wifi_story_machine/app_music.c` — 三处小改(无 TTS 解码)
+### B3. `apps/wifi_story_machine/app_music.c` — 四处改动(无 TTS 解码)
+- **音乐技能播放导出(末尾新增块)**:`app_music_tuya_play_url(url, on_dec_end)`(试听 mp3 URL → `net_music_dec_file`,https 自动 TLS → mp3 解码 → DAC;提示音在播则链式接续)、`app_music_tuya_music_stop/busy`(demo.c ⑤ 交接块用:busy=0 感知下载/解码失败,不必傻等 600s)。
 - `app_music_play_netcfg_prompt()`(L3572):播 `NetCfgEnter.mp3`,供 demo.c 配网提示任务周期播报。
 - `app_music_play_ota_prompt(int type)`(L3580):**OTA 提示音播报**,供 `tuya_ota.c` 跨文件调用(0=正在升级 / 1=升级成功 / 2=升级失败)。`app_music_play_voice_prompt` 是 static,需在 app_music.c 内包一层导出。
 - K6(`KEY_PHOTO`)长按(L4447-4457,`#if CONFIG_TUYA_AGENTIC_ENABLE`):调 `tuya_clear_provision_and_reset()`。K6 短按仍是绘本识别(不动)。
@@ -126,6 +135,7 @@ AC79 上手写的涂鸦 BLE GATT 配网传输层(SDK 原版无):
 #define TUYA_DOWNLINK_OPUS_ENABLE      // 下行 TTS opus(已开启;已调通,~2KB/s 治拥挤网卡顿。注释掉切回 PCM)
 #define TUYA_BARGE_IN_ENABLE           // 用户打断 TTS 开关(已开启;强依赖 AEC、有竞态、实验性)
 #define TUYA_SERVER_VAD_ENABLE         // 云端 VAD 停说判定(已开启;开口仍本地VAD,停说由云端TAI_EVT_SERVER_VAD决定,带本地2s超时兜底)
+#define TUYA_MUSIC_ENABLE               // 涂鸦音乐技能(已开启;SKILL解析→app_music网络解码播放,支持barge-in停乐)
 #define TUYA_OTA_ENABLE         1      // 涂鸦云 OTA(开机连 AI 前检查一次,有升级则下载烧写重启)
 #define TUYA_FIRMWARE_VERSION   "1.0.11"// 出厂基线版本号;发版前改成与涂鸦平台填的一致
 ```
@@ -188,4 +198,4 @@ flash 布局改动(为双备份 OTA 腾空间):
 
 ## 数据流一句话
 
-`mic → audio_input.c(enc+VAD+AEC)→ pcm_cbuff_w → demo.c _device_get_voice_data → tai_send_audio_chunk(上行 PCM)`;`云端 opus → demo.c on_audio → _device_write_voice_data(整包直写)→ pcm_cbuff_r → audio_input.c dec(CBR opus_cbr_pktlen=80, sample_rate=0 自动重采样 48k→DAC)→ DAC`。barge-in = AEC + VAD + 3 帧能量确认,触发后 `chat_break` + 清 rbuf + 排 stale mic + 1000ms 冷却 + 补发 onset 帧。停说判定:`TUYA_SERVER_VAD_ENABLE` 时等云端 `TAI_EVT_SERVER_VAD`(本地 2s 静音兜底),否则本地 VAD 直接判停说。OTA = 开机连 AI 前 `tuya_ota_check_and_upgrade`(ATOP 查升级 → 下载烧写 → 自动重启)。
+`mic → audio_input.c(enc+VAD+AEC)→ pcm_cbuff_w → demo.c _device_get_voice_data → tai_send_audio_chunk(上行 PCM)`;`云端 opus → demo.c on_audio → _device_write_voice_data(整包直写)→ pcm_cbuff_r → audio_input.c dec(CBR opus_cbr_pktlen=80, sample_rate=0 自动重采样 48k→DAC)→ DAC`。barge-in = AEC + VAD + 3 帧能量确认,触发后 `chat_break` + 清 rbuf + 排 stale mic + 1000ms 冷却 + 补发 onset 帧。停说判定:`TUYA_SERVER_VAD_ENABLE` 时等云端 `TAI_EVT_SERVER_VAD`(本地 2s 静音兜底),否则本地 VAD 直接判停说。OTA = 开机连 AI 前 `tuya_ota_check_and_upgrade`(ATOP 查升级 → 下载烧写 → 自动重启)。音乐 = 云端音乐 SKILL(`tuya_music.c` 并行重组+解析)→ TTS 报幕排空后让出 DAC → `app_music_tuya_play_url`(net_download https → mp3 解码 → DAC)→ 播完或 barge-in(VAD+3 帧能量门)停乐后恢复 TTS 播放器回听音。

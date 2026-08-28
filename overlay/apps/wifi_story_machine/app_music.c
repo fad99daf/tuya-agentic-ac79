@@ -2800,6 +2800,73 @@ static int app_music_play_net_music(void *url)
     return net_music_dec_file(url, 0, net_music_dec_end, 0);
 }
 
+/* ===== 涂鸦音乐技能播放(供 apps/common/LLM/tuya_agentic 跨文件调用)=====
+ * 云端音乐 SKILL 回下发的试听 mp3 URL 交给杰理网络解码链:
+ *   net_download_open(http_ops 后端,https 前缀自动走 TLS)→ mp3 解码 → DAC。
+ * 与上面 ai_server_event_handler 的 AI_SERVER_EVENT_URL 媒体路径一致:
+ * 切 NET_MUSIC_MODE → 停当前解码 → net_music_dec_file。
+ * on_dec_end:整首播完或下载/解码出错停机时回调一次(dec_server_event_handler
+ * 的 END/ERR 两个 case 都会触发 do_dec_end_handler,失败不会漏调),
+ * tuya 侧据此清"音乐播放中"标志。
+ * 返回 0=已受理(异步起播;若提示音在播会链式接在其后),<0=起播失败。*/
+static void (*tuya_music_end_cb)(int);
+
+static int tuya_net_music_dec_end(int arg)
+{
+    net_music_dec_stop(arg);
+    if (tuya_music_end_cb) {
+        tuya_music_end_cb(arg);
+    }
+    return 0;
+}
+
+/* 提示音播完后接续起播(dec_end 链式 handler,arg 传 url 指针) */
+static int tuya_play_net_music_after_prompt(int url)
+{
+    return net_music_dec_file((void *)url, 0, tuya_net_music_dec_end, 0);
+}
+
+int app_music_tuya_play_url(const char *url, void (*on_dec_end)(int))
+{
+    if (!url || !url[0]) {
+        return -1;
+    }
+    tuya_music_end_cb = on_dec_end;
+    __this->play_tts   = 0;      /* 媒体路径(非语音播报):不存断点不存文件 */
+    __this->total_time = 0;      /* 清上一首歌信息 */
+    if (__this->mode != NET_MUSIC_MODE) {
+        app_music_play_mode_switch_notify();
+        __this->mode = NET_MUSIC_MODE;
+    }
+    if (__this->play_voice_prompt) {
+        if (__this->dec_end_handler != (void *)app_music_shutdown) {
+            set_dec_end_handler(__this->dec_end_file, tuya_play_net_music_after_prompt, (int)url, -1);
+            return 0;
+        }
+    }
+    return net_music_dec_file((void *)url, 0, tuya_net_music_dec_end, 0);
+}
+
+/* 强停当前网络音乐(会话退出/等待超时兜底),并清断点防下次错误续播 */
+void app_music_tuya_music_stop(void)
+{
+    if (__this->dec_ops == &net_music_dec_ops) {
+        __this->dec_ops->dec_stop(0);
+        __this->net_bp.dec_bp.len = 0;
+    }
+}
+
+/* 网络音乐是否仍占用(下载中或解码中):net_file 从 net_download_open 起非空,
+ * 到 dec_end/出错停机被关掉置空。tuya 等待循环据此感知下载失败提前退出
+ * (失败路径 __net_music_dec_file 的 __err 不走 dec_end 回调)。*/
+int app_music_tuya_music_busy(void)
+{
+    if (__this->dec_ops != &net_music_dec_ops) {
+        return 0;
+    }
+    return __this->net_file != NULL;
+}
+
 static int app_music_ai_listen_start(u8 voice_mode, u8 enable_vad);
 
 //第三方平台的事件通知回调

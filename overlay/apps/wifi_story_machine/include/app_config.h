@@ -229,9 +229,15 @@
 #define CONFIG_TUYA_AGENTIC_ENABLE            //涂鸦 AgenticKit(连涂鸦 AI 云,apps/common/LLM/tuya_agentic)
 /* ===== 涂鸦下行 TTS 编码开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下生效)=====
  * 不定义(默认)= PCM:稳定能播,但 16k/16bit/mono=32KB/s,拥挤测试网易卡顿。
- * 定义下面宏 = opus:~2KB/s(1/16 带宽),云端确认支持(codec=111)。
- *   实现已调通:CBR 模式 + opus_cbr_pktlen=80 + sample_rate=0(解码器自动 48k 重采样到 DAC)。
- *   出问题可注释掉切回 PCM。*/
+ * 定义下面宏 = opus:~2KB/s(1/16 带宽),云端确认支持(codec=111),帧长 80B/16kbps/40ms。
+ *   opus 解码目前还在调(啸叫,疑 TCP 分帧重组 / 解码器兼容问题),先留开关切回 PCM。
+ *   调 opus 时把下一行注释去掉即可。*/
+/* 2026-08-27 颤音排查:opus 下行(48k 解码→软件 SRC 降 16k)播 TTS 有颤音,PCM 16k 直通干净(开机提示音验证)。
+ * 暂切 PCM 做对照:PCM 也不颤→元凶在 opus 解码/SRC;PCM 也颤→元凶在网络播放链路。
+ * 要恢复 opus 下行,取消下一行注释即可。*/
+/* 2026-08-28 回退:本地 libopus 软解方案在 silk_Decode 内触发确定性 axi_wr_inv 崩溃(根因未解),
+ * 已放弃,恢复原杰理闭源 opus 解码路径(48k 出→软件 SRC 降 16k,颤音随之回来)。
+ * 带宽仍是 opus 的 ~2KB/s。若颤音不可接受,注释下一行切纯 PCM 下行(实测不颤)。*/
 #define TUYA_DOWNLINK_OPUS_ENABLE
 
 /* ===== 涂鸦 barge-in(用户打断 TTS)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
@@ -251,11 +257,26 @@
  *   简单但易误判(话没说好就触发→ASR收空文本)。*/
 #define TUYA_SERVER_VAD_ENABLE
 
+/* ===== 涂鸦音乐技能(音乐播放)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
+ * 定义(默认)= 支持"播放XXX的歌":云端音乐 SKILL 回试听 mp3 URL(参考
+ *   agentic-kit music_play_demo),设备解析后交给杰理网络音乐解码链播放
+ *   (net_download→mp3 解码,https 自动 TLS)。实现:
+ *   apps/common/LLM/tuya_agentic/tuya_music.c(解析)+ app_music.c(导出
+ *   app_music_tuya_play_url)+ tuya_agentic_demo.c ⑤ 交接块。
+ *   ⚠️ 试听版仅 ~30s 片段;完整歌曲需在涂鸦平台购买音乐高级能力授权。
+ *   ⚠️ 播放期间不上行(音乐回采不进 ASR);说话可打断——VAD+能量门 3 帧双
+ *      确认停乐回听音,若"音乐自己把自己打断"就调 BARGE_MIN_ENERGY(demo ⑤)。
+ * 不定义 = 音乐 SKILL 回复仅当普通文本打印,不起播。*/
+#define TUYA_MUSIC_ENABLE
+
 /* ===== 涂鸦云 OTA(固件升级)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
- * TUYA_FIRMWARE_VERSION:出厂基线版本号(固件编译期写死)。每次发版前改成和涂鸦平台
- *   上传固件时填的版本号一致,然后编译+出 OTA 包+传平台。
- *   (跨 OTA 自动持久化版本号已验证不可靠——VM/USER/BTIF/RTC 均会被擦除/覆盖,
- *   故采用手动版本号方案。)
+ * TUYA_FIRMWARE_VERSION:出厂基线版本号(固件编译期写死)。只用于"首次上电,VM 还没存
+ *   过平台下发版本"时的兜底上报值,正常发版【不需要改它】。
+ *   真正上报给涂鸦云的版本 = tuya_get_effective_sw_ver():
+ *     - 优先读 VM(平台上次 OTA 下发的版本号,OTA 成功烧写前会写进 VM)
+ *     - VM 没有就用本宏 TUYA_FIRMWARE_VERSION
+ *   这样:源码永远报 1.0.0,平台每次配新升级包(如 1.0.3),设备升级完就把 1.0.3
+ *   存进 VM,重启后上报 1.0.3 == 平台 1.0.3,不再重复升级。源码版本号与平台解耦。
  * TUYA_OTA_ENABLE:1=开机连 AI 前检查一次涂鸦云 OTA;0=关闭(不检查)。
  *   检查到新固件会:播报提示音 -> HTTPS 下载 -> 烧写 flash -> 自动重启。
  *   实现见 apps/common/LLM/tuya_agentic/tuya_ota.c。*/
@@ -449,7 +470,7 @@
 #endif
 #endif
 
-#define CONFIG_DOUBLE_BANK_ENABLE           1//1: 双备份方式升级(OTA 需要) 0:单备份方式升级
+#define CONFIG_DOUBLE_BANK_ENABLE           1//1: 双备份方式升级 0:单备份方式升级
 
 #define CONFIG_UPGRADE_FILE_NAME            "update.ufw"
 #define CONFIG_UPGRADE_PATH                 CONFIG_ROOT_PATH\

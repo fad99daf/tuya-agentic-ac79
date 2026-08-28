@@ -25,6 +25,14 @@
 #include "tuya_ai.h"
 #include "tuya_agentic.h"
 #include "tuya_ble_prov.h"        /* tuya_ble_wifi_creds_t(BLE 配网结果类型)*/
+#ifdef TUYA_MUSIC_ENABLE
+#include "tuya_music.h"           /* 音乐 SKILL 文本流重组+解析(实现 tuya_music.c) */
+/* 实现见 apps/wifi_story_machine/app_music.c(导出模式同 app_music_play_netcfg_prompt):
+ * net_download(https 自动 TLS)→ mp3 解码;on_dec_end 在播完/出错停机时回调。*/
+int  app_music_tuya_play_url(const char *url, void (*on_dec_end)(int));
+void app_music_tuya_music_stop(void);
+int  app_music_tuya_music_busy(void);   /* 网络音乐仍占用(下载/解码中):等待循环感知失败退出 */
+#endif
 
 /* 阶段3 用的音频流接口(实现见 apps/common/LLM/audio/audio_input.c)。
  * 这里【故意不】#include "audio_input.h":它会经 audio_server.h → utils/fs/fs.h 引入
@@ -42,6 +50,7 @@ void stop_audio_stream(void);
 int  get_recoder_state(void);
 unsigned int _device_get_voice_level(void);   /* 录音 cbuf 水位,诊断上行是否丢话头 */
 unsigned int _device_get_play_level(void);    /* 下行播放 cbuf 水位:排空≈DAC 播完 */
+void _device_net_audio_play(bool flag);       /* 停/起 TTS 网络播放器(音乐交接时让出/收回 DAC) */
 
 /* ===== 上行延迟诊断开关(定位"打断不佳"用)=====
  * 打开后在 tai_send_audio_chunk 前后打时间戳,超 UPLINK_LAT_WARN_MS 才打印(避免刷屏)。
@@ -55,9 +64,9 @@ unsigned int _device_get_play_level(void);    /* 下行播放 cbuf 水位:排空
 #endif
 
 /* === 产品三件套(涂鸦 IoT 平台创建产品时获得,构建期固定)===(前端填这个)*/
-#define TUYA_PRODUCT_KEY    "YOUR_PID_HERE"              /* PID */
-#define TUYA_UUID           "YOUR_UUID_HERE"          /* 设备 UUID */
-#define TUYA_AUTH_KEY       "YOUR_AUTHKEY_HERE"  /* 授权码 AuthKey */
+#define TUYA_PRODUCT_KEY    "YOUR_PID_HERE"                 /* PID */
+#define TUYA_UUID           "YOUR_UUID_HERE"                /* 设备 UUID */
+#define TUYA_AUTH_KEY       "YOUR_AUTHKEY_HERE"             /* 授权码 AuthKey */
 
 /* === 激活 token(配网时涂鸦 App 下发;调试期可从平台/App 取一次填这里)===(前端填这个)*/
 #define TUYA_ACTIVATION_TOKEN "xxxxxxxx"
@@ -90,12 +99,20 @@ static volatile int g_audio_ready;        /* 音频流已起:on_audio 才允许�
 static volatile int g_tts_playing;        /* 云端正在播 TTS:期间暂停上行,防麦克风采到自身喇叭 */
 static volatile int g_turn_done;          /* 本轮回复结束(TAI_EVT_END),可重新听音 */
 static volatile int g_barge_in;           /* barge-in 触发:跳过 TTS 后清缓冲/冷却,直接进新一轮(TUYA_BARGE_IN_ENABLE)*/
-static volatile int g_exit;               /* on_disconnect 置位:令语音循环退出 */
+static volatile int g_exit;               /* on_disconnect 置位:令本次会话的语音循环退出(supervisor 稍后重连) */
+static volatile int g_link_broken;        /* 上行发送失败:链路已断,快速报废本次会话交 supervisor 重连(不等 60s 超时) */
+static volatile int g_mqtt_ka_run;        /* MQTT 心跳线程运行标志:生命周期=整个 tuya 流程,不跟 AI 会话共存亡 */
 static int g_audio_frame_logged;          /* 下行首帧帧长只打印一次,供核对 opus_cbr_pktlen */
 #ifdef TUYA_SERVER_VAD_ENABLE
 static volatile int g_server_vad_stop;    /* 云端VAD(TAI_EVT_SERVER_VAD)通知停说:上行循环据此收尾。on_event 在 worker 线程置位,主循环读 */
 #endif
 static volatile unsigned int g_barge_cooldown_until; /* barge-in 冷却到期 ms 时间戳;此前的 g_tts_playing 视为老轮在途残响,忽略(0=始终过期) */
+#ifdef TUYA_MUSIC_ENABLE
+static volatile int g_music_playing;   /* app_music 网络音乐播放中:期间不上行(音乐回采会假触发 VAD),播完回听音 */
+/* dec_end 回调(app_music 解码事件上下文触发):整首播完/下载解码出错停机。
+ * 只清标志——不在此碰播放器(跨线程),TTS 播放器的恢复由语音循环侧做。*/
+static void tuya_music_dec_end_cb(int arg) { (void)arg; g_music_playing = 0; }
+#endif
 extern unsigned int timer_get_ms(void);   /* system/timer.h,单调 ms */
 /* barge-in 冷却是否已过:过期=可受理新 g_tts_playing 信号(云端真回话/真打断);
  * 未过期=老轮 chat_break 后在途 TTS 残响,忽略以免二次触发(竞态)。
@@ -259,13 +276,35 @@ static void on_mqtt_message(const char *topic, size_t topic_len,
            data ? (const char *)data : "(null)");
 }
 
-/* MQTT 心跳维持线程(MQTT 常驻模式)。 */
+/* MQTT 心跳维持线程(MQTT 常驻模式)。
+ * 断线自愈:iot_client_process 连续 2 轮(≈10s)失败判定连接死亡,销毁旧句柄
+ * (防泄漏,try_connect 直接覆盖指针不 free)后重连;重连退避 5s→10s→…→60s
+ * 封顶,成功后自然复位(重新从连续失败计数开始)。WiFi 掉线由 SDK 层自动重连
+ * (WIFI_EVENT_STA_DISCONNECT → NET_EVENT_DISCONNECTED_AND_REQ_CONNECT →
+ * wifi_return_sta_mode),这里只管 MQTT 层。*/
 static void tuya_mqtt_keepalive_task(void *arg)
 {
+    extern int  iot_client_message_connect(iot_client_t *client);    /* src/iot_client_message.h 未进公共头 */
+    extern void iot_client_message_disconnect(iot_client_t *client);
     iot_client_t *iot = (iot_client_t *)arg;
     if (!iot) return;
-    while (!g_exit) {
-        iot_client_process(iot, 0);
+    int fail_cnt = 0;
+    while (g_mqtt_ka_run) {
+        int ret = iot_client_process(iot, 0);
+        if (ret == 0) {
+            fail_cnt = 0;
+        } else if (++fail_cnt >= 2) {   /* 单次失败可能是瞬断,连续 2 轮才判死 */
+            printf("[TUYA] mqtt dead (ret=%d), reconnect...\r\n", ret);
+            iot_client_message_disconnect(iot);
+            unsigned int backoff = 5000;
+            while (g_mqtt_ka_run && iot_client_message_connect(iot) != 0) {
+                printf("[TUYA] mqtt reconnect fail, retry in %ums\r\n", backoff);
+                msleep(backoff);
+                if (backoff < 60000) backoff *= 2;
+            }
+            if (g_mqtt_ka_run) printf("[TUYA] mqtt reconnected\r\n");
+            fail_cnt = 0;
+        }
         os_time_dly(500);
     }
 }
@@ -318,6 +357,12 @@ static void on_text(tai_ctx_t *ctx, const tai_text_msg_t *msg, void *ud)
 {
     (void)ctx; (void)ud;
     printf("[TUYA-AI] %.*s\r\n", (int)msg->len, msg->text);
+#ifdef TUYA_MUSIC_ENABLE
+    /* 并行重组文本流:音乐 SKILL 是一份可跨分片的完整 JSON,拼完才能解析
+     * (msg->text 无 '\0' 结尾,tuya_music_text_accum 内部先按 len 拷贝)。
+     * NLG 流重组后不是音乐响应,自然丢弃(逐片打印已在上面完成)。*/
+    tuya_music_text_accum((int)msg->stream_flag, msg->text, msg->len);
+#endif
 }
 static void on_audio(tai_ctx_t *ctx, const tai_audio_msg_t *msg, void *ud)
 {
@@ -336,16 +381,14 @@ static void on_audio(tai_ctx_t *ctx, const tai_audio_msg_t *msg, void *ud)
         _device_rbuf_clear();
         tts_prebuffer_arm();
     }
-#ifdef TUYA_DOWNLINK_OPUS_ENABLE
     if (g_audio_frame_logged < 5) {
-        /* 打印前 5 帧 len:核对 opus_cbr_pktlen。全一致=CBR(该值即每帧字节);忽大忽小=云端非 CBR */
+        /* 打印每会话前 5 帧:opus 模式核对 CBR pktlen;PCM 模式核对云端确实发 codec=101/16k */
         printf("[TUYA-AI] on_audio #%d: len=%d codec=%u sr=%u frame_ms=%u stream=%u\r\n",
                g_audio_frame_logged + 1, (int)msg->len, (unsigned)msg->codec,
                (unsigned)msg->sample_rate, (unsigned)msg->frame_duration,
                (unsigned)msg->stream_flag);
         g_audio_frame_logged++;
     }
-#endif
     _device_write_voice_data((void *)msg->data, msg->len);
 }
 static void on_event(tai_ctx_t *ctx, const tai_event_msg_t *msg, void *ud)
@@ -355,6 +398,9 @@ static void on_event(tai_ctx_t *ctx, const tai_event_msg_t *msg, void *ud)
         if (dc) {
             dc->got_done = 1;            /* 兼容独立文本 demo */
         }
+#ifdef TUYA_MUSIC_ENABLE
+        tuya_music_text_flush();         /* SDK 丢空文本帧:半截流可能等不到显式 END,兜底交付解析 */
+#endif
         g_turn_done   = 1;
         g_tts_playing = 0;
         printf("[TUYA-AI] === 回答结束 ===\r\n");
@@ -395,7 +441,7 @@ static void on_disconnect(tai_ctx_t *ctx, const tai_disconnect_msg_t *msg, void 
     (void)ctx; (void)ud;
     printf("[TUYA-AI] disconnected: reason=%u close_code=%u\r\n",
            (unsigned)msg->reason, (unsigned)msg->close_code);
-    g_exit = 1;   /* 令语音循环退出(v1:下次开机重跑;常驻重连留作 fast-follow) */
+    g_exit = 1;   /* 令本次会话语音循环退出,tuya_ai_run 监督循环稍后重连(拿新 token 重 connect) */
 }
 
 /* ------------------------------------------------------------------------- */
@@ -648,18 +694,22 @@ static int barge_in_energy_confirmed(void)
 }
 #endif
 
-/* 给定 iot_client(已激活/已初始化)+ local_key,换 token 并跑一轮文本对话。
- * 复用 parse_token / on_text / on_event 等。*/
-static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_key)
+/* 单次 AI 会话:get_session_token → tai_connect → 语音循环(直到 on_disconnect
+ * 置 g_exit 或发送失败置 g_link_broken)。返回会话存活时长 ms——supervisor
+ * (tuya_ai_run)据此复位重连退避。任何失败都【不碰 iot】:激活凭证/MQTT 由
+ * supervisor 跨会话持有,这里只回收 tai 侧资源(token/mem/连接)。*/
+static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const char *local_key)
 {
+    unsigned int t_start = timer_get_ms();
     char *token = (char *)malloc(4096);
-    if (!token) { iot_client_deinit(iot); return; }
+    if (!token) return 0;
     if (iot_client_get_session_token(iot, NULL, token, 4096) != 0 || !token[0]) {
-        printf("[TUYA] get_session_token fail\r\n"); free(token); iot_client_deinit(iot); return;
+        /* 云端偶发 5xx / 网络未恢复:不 deinit iot,交 supervisor 退避重试 */
+        printf("[TUYA] get_session_token fail (will retry)\r\n"); free(token); return 0;
     }
     tai_conn_params_t cp;
     if (parse_token(token, &cp) != 0) {
-        printf("[TUYA] parse_token fail\r\n"); free(token); iot_client_deinit(iot); return;
+        printf("[TUYA] parse_token fail (will retry)\r\n"); free(token); return 0;
     }
     if (cp.biz_code == 0) cp.biz_code = 65537;
     if (cp.biz_tag  == 0) cp.biz_tag  = 119;
@@ -709,39 +759,41 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
     tc.on_event = on_event; tc.on_disconnect = on_disconnect; tc.user_data = &dc;
 
     void *mem = pal->malloc(tai_ctx_size());
-    if (!mem) return;
+    if (!mem) return 0;
     tai_ctx_t *ctx = tai_ctx_init(mem, &tc);
-    if (!ctx) { pal->free(mem); return; }
+    if (!ctx) { pal->free(mem); return 0; }
     printf("[TUYA] tai_connect...\r\n");
     if (tai_connect(ctx) != TAI_OK) {
-        printf("[TUYA] tai_connect fail\r\n");
-        tai_ctx_deinit(ctx); pal->free(mem); return;
+        printf("[TUYA] tai_connect fail (will retry)\r\n");
+        tai_ctx_deinit(ctx); pal->free(mem); return 0;
     }
 
     /* ===== 阶段3:免唤醒语音对话(本地 VAD 驱动)=====
-     * 起音频流(mic OPUS 采集 + DAC 播放),然后循环:
-     *   本地VAD检测开口 → 上行OPUS → 沉默收尾 → 云端回复(on_audio 播TTS)→ 重新待命。
+     * 会话状态标志由 supervisor 在每次尝试前复位;音频流(mic 采集 + DAC 播放)
+     * 也由 supervisor 只起一次、跨会话存活(重连期间采集照跑,cbuf 环形覆盖无害)。
+     * 循环:本地VAD检测开口 → 上行PCM → 停说收尾 → 云端回复(on_audio 播TTS)→ 重新待命。
      * 回声抑制:TTS 期间 g_tts_playing=1 暂停上行,播完冷却 ~300ms 再听。 */
-    audio_stream_init(16000, 16, 1);
-    start_audio_stream();
     g_audio_ready        = 1;
     g_tts_playing        = 0;
     g_turn_done          = 1;          /* 视为"上一轮已结束",直接进入听音 */
-    g_exit               = 0;
     g_audio_frame_logged = 0;
+#ifdef TUYA_MUSIC_ENABLE
+    g_music_playing      = 0;
+    tuya_music_reset();                /* 清上一会话残留的半截文本流/未消费的音乐结果 */
+#endif
     printf("[TUYA] voice loop ready (local-VAD, uplink=PCM 16k/mono)"
 #ifdef TUYA_DOWNLINK_OPUS_ENABLE
             " downlink=opus"
 #else
             " downlink=pcm"
 #endif
+#ifdef TUYA_MUSIC_ENABLE
+            " +music"
+#endif
             "\r\n");
 
-    /* MQTT 常驻:fork 独立线程维持心跳 + 收 DP 下行(见 tuya_mqtt_keepalive_task)。
+    /* MQTT 心跳线程由 supervisor(tuya_ai_run)启动,生命周期跨会话。
      * 不能在语音循环里调 iot_client_process——它内部 TLS recv 会阻塞语音线程。*/
-    if (iot) {
-        thread_fork("tuya_mqtt_ka", 5, 6 * 1024, 0, 0, tuya_mqtt_keepalive_task, iot);
-    }
 
     /* ===== 对照实验:文本通道探针(音频流已起,若云端回 TTS 可顺带验证下行播放)=====
      *   文本正常回复 → 会话通,问题锁定在音频上行(云端 ASR 不认我们的 opus)
@@ -769,6 +821,7 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
     unsigned char abuf[TUYA_OPUS_FRAME_LEN];
     /* 上行诊断:本轮帧计数/有效帧数 + 空闲排空的底噪基线 */
     unsigned int uplink_frames = 0, uplink_active = 0;
+    unsigned int start_fails = 0;      /* audio_start 连续失败计数:≥5(≈1s)判链路死 */
     unsigned int idle_cnt = 0, idle_sum = 0, idle_act_sum = 0;
 #ifdef TUYA_SERVER_VAD_ENABLE
     /* 云端VAD模式的本地超时兜底:本地VAD连续判静音的帧数计数。
@@ -861,9 +914,15 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
             g_barge_prefill = 0;   /* 本轮没起上行,别让 prefill 漏到下一轮 */
 #endif
             printf("[TUYA] tai_send_audio_start fail\r\n");
+            if (++start_fails >= 5) {   /* 连续失败:TCP 半死(未触发 on_disconnect),别原地空转 */
+                printf("[TUYA] audio_start failed x%u, link dead\r\n", start_fails);
+                g_link_broken = 1;
+                break;
+            }
             msleep(200);
             continue;
         }
+        start_fails = 0;
 #ifdef TUYA_BARGE_IN_ENABLE
         /* barge-in 轮:先补发能量确认时读走的 onset 帧(最响那段),再进实时上行。
          * 否则 onset 丢失、上行只收尾音/静音→ASR 空→打断后无播报。*/
@@ -900,6 +959,7 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
                 unsigned int _lvl_post = _device_get_voice_level();
                 if (_snd_rt != TAI_OK) {
                     printf("[TUYA] tai_send_audio_chunk fail\r\n");
+                    g_link_broken = 1;   /* 发送失败=链路断,快速报废本会话(supervisor 重连) */
                     break;
                 }
                 /* 超时 或 水位异常高 才打印 */
@@ -911,13 +971,15 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
 #else
                 if (tai_send_audio_chunk(ctx, abuf, TUYA_OPUS_FRAME_LEN) != TAI_OK) {
                     printf("[TUYA] tai_send_audio_chunk fail\r\n");
+                    g_link_broken = 1;   /* 发送失败=链路断,快速报废本会话(supervisor 重连) */
                     break;
                 }
 #endif
 
                 uplink_frames++;
                 if (fact > 3) uplink_active++;   /* 新度量下 fact=avg|sample|/100;>3 即 avg>300(远超 idle 底噪 avg<50)≈有效话音帧 */
-                printf("[TUYA] uplink f#%u sum=%u act=%u%%\r\n", uplink_frames, fsum, fact);
+                if (uplink_frames % 25 == 1)     /* 40ms/帧,25帧≈1s 一条:压测长跑防串口刷屏拖慢上行节拍 */
+                    printf("[TUYA] uplink f#%u sum=%u act=%u%%\r\n", uplink_frames, fsum, fact);
             }
 #ifdef TUYA_SERVER_VAD_ENABLE
             /* 云端VAD模式:停说由云端 TAI_EVT_SERVER_VAD 决定(更准),本地只做超时兜底。
@@ -950,7 +1012,7 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
 
         /* ④ 等本轮回复结束(云端 TTS 播完,TAI_EVT_END 置 g_turn_done)再回 ① */
         int w = 0;
-        while (!g_exit && !g_turn_done && w < TUYA_WAIT_MS) {
+        while (!g_exit && !g_link_broken && !g_turn_done && w < TUYA_WAIT_MS) {
 #ifdef TUYA_BARGE_IN_ENABLE
             /* barge-in:TTS 播放期间本地 VAD 检测到说话 → 打断。靠 AEC 保证 VAD 不是被回声触发。*/
             if (g_tts_playing && get_recoder_state() && barge_cooldown_expired()) {
@@ -972,7 +1034,7 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
         /* 回复期间(TTS 播放/等云端)录音 cbuf 积压了环境音/TTS 回采,这里清掉——
            此刻没有要保留的用户语音,清它是安全的(与"VAD触发时清"不同,那才会吞掉话音)。
            barge-in 时用户正在说话,【不能】清缓冲也不能冷却,跳过直接进新一轮上行。*/
-        if (!g_barge_in) {
+        if (!g_barge_in && !g_link_broken) {   /* 链路断:不等 TTS 到达/排空,直接报废会话 */
             /* 等 DAC 真正播完再听:云端 EVT_END(本轮发完)时,下行 jitter buffer 里可能还压着
              * 几秒 TTS,喇叭仍在播。若这时去听,麦克风采到正在播的 TTS→当新问题→自说自话。
              * 改成等下行 cbuf(pcm_cbuff_r)排空(≈DAC 播完)再听,从根上消除"云端发完≠喇叭播完"。
@@ -1051,15 +1113,153 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
                 _device_get_voice_data(_trash, sizeof(_trash));
             }
         }
+#ifdef TUYA_MUSIC_ENABLE
+        /* ⑤ 音乐技能交接:本轮云端回了音乐 SKILL(试听 mp3 URL,解析见 tuya_music.c)。
+         * 上面的 TTS 排空已把"正在为您播放…"播完 → 停我们的 TTS 解码器让出 DAC →
+         * 交给 app_music 网络解码(net_download,https 自动 TLS)→ 等整首播完
+         * (dec_end 回调清 g_music_playing)→ 重启 TTS 播放器,回 ① 继续听音。
+         * ★ 播放期间不上行(音乐回采不该进 ASR),但可 barge-in 停乐:照搬 TTS drain
+         *   的"VAD+能量门"双确认(见下面等待循环)。AEC 对连续音乐的效果未验证,
+         *   故开头 1s 不设防、每秒打一次 mic 能量基线([MUSIC-DBG]),实测误触发
+         *   ("音乐自己把自己打断")就调 BARGE_MIN_ENERGY。
+         * ★ DAC 交接前后各等 300ms:两个解码器共享 DAC,边停边开会踩到
+         *   subdevice_dac 的格式重配断言(2026-08-27 提示音教训)。*/
+        if (tuya_music_pending() && g_barge_in) {
+            /* barge-in 打断了"正在为您播放…":用户已改口,音乐请求过时,丢弃。
+             * 不丢会把用户新话音压在整首歌后面才被听到。*/
+            printf("[TUYA-MUSIC] pending music dropped (barge-in)\r\n");
+            tuya_music_clear_pending();
+        }
+        if (tuya_music_pending() && !g_link_broken) {
+            char murl[512];
+            strncpy(murl, tuya_music_get_url(), sizeof(murl) - 1);
+            murl[sizeof(murl) - 1] = '\0';
+            printf("[TUYA-MUSIC] play: %s - %s\r\n",
+                   tuya_music_get_artist(), tuya_music_get_name());
+            tuya_music_clear_pending();          /* 先消费:防下轮误重播 */
+            _device_net_audio_play(0);           /* 停 TTS 解码器:让出 DAC */
+            msleep(300);                         /* 等 audio_server 释放 DAC */
+            g_music_playing = 1;
+            if (app_music_tuya_play_url(murl, tuya_music_dec_end_cb) != 0) {
+                printf("[TUYA-MUSIC] start play fail, restore TTS player\r\n");
+                g_music_playing = 0;
+                msleep(300);
+                _device_net_audio_play(1);       /* 恢复 TTS 播放器 */
+            } else {
+                /* 等播完(试听 ~30s,整首几分钟;600s 兜底防卡死)。
+                 * 退出条件:dec_end 回调清 g_music_playing(播完/解码停机);
+                 * 或 busy=0——下载失败路径 __net_music_dec_file 的 __err 不走
+                 * dec_end 回调,靠 net_file 已被关闭置空感知,别傻等 600s。
+                 * _device_get_voice_data 内部按帧节拍(~40ms)阻塞,顺带排空 mic:
+                 * 音乐回采不积压,播完立刻干净听音(不会把音乐尾巴当新问题)。
+                 * barge-in(TUYA_BARGE_IN_ENABLE,判据照搬 barge_in_energy_confirmed):
+                 *   VAD 在线 + 3 帧连续(120ms) sum≥BARGE_MIN_ENERGY 才停乐,断一帧
+                 *   就重数——滤掉音乐瞬态拍子。若 AEC 把音乐消得够低,音乐回声到不了
+                 *   门槛,只有贴脸的人声能过;实测过不了关就调门槛。
+                 *   开头 25 帧(1s)不设防:避开 DAC 交接瞬态和曲首重拍。*/
+                unsigned int mstart = timer_get_ms();
+#ifdef TUYA_BARGE_IN_ENABLE
+                unsigned int mframes = 0, mhi = 0;   /* 帧计数 / 连续达标帧数 */
+                unsigned int msums[3] = {0, 0, 0};
+                int mbarge = 0;
+#endif
+                while (!g_exit && !g_link_broken && g_music_playing &&
+                       app_music_tuya_music_busy() &&
+                       timer_get_ms() - mstart < 600000) {
+                    unsigned char _mt[TUYA_OPUS_FRAME_LEN];
+                    if (_device_get_voice_data(_mt, sizeof(_mt)) != sizeof(_mt)) {
+                        continue;               /* 读不够一帧:等下一拍再来 */
+                    }
+#ifdef TUYA_BARGE_IN_ENABLE
+                    mframes++;
+                    unsigned int mes, mea;
+                    opus_frame_stat(_mt, sizeof(_mt), &mes, &mea);
+                    if ((mframes % 25) == 0) {  /* 每 ~1s 打能量基线:调门槛看这个 */
+                        printf("[MUSIC-DBG] playing, mic post-AEC: sum=%u act=%u%% rec=%d\r\n",
+                               mes, mea, get_recoder_state());
+                    }
+                    if (mframes > 25 && get_recoder_state() && mes >= BARGE_MIN_ENERGY) {
+                        msums[mhi++] = mes;
+                        if (mhi >= 3) {         /* 3 帧连续达标:确认真话音,停乐 */
+                            printf("[TUYA-MUSIC] barge-in: stop music (sums=%u,%u,%u)\r\n",
+                                   msums[0], msums[1], msums[2]);
+                            mbarge = 1;
+                            break;
+                        }
+                    } else {
+                        mhi = 0;                /* VAD 掉线/能量掉线:重数 */
+                    }
+#endif
+                }
+                if (g_music_playing) {           /* 超时/失败/打断/退出:强停,防 DAC 被占死 */
+                    printf("[TUYA-MUSIC] stop (%s)\r\n",
+#ifdef TUYA_BARGE_IN_ENABLE
+                           mbarge ? "barge-in" :
+#endif
+                           app_music_tuya_music_busy() ? "timeout/exit" : "download/decode fail");
+                    app_music_tuya_music_stop();
+                    g_music_playing = 0;
+                }
+#ifdef TUYA_BARGE_IN_ENABLE
+                if (mbarge) {                   /* 停乐后排 ~300ms 残响:打断词与音乐混叠,
+                                                   本轮已作废不清会被音乐尾巴当下句触发假轮 */
+                    unsigned char _mt[TUYA_OPUS_FRAME_LEN];
+                    for (int i = 0; i < 8 && !g_exit; i++) {
+                        _device_get_voice_data(_mt, sizeof(_mt));
+                    }
+                }
+#endif
+                msleep(300);                     /* 等音乐解码器释放 DAC */
+                _device_net_audio_play(1);       /* 恢复 TTS 播放器:下一轮 TTS 要播 */
+                printf("[TUYA-MUSIC] done, back to listening\r\n");
+            }
+        }
+#endif
         /* g_barge_in 不在此清:改由 barge-in 新上行起点(循环顶 drain-stale 处)清,让标记贯穿。*/
+        if (g_link_broken) break;   /* 链路断:退出语音循环,本会话收尾交 supervisor 重连 */
     }
 #undef TUYA_OPUS_FRAME_LEN
 
-    g_audio_ready = 0;
-    stop_audio_stream();
+    /* 音频流不在此停(supervisor 下次会话复用):tai 已 deinit 不会再有 on_audio
+     * 回包,g_audio_ready 留 1 只在有会话时起作用。*/
     tai_disconnect(ctx);
     tai_ctx_deinit(ctx);
     pal->free(mem);
+    return timer_get_ms() - t_start;
+}
+
+/* AI 会话监督循环(断线自愈,压测/长时间运行核心):会话断开(on_disconnect /
+ * 发送失败 / 建连失败)后退避重建会话:重新 get_session_token → tai_connect。
+ * 退避 5s→10s→…→60s 封顶;会话曾健康存活>60s 再断,退避复位 5s。
+ * WiFi 断线由 SDK 层自动重连(见 tuya_mqtt_keepalive_task 注释),这里只管
+ * AI 会话层。MQTT 心跳线程与音频流都在此启动且跨会话存活:重连等待期间采集
+ * 照跑,cbuf 环形覆盖旧数据(无害),会话恢复后 idle-drain 自然消费到新鲜帧。*/
+static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_key)
+{
+    g_mqtt_ka_run = 1;
+    thread_fork("tuya_mqtt_ka", 5, 6 * 1024, 0, 0, tuya_mqtt_keepalive_task, iot);
+
+    audio_stream_init(16000, 16, 1);
+    start_audio_stream();
+
+    unsigned int backoff_ms = 5000;
+    while (1) {
+        /* 每次会话尝试前复位跨线程标志(tai ctx 尚未创建,on_disconnect 无竞态) */
+        g_exit = 0; g_link_broken = 0;
+        g_tts_playing = 0; g_turn_done = 1;
+#ifdef TUYA_BARGE_IN_ENABLE
+        g_barge_in = 0; g_barge_prefill = 0;
+#endif
+        printf("[TUYA] session attempt\r\n");
+        unsigned int lived_ms = tuya_ai_session(pal, iot, local_key);
+        if (lived_ms > 60000) backoff_ms = 5000;   /* 会话曾健康存活,按首次失败退避 */
+        /* 会话报废收尾:清残留 TTS 让喇叭立刻安静,重连后从干净状态起听 */
+        _device_rbuf_clear();
+        printf("[TUYA] session lost (lived %us), retry in %ums\r\n",
+               lived_ms / 1000, backoff_ms);
+        msleep(backoff_ms);
+        if (backoff_ms < 60000) backoff_ms *= 2;
+    }
 }
 
 /* 配网等待期循环播报"请配置网络",每 30s 一次,避免用户以为设备死机(tuya/小智的做法)。
@@ -1195,7 +1395,7 @@ void tuya_agentic_main(void *arg)
         memset(&cfg, 0, sizeof(cfg));
         /* region 从 VM 恢复(配网时下发存的),不硬编码——设备不预知会被部署到哪个区,
          * region 决定 ATOP/MQTT 域名(schema 拉取/OTA/AI token/MQTT 接入)。
-         * 读不到(旧固件升级/异常)时兜底中国区 AY。*/
+         * 读不到(旧固件升级/异常)或值非法时兜底中国区 AY。*/
         {
             uint8_t vm_region = AY;
             if (syscfg_read(VM_TUYA_REGION_IDX, &vm_region, 1) <= 0 || vm_region > SG) {
