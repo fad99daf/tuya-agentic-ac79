@@ -12,6 +12,7 @@ End-side port of **Tuya agentic-kit** (AI Agent cloud voice chat) onto the **Jie
 - **Uplink ASR** — PCM 16k / 16bit / mono (JieLi's opus is a Baidu headerless format that Tuya cannot decode, so uplink stays PCM)
 - **Downlink TTS** — opus (default, ~2KB/s fights stutter on congested networks) / PCM (optional, stable). Opus now works: CBR + `sample_rate=0` auto-resampling
 - **Barge-in (interrupt)** — AEC + VAD + multi-frame energy confirmation (experimental, depends heavily on AEC)
+- **Music playback** — "play X's songs": the cloud music SKILL returns a trial mp3 URL; the device parses it and plays through JieLi's network decode chain (https with automatic TLS). The DAC is handed over after the TTS announcement and restored when done; speaking during playback stops it (VAD + 3-frame energy gate). ⚠️ Trial clips are ~30s; full songs require the paid music capability on the Tuya platform
 - **Cloud VAD end-of-speech** — wakeup is always local VAD; end-of-speech is decided by the cloud (TAI 2.1 signals it via ChatBreak; ServerVad is also handled for compatibility), with a local 2s silence timeout fallback
 - **Persistent MQTT + DP downlink** — MQTT and the AI TLS connection are independent TCP links that coexist; a `tuya_mqtt_ka` thread keeps the heartbeat and receives DP downlink. The device stays online in the App, and cloud DP/MCP commands arrive in real time (`on_dp_downlink` / `on_event`)
 - **TTS first-byte prebuffering** — buffers ~160ms of audio at the start of each TTS turn before feeding the decoder, fixing first-frame underrun stutter
@@ -37,7 +38,7 @@ End-side port of **Tuya agentic-kit** (AI Agent cloud voice chat) onto the **Jie
 
 ### SDK version (important)
 
-Built against **JieLi AC79 AIoT SDK `AC79NN_SDK_V1.2.0`**. You **must check out exactly this tag** — other versions have different source line numbers, so the patch / overlay won't align. Official repo: <https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK>
+Built against the **JieLi AC79 AIoT SDK V1.2.0 release archive** (gitee Releases → `fw-AC79_AIoT_SDK-release-AC79NN_SDK_V1.2.0.zip`). If you clone via git, check out **`AC79NN_SDK_V1.2.12_2026-03-07`** — that tag's content matches the V1.2.0 release archive byte-for-byte (the patch baseline was verified against it; note there is no tag literally named `AC79NN_SDK_V1.2.0` upstream). Other versions differ and the patch / overlay won't align. Official repo: <https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK>
 
 ### Tuya IoT platform preparation
 
@@ -61,10 +62,10 @@ Rough flow:
 ## 1. Quick start
 
 ```bash
-# 1) Get the official SDK and pin the version (must be V1.2.0)
+# 1) Get the official SDK and pin the version (tag identical to the V1.2.0 release archive)
 git clone https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK.git
 cd fw-AC79_AIoT_SDK
-git checkout AC79NN_SDK_V1.2.0
+git checkout AC79NN_SDK_V1.2.12_2026-03-07
 
 # 2) Clone this integration repo (anywhere)
 git clone <this-repo-url> ../tuya-agentic-ac79
@@ -111,7 +112,7 @@ After merging, fill in **your own** Tuya product triple in `apps/common/LLM/tuya
 #define TUYA_AUTH_KEY       "YOUR_AUTHKEY_HERE"  /* AuthKey: Tuya IoT platform -> Device -> AuthKey         */
 ```
 
-Line 51 `TUYA_ACTIVATION_TOKEN` (default placeholder `xxxxxxxx`) is the provisioning activation token: only fill it once from the platform/App when manually testing activation; the normal App provisioning flow does **not** need it.
+`TUYA_ACTIVATION_TOKEN` (default placeholder `xxxxxxxx`) is the provisioning activation token: only fill it once from the platform/App when manually testing activation; the normal App provisioning flow does **not** need it.
 
 The device triple (devid / secret / localkey) is activated by the cloud and written to VM (indices 176–180) on the first BLE provisioning — survives power loss, **no need to fill it**.
 
@@ -126,6 +127,9 @@ Edit `apps/wifi_story_machine/include/app_config.h`:
 | `CONFIG_TUYA_AGENTIC_ENABLE` | Tuya integration master switch (controls Makefile sources + K6 reset branch + auto-start) | on |
 | `TUYA_BARGE_IN_ENABLE` | Interrupt TTS (depends on AEC; experimental) | on |
 | `TUYA_DOWNLINK_OPUS_ENABLE` | Use opus for downlink TTS (fights stutter); commented = PCM | off (commented) |
+| `TUYA_SERVER_VAD_ENABLE` | Cloud VAD end-of-speech (wake-up stays local VAD; local 2s silence fallback) | on |
+| `TUYA_MUSIC_ENABLE` | Music skill: parse the music SKILL and play via the network decode chain; speech can stop playback | on |
+| `TUYA_OTA_ENABLE` / `TUYA_FIRMWARE_VERSION` | Tuya cloud OTA; version is a manual scheme (update the macro to match the platform before each release) | 1 / "1.0.11" |
 
 ---
 
@@ -154,16 +158,19 @@ Edit `apps/wifi_story_machine/include/app_config.h`:
 | **Provisioning fails after long-press K6** (but works after the reset key) | Soft reset (P33) doesn't fully reset the BT controller like a power cycle. Fixed by stopping BT + delay before reset; if it still happens occasionally, use the reset key (cold boot) or retry |
 | **Downlink TTS has squeal/noise** | If opus behaves abnormally, fall back to PCM (comment out `TUYA_DOWNLINK_OPUS_ENABLE`). Opus is now working (CBR + sample_rate=0 auto-resampling) |
 | **Connects then drops (conn nack → timeout) during provisioning** | Usually 2.4G RF interference. Turn off phone WiFi, move closer, retry a few times |
-| **Patch won't apply / line numbers off** | Wrong SDK version. Must be `AC79NN_SDK_V1.2.0` |
+| **Music stops after ~30 seconds** | Platform trial-clip limit; full songs require the paid music capability on the Tuya platform |
+| **Music stops by itself mid-play** | False barge-in trigger: music pickup got through the energy gate. Check the `[MUSIC-DBG]` baseline sum in the logs and raise `BARGE_MIN_ENERGY` (`tuya_agentic_demo.c`) |
+| **Patch won't apply / line numbers off** | Wrong SDK version. Use `AC79NN_SDK_V1.2.12_2026-03-07` (content = the official V1.2.0 release archive; the patch baseline) |
 
 ---
 
 ## 7. Known issues / notes
 
 - **Downlink opus is now working** (CBR + `sample_rate=0` lets the decoder auto-output 48k and resample to DAC); enabled by default. Earlier `sample_rate=16000` forced alignment caused slow/low-pitched audio, and removing CBR hung the decoder — both fixed.
+- **Music interrupt is "stop then listen"**: the interrupting utterance overlaps the music and is discarded (not sent to ASR) — say the next command after the music stops. If the music stops by itself, raise `BARGE_MIN_ENERGY` based on the `[MUSIC-DBG]` logs (AEC against continuous music is unverified).
 - **OTA version is a manual scheme**: `TUYA_FIRMWARE_VERSION` must be updated before each release to match what's filled in on the Tuya platform. Auto-persisting the version across OTA (VM/USER/BTIF/RTC) was verified unreliable, so it's not used.
 - **Barge-in depends heavily on AEC**; experimental with a single mic. Tuning details in [`docs/CHANGES.md`](docs/CHANGES.md).
-- **Version-bound**: this repo only fits `AC79NN_SDK_V1.2.0`. To track a newer official SDK, regenerate the patch.
+- **Version-bound**: the patch baseline is the official V1.2.0 release archive content (git tag `AC79NN_SDK_V1.2.12_2026-03-07`, verified). To track a newer official SDK, regenerate the patch.
 
 ---
 
@@ -171,8 +178,8 @@ Edit `apps/wifi_story_machine/include/app_config.h`:
 
 Full list in [`docs/CHANGES.md`](docs/CHANGES.md). Summary:
 
-- **New** `apps/common/LLM/tuya_agentic/`: `tuya_agentic_demo.c` (main loop), `pal_ac791n.c` (PAL), `le_net_cfg_tuya.c/.h` (BLE provisioning), bool-compat shims, and the pulled-in `agentic-kit/`
-- **Edited SDK files** (8): `audio_input.c/.h`, `user_cfg.c` (AEC), `app_music.c` (K6), `Makefile`, `app_config.h`, `wifi_app_task.c`, `app_main.c` (btstack stack 768→2048)
+- **New** `apps/common/LLM/tuya_agentic/`: `tuya_agentic_demo.c` (main loop), `pal_ac791n.c` (PAL), `le_net_cfg_tuya.c/.h` (BLE provisioning), `tuya_music.c/.h` (music skill parsing), `tuya_ota.c/.h` (OTA), bool-compat shims, and the pulled-in `agentic-kit/`
+- **Edited SDK files** (8): `audio_input.c/.h`, `user_cfg.c` (AEC), `app_music.c` (K6 + music playback exports), `Makefile`, `app_config.h`, `wifi_app_task.c`, `app_main.c` (btstack stack 768→2048)
 - **Optional debug change**: `board_7916A.c` (UART baudrate, just for logs)
 
 ---

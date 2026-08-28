@@ -270,13 +270,10 @@
 #define TUYA_MUSIC_ENABLE
 
 /* ===== 涂鸦云 OTA(固件升级)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
- * TUYA_FIRMWARE_VERSION:出厂基线版本号(固件编译期写死)。只用于"首次上电,VM 还没存
- *   过平台下发版本"时的兜底上报值,正常发版【不需要改它】。
- *   真正上报给涂鸦云的版本 = tuya_get_effective_sw_ver():
- *     - 优先读 VM(平台上次 OTA 下发的版本号,OTA 成功烧写前会写进 VM)
- *     - VM 没有就用本宏 TUYA_FIRMWARE_VERSION
- *   这样:源码永远报 1.0.0,平台每次配新升级包(如 1.0.3),设备升级完就把 1.0.3
- *   存进 VM,重启后上报 1.0.3 == 平台 1.0.3,不再重复升级。源码版本号与平台解耦。
+ * TUYA_FIRMWARE_VERSION:固件版本号(编译期写死)。⚠️手动方案:每次发版前改成与
+ *   涂鸦平台上传固件时填的版本号一致,再编译+出 OTA 包+传平台。
+ *   (曾尝试跨 OTA 自动持久化版本号——VM 方案重启后读回 CRC 损坏,实测不可靠,
+ *    已回退手动;tuya_get_effective_sw_ver() 直接返回本宏,见 tuya_ota.c。)
  * TUYA_OTA_ENABLE:1=开机连 AI 前检查一次涂鸦云 OTA;0=关闭(不检查)。
  *   检查到新固件会:播报提示音 -> HTTPS 下载 -> 烧写 flash -> 自动重启。
  *   实现见 apps/common/LLM/tuya_agentic/tuya_ota.c。*/
