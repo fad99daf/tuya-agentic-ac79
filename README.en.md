@@ -9,8 +9,9 @@ End-side port of **Tuya agentic-kit** (AI Agent cloud voice chat) onto the **Jie
 ## Features
 
 - **Voice chat** — realtime interaction (ASR + LLM + TTS)
-- **Uplink ASR** — PCM 16k / 16bit / mono (JieLi's opus is a Baidu headerless format that Tuya cannot decode, so uplink stays PCM)
+- **Uplink ASR** — opus (default; local libopus 1.4 fixed-point software encoder, 16k/mono/CBR 16kbps/40ms, ~2KB/s — 1/16 of PCM) / PCM (optional, 32KB/s). The mic pipeline stays PCM (VAD/AEC/energy gate/barge-in unaffected); encoding happens per frame only at send time, with automatic PCM fallback if the encoder fails to init
 - **Downlink TTS** — opus (default, ~2KB/s fights stutter on congested networks) / PCM (optional, stable). Opus now works: CBR + `sample_rate=0` auto-resampling
+- **DNS noise-suppression boost** — noisy-environment ASR: DNS forcibly enabled (immune to stale flash config) + over_drive=3; measured noise floor 9k–64k → 3k–6k. If quiet speech gets eaten, dial back to 2.0–2.5 in the `user_cfg.c` override block
 - **Barge-in (interrupt)** — AEC + VAD + multi-frame energy confirmation (experimental, depends heavily on AEC)
 - **Music playback** — "play X's songs": the cloud music SKILL returns a trial mp3 URL; the device parses it and plays through JieLi's network decode chain (https with automatic TLS). The DAC is handed over after the TTS announcement and restored when done; speaking during playback stops it (VAD + 3-frame energy gate). ⚠️ Trial clips are ~30s; full songs require the paid music capability on the Tuya platform
 - **Cloud VAD end-of-speech** — wakeup is always local VAD; end-of-speech is decided by the cloud (TAI 2.1 signals it via ChatBreak; ServerVad is also handled for compatibility), with a local 2s silence timeout fallback
@@ -97,6 +98,7 @@ After merging, `apps/common/LLM/tuya_agentic/` holds the integration code, and `
 
 - overlay **overwrites 10 SDK files** and **adds the whole `tuya_agentic/` directory**.
 - patch only modifies those 10 files (the new directory must still be copied in via overlay).
+- The new directory ships a bundled libopus fixed-point encoder with a **prebuilt `libopus_tuya.a`** — no local rebuild needed for normal use; only if you modify sources under `libopus/`, re-run its `build_tuya_libopus.sh` (needs the JieLi LLVM toolchain at `/c/JL/pi32/bin`) and rebuild the project.
 
 > ⚠ **Re-running apply overwrites `demo.c` and resets your credentials back to placeholders.** If you've already filled them in, edit the target file directly for later changes, or re-fill after re-running.
 
@@ -126,7 +128,8 @@ Edit `apps/wifi_story_machine/include/app_config.h`:
 |---|---|---|
 | `CONFIG_TUYA_AGENTIC_ENABLE` | Tuya integration master switch (controls Makefile sources + K6 reset branch + auto-start) | on |
 | `TUYA_BARGE_IN_ENABLE` | Interrupt TTS (depends on AEC; experimental) | on |
-| `TUYA_DOWNLINK_OPUS_ENABLE` | Use opus for downlink TTS (fights stutter); commented = PCM | off (commented) |
+| `TUYA_DOWNLINK_OPUS_ENABLE` | Use opus for downlink TTS (fights stutter); commented = PCM | on |
+| `TUYA_UPLINK_OPUS_ENABLE` | Encode uplink ASR with the local libopus fixed-point encoder (~2KB/s); commented = PCM (32KB/s) | on |
 | `TUYA_SERVER_VAD_ENABLE` | Cloud VAD end-of-speech (wake-up stays local VAD; local 2s silence fallback) | on |
 | `TUYA_MUSIC_ENABLE` | Music skill: parse the music SKILL and play via the network decode chain; speech can stop playback | on |
 | `TUYA_OTA_ENABLE` / `TUYA_FIRMWARE_VERSION` | Tuya cloud OTA; version is a manual scheme (update the macro to match the platform before each release) | 1 / "1.0.11" |
@@ -160,6 +163,7 @@ Edit `apps/wifi_story_machine/include/app_config.h`:
 | **Connects then drops (conn nack → timeout) during provisioning** | Usually 2.4G RF interference. Turn off phone WiFi, move closer, retry a few times |
 | **Music stops after ~30 seconds** | Platform trial-clip limit; full songs require the paid music capability on the Tuya platform |
 | **Music stops by itself mid-play** | False barge-in trigger: music pickup got through the energy gate. Check the `[MUSIC-DBG]` baseline sum in the logs and raise `BARGE_MIN_ENERGY` (`tuya_agentic_demo.c`) |
+| **ASR misrecognizes in noisy environments** | Check `idle drain avg_sum` (noise floor) vs speech-frame `act%` in the serial log. DNS is forcibly enabled with over_drive=3 (`user_cfg.c` override block); if **quiet speech gets eaten / recognition worsens** (over-suppression), dial `DNS_over_drive` back to 2.0–2.5. Note DNS only suppresses stationary noise (fans/hum); non-stationary noise (nearby voices, TV) can't be filtered — speak closer to the mic |
 | **Patch won't apply / line numbers off** | Wrong SDK version. Use `AC79NN_SDK_V1.2.12_2026-03-07` (content = the official V1.2.0 release archive; the patch baseline) |
 
 ---
@@ -167,6 +171,7 @@ Edit `apps/wifi_story_machine/include/app_config.h`:
 ## 7. Known issues / notes
 
 - **Downlink opus is now working** (CBR + `sample_rate=0` lets the decoder auto-output 48k and resample to DAC); enabled by default. Earlier `sample_rate=16000` forced alignment caused slow/low-pitched audio, and removing CBR hung the decoder — both fixed.
+- **Uplink opus is a local libopus fixed-point software encoder** (all symbols `topus_`-prefixed for isolation — zero conflict with JieLi's closed-source opus libs; a prebuilt `libopus_tuya.a` is bundled). A clang+LTO crash with a local libopus **floating-point decoder** was recorded and that decoder path was dropped — only the fixed-point **encoder** remains; if boot/speech crashes reappear, comment out `TUYA_UPLINK_OPUS_ENABLE` to fall back to PCM uplink while diagnosing. Modifying libopus sources requires re-running `build_tuya_libopus.sh`, then rebuilding.
 - **Music interrupt is "stop then listen"**: the interrupting utterance overlaps the music and is discarded (not sent to ASR) — say the next command after the music stops. If the music stops by itself, raise `BARGE_MIN_ENERGY` based on the `[MUSIC-DBG]` logs (AEC against continuous music is unverified).
 - **OTA version is a manual scheme**: `TUYA_FIRMWARE_VERSION` must be updated before each release to match what's filled in on the Tuya platform. Auto-persisting the version across OTA (VM/USER/BTIF/RTC) was verified unreliable, so it's not used.
 - **Barge-in depends heavily on AEC**; experimental with a single mic. Tuning details in [`docs/CHANGES.md`](docs/CHANGES.md).
@@ -178,7 +183,7 @@ Edit `apps/wifi_story_machine/include/app_config.h`:
 
 Full list in [`docs/CHANGES.md`](docs/CHANGES.md). Summary:
 
-- **New** `apps/common/LLM/tuya_agentic/`: `tuya_agentic_demo.c` (main loop), `pal_ac791n.c` (PAL), `le_net_cfg_tuya.c/.h` (BLE provisioning), `tuya_music.c/.h` (music skill parsing), `tuya_ota.c/.h` (OTA), bool-compat shims, and the pulled-in `agentic-kit/`
+- **New** `apps/common/LLM/tuya_agentic/`: `tuya_agentic_demo.c` (main loop), `pal_ac791n.c` (PAL), `le_net_cfg_tuya.c/.h` (BLE provisioning), `tuya_music.c/.h` (music skill parsing), `tuya_ota.c/.h` (OTA), `tuya_opus_enc.c/.h` + `libopus/` (uplink opus encoding, prebuilt archive included), bool-compat shims, and the pulled-in `agentic-kit/`
 - **Edited SDK files** (8): `audio_input.c/.h`, `user_cfg.c` (AEC), `app_music.c` (K6 + music playback exports), `Makefile`, `app_config.h`, `wifi_app_task.c`, `app_main.c` (btstack stack 768→2048)
 - **Optional debug change**: `board_7916A.c` (UART baudrate, just for logs)
 
@@ -204,7 +209,7 @@ tuya-agentic-ac79/
 
 ## License
 
-Integration code: Apache-2.0 (same as the JieLi SDK). Pulled-in modules under `agentic-kit/` (Tuya open-source, AWS coreHTTP / coreMQTT) keep their original licenses.
+Integration code: Apache-2.0 (same as the JieLi SDK). Pulled-in modules under `agentic-kit/` (Tuya open-source, AWS coreHTTP / coreMQTT) keep their original licenses; `tuya_agentic/libopus/` (libopus 1.4 subset, incl. the prebuilt `libopus_tuya.a`) is BSD-3-Clause (see its `COPYING`).
 
 ## Acknowledgements
 

@@ -289,11 +289,19 @@ void get_cfg_file_aec_config(struct aec_s_attr *aec_param)
     aec_param->AEC_DT_AggressiveFactor = 2.0f;
     aec_param->ES_AggressFactor      = -6.0f;
     aec_param->ES_MinSuppress        =  2.0f;
-    /* DNS 降噪增强 1.0→2.0:故事等连续密集 TTS 时 AEC 残留回声大,DNS 加强压回声,
-     * 让用户话音在 post-AEC 里更突出,encoder VAD 才能穿透触发(实测故事期间 VAD 完全不触发)。
-     * 代价:可能压掉一点小声话音;TTS 静默段无影响。范围 0~6。*/
-    aec_param->DNS_over_drive        =  2.0f;
-    log_info("AEC override: dt_aggr=%.1f es_aggr=%.1f es_min_supp=%.1f dns_od=%.1f\n",
+    /* ★ 强制开 DNS(EnableBit BIT(5)):CONFIG_DNS_ENC_ENABLE 虽已定义,但 aec_mode 实际值
+     *   读自 flash syscfg——里面存的旧值可能没有 BIT(5)(mode=7 而非 39),DNS 等于没开。
+     *   在这里 |= 保证无论 flash 存了什么都开着(2026-08-28 嘈杂环境 ASR 误识别优化)。*/
+    aec_param->EnableBit |= BIT(5);
+    /* DNS 降噪:1.0→2.0 是为压 TTS 回声;这次 2.0→3.0 为嘈杂环境 ASR(实测说话帧 act 0~2%,
+     *   与底噪同量级,SNR 不足云端捞字困难)。over_drive 越大压得越狠(0~6):
+     *   调参看串口 [TUYA] idle drain avg_sum(底噪基线,应明显下降)与说话帧 act%(应相对升高);
+     *   若出现"小声说话被吃/识别反而更差"(过压制)回调到 2.0~2.5。
+     *   gain_floor 显式钉在 0.1(默认):允许的最大降噪深度,再小易压语音。*/
+    aec_param->DNS_over_drive        =  3.0f;
+    aec_param->DNS_gain_floor        =  0.1f;
+    log_info("AEC override: enablebit=%d dt_aggr=%.1f es_aggr=%.1f es_min_supp=%.1f dns_od=%.1f\n",
+             (int)aec_param->EnableBit,
              (double)aec_param->AEC_DT_AggressiveFactor,
              (double)aec_param->ES_AggressFactor,
              (double)aec_param->ES_MinSuppress,

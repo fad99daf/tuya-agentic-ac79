@@ -99,6 +99,19 @@ AC79 上手写的涂鸦 BLE GATT 配网传输层(SDK 原版无):
 - **音乐 barge-in(说话可停乐)**:等待循环逐帧 `opus_frame_stat`,VAD 在线 + **3 帧连续**(120ms)sum≥`BARGE_MIN_ENERGY` 才停乐(判据同 `barge_in_energy_confirmed`,断一帧重数,滤音乐瞬态拍子);开头 1s 不设防(DAC 交接瞬态/曲首重拍);每秒打 `[MUSIC-DBG]` 能量基线供调门槛(AEC 对连续音乐的效果未验证,若"音乐自己把自己打断"就调高门槛);停乐后排 ~300ms 残响再回听音。**打断词本身与音乐混叠不作数**——语义是"停乐后听",下一句等音乐停了再说。
 - **⚠️ 试听版仅 ~30s 片段**;完整歌曲需在涂鸦平台购买音乐高级能力授权。
 
+### A8. `tuya_opus_enc.c` + `.h` — 上行 opus 编码封装 ⭐新增
+本地 libopus 定点编码器的薄封装(init/frame/deinit/ok 共 4 个 API),供 demo.c 在**上行发送处**逐帧编码(1280B PCM → ~80B opus 包)。关键实现:
+- 5 个符号重定向 `#define`(opus_encoder_create→topus_* 等)必须放在 `#include "opus.h"` **之前**——否则头文件原型不跟着改名,产生隐式声明告警 + 链接错。
+- 文件整体 `#ifdef TUYA_UPLINK_OPUS_ENABLE` 包裹,开关关闭时为空翻译单元(不占体积)。
+- init 失败 → demo.c 打印告警并自动回退 PCM 上行(对话仍可用,只是带宽大),不废会话。
+
+### A9. `libopus/` — libopus 1.4 定点编码器子集 + 符号隔离预编译 ⭐新增
+上行 opus 的编码器本体(~190 文件/3MB,含预编译 `libopus_tuya.a`)。**为什么自带**:杰理闭源 `lib_opus_enc.a / lib_opus_stenc.a / lib_opus_dec.a` 也是 libopus 改的,与源码直编有 141/74/137 个同名全局符号,混链必报 multiple definition;且闭源库不暴露编码参数接口,无法对齐涂鸦云端要求的 16k/mono/VOIP/CBR16k/40ms。
+- **裁剪**:只留定点编码路径——删 decoder、x86/arm SIMD、浮点、tests/dump_modes;恢复链接必需的 PLC.h、NLSF_decode.c、repacketizer.c;`src/packet_shim.c` 补 `opus_packet_get_nb_frames`;自带 `config.h`(OPUS_BUILD/FIXED_POINT/VAR_ARRAYS);`silk/fixed/` 下补 typedef.h、debug.h 转发 shim(quoted include 先搜本目录,父目录同名头与杰理 generic/lwip 头撞名)。
+- **`build_tuya_libopus.sh`(两遍编译符号隔离)**:第一遍无重命名编译 + llvm-nm 收集全部全局符号,生成 rename.h(`#define sym topus_sym`);第二遍 `-include rename.h` 重编(定义与引用同步改名,libc 名不动),llvm-ar 打包成 `libopus_tuya.a`;末尾自检(归档内全部 topus_ 前缀 + 与 3 个杰理 opus 库零交集,失败即退出)。**产物是 LTO bitcode 归档**——必须,普通 ELF 对象在工程 LTO 链接里会被 R_PI32V2_LONG_JUMP_23M2 长跳转搬迁卡死(2026-08-28 实测)。⚠️ 脚本对 SDK 根/工作目录全部相对定位(路径含中文时杰理 LLVM 工具会失败),工具链取 `/c/JL/pi32/bin`(与 Makefile 约定一致)。
+- **仓库已带预编译好的 `libopus_tuya.a`**:不改 libopus 源码**无需**跑此脚本,直接编工程即可;只有改了 `libopus/` 下源码才需重跑再编。
+- 许可 BSD-3-Clause(`COPYING` 随附,二进制分发需保留声明)。
+
 ---
 
 ## B. 改动的 SDK 原有文件
@@ -107,17 +120,20 @@ AC79 上手写的涂鸦 BLE GATT 配网传输层(SDK 原版无):
 - **DEFINES**(L151):追加 `-DHTTP_DO_NOT_USE_CUSTOM_CONFIG -DMQTT_DO_NOT_USE_CUSTOM_CONFIG -DIOT_DO_NOT_USE_CUSTOM_CONFIG`(让 coreHTTP/coreMQTT/iot-client 用默认配置,不引各自 *_config.h)
 - **INCLUDES**(L155, L244-255):追加 12 条 `-I` —— `tuya_inc`(最高优先级覆盖 stdbool.h)、`tuya_agentic`、`pal`、`common`、`rtc-tcp-client/include`、`iot-client/include`+`src`、`coreHTTP` include+interface+llhttp、`coreMQTT` include+interface、`tuya-ble/include`
 - **c_SRC_FILES**(L635-666):追加 35 个涂鸦源文件 —— rtc-tcp-client(7)+iot-client(11)+common(3)+coreHTTP(4)+coreMQTT(3)+`pal_ac791n.c`+`tuya_agentic_demo.c`+`tuya_ble_prov.c`+`le_net_cfg_tuya.c`+`tuya_music.c`(音乐SKILL解析);另**删掉**未用到的第三方 LLM 源文件/头路径(volc/onesdk/duer/QYAI/tc_iot 等,见与 SDK 原版 Makefile 的 diff)
-- **LFLAGS**:不动(复用宿主 `libmbedtls_3_4_0.a` / `cJSON.a` / `lwip_2_2_0.a` / `lib_mqtt.a`)
+- **LFLAGS**:不动(复用宿主 `libmbedtls_3_4_0.a` / `cJSON.a` / `lwip_2_2_0.a` / `lib_mqtt.a`);**追加 `tuya_agentic/libopus/libopus_tuya.a`**(上行 opus 编码库,排在 lib_opus_dec.a 之后)
+- **上行 opus 构建接入**(Makefile 与 `.cbp` 同步改):INCLUDES 追加 5 条 —— `libopus` 根(在 tuya_inc 之后靠前)与 `include`/`celt`/`silk`/`silk/fixed` 4 子目录(**列表末尾**)。⚠️ 顺序敏感:silk 子目录靠前会让其 `typedef.h` 劫持 SDK 同名头(→btstack u8/u16 编译错),libopus 根靠后又会被 volc 的 `config.h` 遮蔽(→OPUS_BUILD 未定义);`c_SRC_FILES` 追加 `tuya_opus_enc.c`。CodeBlocks 工程文件 `AC791N_WIFI_STORY_MACHINE.cbp` 做同套改动(用户走 CB 编译时一致)。
 
-### B2. `apps/common/config/user_cfg.c` — AEC 参数覆盖(为 barge-in)
-`get_cfg_file_aec_config()` 末尾(L283-301)硬覆盖 4 项 AEC 参数 + 中文注释,让连续 TTS 期间的回声残留被压住、用户话音能穿透触发 VAD(barge-in 前提):
+### B2. `apps/common/config/user_cfg.c` — AEC/DNS 参数覆盖(barge-in + 嘈杂环境 ASR)
+`get_cfg_file_aec_config()` 末尾(L283-309)硬覆盖 6 项 AEC/DNS 参数 + 中文注释,让连续 TTS 期间的回声残留被压住、用户话音能穿透触发 VAD(barge-in 前提),并强化嘈杂环境降噪(ASR):
 
 | 参数 | 原值 → 新值 | 作用 |
 |---|---|---|
 | `AEC_DT_AggressiveFactor` | 1.0 → **2.0** | 回声消除更激进 |
 | `ES_AggressFactor` | -3.0 → **-6.0** | 非线性残留抑制更深 |
 | `ES_MinSuppress` | 4.0 → **2.0** | 允许更深抑制 |
-| `DNS_over_drive` | 1.0 → **2.0** | 故事密集 TTS 时压回声 |
+| `EnableBit` | flash 值 → **\|= BIT(5)** | 强制开 DNS 位:实际 aec_mode 读自 flash syscfg,旧值可能没存 BIT(5)(mode=7 而非 39),`CONFIG_DNS_ENC_ENABLE` 定义了也等于没开 |
+| `DNS_over_drive` | 1.0 → **3.0**(2026-08-28,经 2.0) | DNS 降噪强度(0~6):2 压 TTS 残留回声;3 为嘈杂环境 ASR(实测底噪基线 9k~64k → 3k~6k,SNR 不足时云端捞字难)。小声说话被吃/识别变差回调 2.0~2.5 |
+| `DNS_gain_floor` | → **0.1**(显式钉住) | 最大降噪深度下限(默认值),防 flash 值漂移;再小易压语音 |
 
 > 注意:VM 176~180 的三元组存取**不在本文件**,而在 `tuya_agentic_demo.c`。本文件只有这一处 AEC 覆盖改动。
 
@@ -129,10 +145,11 @@ AC79 上手写的涂鸦 BLE GATT 配网传输层(SDK 原版无):
 - KEY_POWER 长按注释(L4396-4400):说明电源键是自锁拨动开关按不出长按,原绑在此的"清配网"已移到 K6。
 - **下行 opus 解码不在本文件**,在 `audio_input.c`(见 B6)。
 
-### B4. `apps/wifi_story_machine/include/app_config.h` — 5 个新增宏 + 2 处 flash 布局
+### B4. `apps/wifi_story_machine/include/app_config.h` — 新增宏 + 2 处 flash 布局
 ```c
 #define CONFIG_TUYA_AGENTIC_ENABLE     // 涂鸦 AgenticKit 总开关(控制 Makefile 编入 + K6 重置分支 + DHCP 钩子行为)
 #define TUYA_DOWNLINK_OPUS_ENABLE      // 下行 TTS opus(已开启;已调通,~2KB/s 治拥挤网卡顿。注释掉切回 PCM)
+#define TUYA_UPLINK_OPUS_ENABLE        // 上行 ASR opus(已开启;本地 libopus 1.4 定点软编码,~2KB/s 为 PCM 的 1/16。编码器 init 失败自动回退 PCM。注释掉切回 PCM 32KB/s)
 #define TUYA_BARGE_IN_ENABLE           // 用户打断 TTS 开关(已开启;强依赖 AEC、有竞态、实验性)
 #define TUYA_SERVER_VAD_ENABLE         // 云端 VAD 停说判定(已开启;开口仍本地VAD,停说由云端TAI_EVT_SERVER_VAD决定,带本地2s超时兜底)
 #define TUYA_MUSIC_ENABLE               // 涂鸦音乐技能(已开启;SKILL解析→app_music网络解码播放,支持barge-in停乐)
@@ -198,4 +215,4 @@ flash 布局改动(为双备份 OTA 腾空间):
 
 ## 数据流一句话
 
-`mic → audio_input.c(enc+VAD+AEC)→ pcm_cbuff_w → demo.c _device_get_voice_data → tai_send_audio_chunk(上行 PCM)`;`云端 opus → demo.c on_audio → _device_write_voice_data(整包直写)→ pcm_cbuff_r → audio_input.c dec(CBR opus_cbr_pktlen=80, sample_rate=0 自动重采样 48k→DAC)→ DAC`。barge-in = AEC + VAD + 3 帧能量确认,触发后 `chat_break` + 清 rbuf + 排 stale mic + 1000ms 冷却 + 补发 onset 帧。停说判定:`TUYA_SERVER_VAD_ENABLE` 时等云端 `TAI_EVT_SERVER_VAD`(本地 2s 静音兜底),否则本地 VAD 直接判停说。OTA = 开机连 AI 前 `tuya_ota_check_and_upgrade`(ATOP 查升级 → 下载烧写 → 自动重启)。音乐 = 云端音乐 SKILL(`tuya_music.c` 并行重组+解析)→ TTS 报幕排空后让出 DAC → `app_music_tuya_play_url`(net_download https → mp3 解码 → DAC)→ 播完或 barge-in(VAD+3 帧能量门)停乐后恢复 TTS 播放器回听音。
+`mic → audio_input.c(enc+VAD+AEC)→ pcm_cbuff_w → demo.c _device_get_voice_data → 上行发送(TUYA_UPLINK_OPUS_ENABLE 开:tuya_uplink_send_frame 逐帧 libopus 定点编码 ~80B/40ms;关:PCM 1280B/40ms 直发)→ tai_send_audio_chunk`;`云端 opus → demo.c on_audio → _device_write_voice_data(整包直写)→ pcm_cbuff_r → audio_input.c dec(CBR opus_cbr_pktlen=80, sample_rate=0 自动重采样 48k→DAC)→ DAC`。barge-in = AEC + VAD + 3 帧能量确认,触发后 `chat_break` + 清 rbuf + 排 stale mic + 1000ms 冷却 + 补发 onset 帧。停说判定:`TUYA_SERVER_VAD_ENABLE` 时等云端 `TAI_EVT_SERVER_VAD`(本地 2s 静音兜底),否则本地 VAD 直接判停说。OTA = 开机连 AI 前 `tuya_ota_check_and_upgrade`(ATOP 查升级 → 下载烧写 → 自动重启)。音乐 = 云端音乐 SKILL(`tuya_music.c` 并行重组+解析)→ TTS 报幕排空后让出 DAC → `app_music_tuya_play_url`(net_download https → mp3 解码 → DAC)→ 播完或 barge-in(VAD+3 帧能量门)停乐后恢复 TTS 播放器回听音。

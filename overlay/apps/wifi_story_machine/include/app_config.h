@@ -240,6 +240,17 @@
  * 带宽仍是 opus 的 ~2KB/s。若颤音不可接受,注释下一行切纯 PCM 下行(实测不颤)。*/
 #define TUYA_DOWNLINK_OPUS_ENABLE
 
+/* ===== 涂鸦上行 ASR 编码开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下生效)=====
+ * 不定义(默认)= PCM:mic 管线直出 1280B/40ms 上行(32KB/s),拥挤网络易卡。
+ * 定义 = opus:本地 libopus 1.4【定点】软编码(移植在 tuya_agentic/libopus/,
+ *   封装 tuya_opus_enc.c),16k/mono/VOIP/CBR 16kbps/40ms → 每包 ~80B(~2KB/s,1/16 带宽)。
+ *   mic 管线保持 PCM 不动(VAD/AEC/能量门/barge-in 全不受影响),只在上行发送处
+ *   逐帧编码;编码器初始化失败自动回退 PCM,不废会话。
+ *   ⚠️ 工具链风险(记录在案):clang 4.0.1+LTO 曾对本地 libopus 浮点解码产生
+ *   axi_wr_inv 崩溃(2026-08-28 回退),故本编码器走定点;若上电/说话再现崩溃,
+ *   注释掉本宏即回 PCM 上行。参数对齐 agentic-kit audio_chat_demo(云端验证过)。*/
+#define TUYA_UPLINK_OPUS_ENABLE
+
 /* ===== 涂鸦 barge-in(用户打断 TTS)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
  * 不定义(默认)= 不支持打断:TTS 期间不上行,简单稳定。
  * 定义 = 支持:本地 VAD 在 TTS 期间检测到说话 → tai_chat_break 停 TTS → 发新一轮上行。

@@ -543,7 +543,11 @@ static void audio_player_net_init()
      * ★ opus_cbr_pktlen=80:16kbps×40ms/8。*/
     req.dec.dec_type        = "opus";
     req.dec.channel         = 0;
-    req.dec.sample_rate     = 0;     /* ★ 自动:让解码器输出 48k,重采样到 DAC 16k */
+    /* ★ sample_rate 必须 0(2026-08-27 教训):显式 48000 会在开机提示音仍占用共享 DAC 时
+     *   触发 DAC 格式重配,提示音结束清理时 subdevice_dac.c:253 断言 dac->channel!=0
+     *   → 软复位死循环(每次开机播完提示音即崩)。且重配实际仍回落 16000+src:1,
+     *   实验无效。opus 颤音排查改走 PCM 下行对照(关 TUYA_DOWNLINK_OPUS_ENABLE)。*/
+    req.dec.sample_rate     = 0;
     req.dec.attr           |= AUDIO_ATTR_OPUS_CBR_PKTLEN_TYPE;
     req.dec.opus_cbr_pktlen = 80;
 #elif defined(CONFIG_TUYA_AGENTIC_ENABLE)

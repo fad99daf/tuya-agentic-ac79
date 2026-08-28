@@ -1,3 +1,5 @@
+diff --git a/apps/common/LLM/audio/audio_input.c b/apps/common/LLM/audio/audio_input.c
+index f963e0e0..976dea8e 100644
 --- a/apps/common/LLM/audio/audio_input.c
 +++ b/apps/common/LLM/audio/audio_input.c
 @@ -22,7 +22,7 @@
@@ -18,7 +20,7 @@
  #else
  #define AUDIO_RECORD_VOICE_UPLORD_LEN (1280)
  #endif
-@@ -159,6 +161,8 @@
+@@ -159,6 +161,8 @@ int _device_get_voice_data(void *data, unsigned int max_len)
      mdelay(1);
  #elif defined CONFIG_TWETALK_ENABLE
      mdelay(60);
@@ -27,7 +29,7 @@
  #else
      mdelay(30);
  #endif
-@@ -192,20 +196,47 @@
+@@ -192,20 +196,47 @@ void _device_wbuf_clear()
      cbuf_clear(&g_audio_hdl.pcm_cbuff_w);
  }
  
@@ -48,6 +50,16 @@
 +#if defined(CONFIG_TUYA_AGENTIC_ENABLE) && defined(TUYA_DOWNLINK_OPUS_ENABLE)
 +        /* Opus 下行:云端帧长可变(400B/640B 实测),整包直写 cbuf,不做帧重组。
 +         * 杰理 opus 解码器内部按标准 Opus 帧边界自行切分。*/
++        unsigned int write_len = cbuf_write(cbuf, data, len);
++        if (write_len != len) {
++            if (write_len == 0) {
++                static unsigned int dl_full_cnt = 0;
++                if (++dl_full_cnt % 50 == 1) {
++                    printf("[AUDIO] dl cbuf full drop #%u\r\n", dl_full_cnt);
++                }
++            }
++        }
++#else
          unsigned int write_len = cbuf_write(cbuf, data, len);
 -        /* printf("len=%d wite_len=%d", len, write_len); */
 -        if (0 == write_len) {
@@ -57,16 +69,6 @@
 -        } else if (write_len != len) {
 -            unsigned int rlen = cbuf_get_data_size(cbuf);
 -            // audio_debug("wite_len %d len %d rlen %d", write_len, len, rlen);
-+        if (write_len != len) {
-+            if (write_len == 0) {
-+                static unsigned int dl_full_cnt = 0;
-+                if (++dl_full_cnt % 50 == 1) {
-+                    printf("[AUDIO] dl cbuf full drop #%u\r\n", dl_full_cnt);
-+                }
-+            }
-         }
-+#else
-+        unsigned int write_len = cbuf_write(cbuf, data, len);
 +        if (write_len != len) {
 +            /* 写不满(缓冲满)时【不】再 cbuf_clear——那会瞬间丢掉整缓冲→明显截断。
 +             * 改丢本次新数据(丢最新一小段,缓冲里已存的继续平滑播放)。统计满溢次数便于诊断:
@@ -78,12 +80,12 @@
 +                           dl_full_cnt, cbuf_get_data_size(cbuf));
 +                }
 +            }
-+        }
+         }
 +#endif
      }
  
      os_sem_set(&g_audio_ctrl.r_sem, 0);
-@@ -214,6 +245,25 @@
+@@ -214,6 +245,25 @@ int _device_write_voice_data(void *data, unsigned int len)
      return len;
  }
  
@@ -109,10 +111,11 @@
  //编码器输出PCM数据
  static int recorder_vfs_fwrite(void *file, void *data, unsigned int len)
  {
-@@ -285,6 +335,14 @@
+@@ -284,6 +334,14 @@ static void audio_recoder_init()
+     req.enc.bitrate     = 24000;
      req.enc.format_mode = 0;
      req.enc.frame_ms    = 60;
- #endif
++#endif
 +#ifdef CONFIG_TUYA_AGENTIC_ENABLE
 +    /* 涂鸦 AI 上行用 PCM:杰理 opus format_mode=0 是"百度无头"格式(非标准 opus),
 +     * 涂鸦 ASR 解不了→秒回空。云端下行也用 PCM(codec=101=TAI_AUDIO_PCM),改 PCM 最匹配。 */
@@ -120,11 +123,10 @@
 +    req.enc.bitrate     = 24000;
 +    req.enc.format_mode = 0;
 +    req.enc.frame_ms    = 60;
-+#endif
+ #endif
      req.enc.sample_source = "mic";
      req.enc.vfs_ops = &recorder_vfs_ops;
-     req.enc.file = (FILE *)&g_audio_hdl.pcm_cbuff_w;
-@@ -299,6 +357,19 @@
+@@ -299,6 +357,19 @@ static void audio_recoder_init()
          req.enc.vad_start_threshold = 300;    //ms
          req.enc.vad_stop_threshold  = 0;    //ms
      }
@@ -144,7 +146,7 @@
  
  #ifdef CONFIG_AEC_ENC_ENABLE
      struct aec_s_attr aec_param = {0};
-@@ -365,6 +436,28 @@
+@@ -365,6 +436,28 @@ static int audio_play_net_vfs_fread(void *file, void *data, unsigned int len)
      unsigned int c_rlen = 0;
      cbuf = (cbuffer_t *)file;
  
@@ -173,7 +175,7 @@
      do {
          cbuf_len = cbuf_get_data_size(cbuf);
          rlen = cbuf_len > len ? len : cbuf_len;
-@@ -426,12 +519,6 @@
+@@ -426,12 +519,6 @@ static void audio_player_net_init()
      req.dec.channel         = CHANNEL;  /*dac 差分输出 单路*/
      req.dec.sample_rate     = SAMPLE_RATE;
      req.dec.vfs_ops         = &audio_play_net_vfs_ops;
@@ -186,10 +188,11 @@
  #ifdef AUDIO_TYPE_G711A
      req.dec.dec_type 		= "pcm";
  #elif defined(AUDIO_TYPE_AACLC)
-@@ -447,6 +534,23 @@
+@@ -446,6 +533,27 @@ static void audio_player_net_init()
+     req.dec.sample_rate     = 0;
      req.dec.attr |= AUDIO_ATTR_OPUS_CBR_PKTLEN_TYPE;
      req.dec.opus_cbr_pktlen = 180;
- #endif
++#endif
 +#if defined(CONFIG_TUYA_AGENTIC_ENABLE) && defined(TUYA_DOWNLINK_OPUS_ENABLE)
 +    /* === opus 下行 ===
 +     * ★ sample_rate=0:让解码器自动输出(内部 48k),audio_server 自动重采样到 DAC。
@@ -199,18 +202,21 @@
 +     * ★ opus_cbr_pktlen=80:16kbps×40ms/8。*/
 +    req.dec.dec_type        = "opus";
 +    req.dec.channel         = 0;
-+    req.dec.sample_rate     = 0;     /* ★ 自动:让解码器输出 48k,重采样到 DAC 16k */
++    /* ★ sample_rate 必须 0(2026-08-27 教训):显式 48000 会在开机提示音仍占用共享 DAC 时
++     *   触发 DAC 格式重配,提示音结束清理时 subdevice_dac.c:253 断言 dac->channel!=0
++     *   → 软复位死循环(每次开机播完提示音即崩)。且重配实际仍回落 16000+src:1,
++     *   实验无效。opus 颤音排查改走 PCM 下行对照(关 TUYA_DOWNLINK_OPUS_ENABLE)。*/
++    req.dec.sample_rate     = 0;
 +    req.dec.attr           |= AUDIO_ATTR_OPUS_CBR_PKTLEN_TYPE;
 +    req.dec.opus_cbr_pktlen = 80;
 +#elif defined(CONFIG_TUYA_AGENTIC_ENABLE)
 +    /* === PCM 下行(默认)=== 稳定能播,但 16k=32KB/s 拥挤测试网易卡顿。channel/sample_rate 沿用上面
 +     * 已设的 CHANNEL(1)/SAMPLE_RATE(16k)。云端实测回 codec=101(PCM)。开 TUYA_DOWNLINK_OPUS_ENABLE 切 opus。*/
 +    req.dec.dec_type        = "pcm";
-+#endif
+ #endif
      req.dec.sample_source   = "dac";
      req.dec.file            = (FILE *)&g_audio_hdl.pcm_cbuff_r;
-     audio_debug("audio_player_net_init ");
-@@ -650,6 +754,13 @@
+@@ -650,6 +758,13 @@ static int _audio_soft_init(void)
  #elif defined CONFIG_TWETALK_ENABLE
      pcm_buff_r = malloc(SAMPLE_RATE * CHANNEL * 1);
      cbuf_init(&g_audio_hdl.pcm_cbuff_r, pcm_buff_r, SAMPLE_RATE * CHANNEL * 1);
@@ -224,9 +230,11 @@
  #else
      pcm_buff_r = malloc(SAMPLE_RATE * CHANNEL * 4);
      cbuf_init(&g_audio_hdl.pcm_cbuff_r, pcm_buff_r, SAMPLE_RATE * CHANNEL * 4);
+diff --git a/apps/common/LLM/audio/audio_input.h b/apps/common/LLM/audio/audio_input.h
+index 6ecbac0e..b9089b98 100644
 --- a/apps/common/LLM/audio/audio_input.h
 +++ b/apps/common/LLM/audio/audio_input.h
-@@ -61,6 +61,10 @@
+@@ -61,6 +61,10 @@ typedef struct {
  
  int _device_write_voice_data(void *data, unsigned int len);
  int _device_get_voice_data(void *data, unsigned int max_len);
@@ -237,9 +245,11 @@
  void audio_stream_init(int sample_rate, int bit_dept, int channel_num);
  void start_audio_stream(void);
  void stop_audio_stream(void);
+diff --git a/apps/common/config/user_cfg.c b/apps/common/config/user_cfg.c
+index b7229219..087ccd3f 100644
 --- a/apps/common/config/user_cfg.c
 +++ b/apps/common/config/user_cfg.c
-@@ -279,6 +279,25 @@
+@@ -279,6 +279,33 @@ void get_cfg_file_aec_config(struct aec_s_attr *aec_param)
      aec_param->AGC_echo_look_ahead = 100;
      aec_param->AGC_echo_hold = 400;
      aec_param->ES_Unconverge_OverDrive = aec_param->ES_MinSuppress;
@@ -253,11 +263,19 @@
 +    aec_param->AEC_DT_AggressiveFactor = 2.0f;
 +    aec_param->ES_AggressFactor      = -6.0f;
 +    aec_param->ES_MinSuppress        =  2.0f;
-+    /* DNS 降噪增强 1.0→2.0:故事等连续密集 TTS 时 AEC 残留回声大,DNS 加强压回声,
-+     * 让用户话音在 post-AEC 里更突出,encoder VAD 才能穿透触发(实测故事期间 VAD 完全不触发)。
-+     * 代价:可能压掉一点小声话音;TTS 静默段无影响。范围 0~6。*/
-+    aec_param->DNS_over_drive        =  2.0f;
-+    log_info("AEC override: dt_aggr=%.1f es_aggr=%.1f es_min_supp=%.1f dns_od=%.1f\n",
++    /* ★ 强制开 DNS(EnableBit BIT(5)):CONFIG_DNS_ENC_ENABLE 虽已定义,但 aec_mode 实际值
++     *   读自 flash syscfg——里面存的旧值可能没有 BIT(5)(mode=7 而非 39),DNS 等于没开。
++     *   在这里 |= 保证无论 flash 存了什么都开着(2026-08-28 嘈杂环境 ASR 误识别优化)。*/
++    aec_param->EnableBit |= BIT(5);
++    /* DNS 降噪:1.0→2.0 是为压 TTS 回声;这次 2.0→3.0 为嘈杂环境 ASR(实测说话帧 act 0~2%,
++     *   与底噪同量级,SNR 不足云端捞字困难)。over_drive 越大压得越狠(0~6):
++     *   调参看串口 [TUYA] idle drain avg_sum(底噪基线,应明显下降)与说话帧 act%(应相对升高);
++     *   若出现"小声说话被吃/识别反而更差"(过压制)回调到 2.0~2.5。
++     *   gain_floor 显式钉在 0.1(默认):允许的最大降噪深度,再小易压语音。*/
++    aec_param->DNS_over_drive        =  3.0f;
++    aec_param->DNS_gain_floor        =  0.1f;
++    log_info("AEC override: enablebit=%d dt_aggr=%.1f es_aggr=%.1f es_min_supp=%.1f dns_od=%.1f\n",
++             (int)aec_param->EnableBit,
 +             (double)aec_param->AEC_DT_AggressiveFactor,
 +             (double)aec_param->ES_AggressFactor,
 +             (double)aec_param->ES_MinSuppress,
@@ -265,9 +283,24 @@
  }
  #endif
  
+diff --git a/apps/wifi_story_machine/app_main.c b/apps/wifi_story_machine/app_main.c
+index b4a30136..459ffeaf 100644
+--- a/apps/wifi_story_machine/app_main.c
++++ b/apps/wifi_story_machine/app_main.c
+@@ -129,7 +129,7 @@ const struct task_info task_info_table[] = {
+     {"#C0btstack",          18,      1024,  384   },
+ #else
+     {"btctrler",            19,      512,   384   },
+-    {"btstack",             18,      768,   384   },
++    {"btstack",             18,      2048,   384   },
+ #endif
+ #endif
+     {"wl80_test",            1,     2048,   64    },
+diff --git a/apps/wifi_story_machine/app_music.c b/apps/wifi_story_machine/app_music.c
+index acba599d..b27106a5 100644
 --- a/apps/wifi_story_machine/app_music.c
 +++ b/apps/wifi_story_machine/app_music.c
-@@ -2800,6 +2800,73 @@
+@@ -2800,6 +2800,73 @@ static int app_music_play_net_music(void *url)
      return net_music_dec_file(url, 0, net_music_dec_end, 0);
  }
  
@@ -341,7 +374,7 @@
  static int app_music_ai_listen_start(u8 voice_mode, u8 enable_vad);
  
  //第三方平台的事件通知回调
-@@ -3567,6 +3634,27 @@
+@@ -3567,6 +3634,27 @@ static int app_music_play_voice_prompt(const char *fname, void *dec_end_handler)
      return __play_voice_prompt(fname, dec_end_handler, 1);
  }
  
@@ -369,7 +402,7 @@
  /*
   * ****************************绘本识别*************************************
   */
-@@ -4387,6 +4475,8 @@
+@@ -4387,6 +4475,8 @@ static int app_music_key_long(struct key_event *key)
  #endif
          break;
      case KEY_POWER:
@@ -378,7 +411,7 @@
          app_music_shutdown(0);
          break;
      case KEY_MENU:
-@@ -4436,6 +4526,15 @@
+@@ -4436,6 +4526,15 @@ static int app_music_key_long(struct key_event *key)
  #endif
          break;
      case KEY_PHOTO:
@@ -394,7 +427,7 @@
          break;
      case KEY_ENC:
  #ifdef CONFIG_BT_ENABLE
-@@ -4503,6 +4602,9 @@
+@@ -4503,6 +4602,9 @@ static int app_music_key_long(struct key_event *key)
  static int app_music_key_event_handler(struct key_event *key)
  {
      int ret = false;
@@ -404,491 +437,16 @@
  
      if (__this->call_flag && (key->value != KEY_UP && key->value != KEY_DOWN && key->value != KEY_VOLUME_DEC && key->value != KEY_VOLUME_INC && key->value != KEY_OK && key->value != KEY_ENC)) {
          return true;	//通话模式下只有音量键和暂停键能起作用
---- a/apps/wifi_story_machine/app_main.c
-+++ b/apps/wifi_story_machine/app_main.c
-@@ -129,7 +129,7 @@
-     {"#C0btstack",          18,      1024,  384   },
- #else
-     {"btctrler",            19,      512,   384   },
--    {"btstack",             18,      768,   384   },
-+    {"btstack",             18,      2048,   384   },
- #endif
- #endif
-     {"wl80_test",            1,     2048,   64    },
---- a/apps/wifi_story_machine/wifi_app_task.c
-+++ b/apps/wifi_story_machine/wifi_app_task.c
-@@ -658,6 +658,9 @@
-         thread_fork("realtime_demo", 4, 5 * 1024, 0, 0, realtime_demo, NULL);
- #endif
- 
-+/* 涂鸦 AgenticKit 流程改为由 tuya_agentic_main 在 boot 时(late_initcall)自启动,
-+ * 它自己管理 BLE 配网 → WiFi → 激活 → 连 AI 的完整流程,不再挂在 DHCP 钩子上。*/
-+
- #ifdef CONFIG_TWETALK_ENABLE
-         // 联网成功后 初始化twetlak
-         extern int start_tc_iot_twetalk(void);
---- a/apps/wifi_story_machine/include/app_config.h
-+++ b/apps/wifi_story_machine/include/app_config.h
-@@ -115,10 +115,10 @@
- 
- #if defined CONFIG_VOICE_PROMPT_FILE_SAVE_IN_RESERVED_EXPAND_ZONE
- #if defined CONFIG_UI_FILE_SAVE_IN_RESERVED_EXPAND_ZONE
--#define CONFIG_AUDIO_PACKRES_LEN 0x180000
-+#define CONFIG_AUDIO_PACKRES_LEN 0x80000
- #define CONFIG_AUDIO_PACKRES_ADR ((__FLASH_SIZE__) - (CONFIG_UI_PACKRES_LEN) - 0x1000 - CONFIG_AUDIO_PACKRES_LEN)
- #else
--#define CONFIG_AUDIO_PACKRES_LEN 0x180000
-+#define CONFIG_AUDIO_PACKRES_LEN 0x80000
- #define CONFIG_AUDIO_PACKRES_ADR ((__FLASH_SIZE__) - CONFIG_AUDIO_PACKRES_LEN - 0x1000)
- #endif
- #else
-@@ -226,6 +226,60 @@
- // #define CONFIG_HTTP_SERVER_ENABLE            //HTTP服务器
- // #define CONFIG_FTP_SERVER_ENABLE             //FTP服务器
- // #define CONFIG_VOLC_LLM_ENABLE               //火山大模型
-+#define CONFIG_TUYA_AGENTIC_ENABLE            //涂鸦 AgenticKit(连涂鸦 AI 云,apps/common/LLM/tuya_agentic)
-+/* ===== 涂鸦下行 TTS 编码开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下生效)=====
-+ * 不定义(默认)= PCM:稳定能播,但 16k/16bit/mono=32KB/s,拥挤测试网易卡顿。
-+ * 定义下面宏 = opus:~2KB/s(1/16 带宽),云端确认支持(codec=111),帧长 80B/16kbps/40ms。
-+ *   opus 解码目前还在调(啸叫,疑 TCP 分帧重组 / 解码器兼容问题),先留开关切回 PCM。
-+ *   调 opus 时把下一行注释去掉即可。*/
-+/* 2026-08-27 颤音排查:opus 下行(48k 解码→软件 SRC 降 16k)播 TTS 有颤音,PCM 16k 直通干净(开机提示音验证)。
-+ * 暂切 PCM 做对照:PCM 也不颤→元凶在 opus 解码/SRC;PCM 也颤→元凶在网络播放链路。
-+ * 要恢复 opus 下行,取消下一行注释即可。*/
-+/* 2026-08-28 回退:本地 libopus 软解方案在 silk_Decode 内触发确定性 axi_wr_inv 崩溃(根因未解),
-+ * 已放弃,恢复原杰理闭源 opus 解码路径(48k 出→软件 SRC 降 16k,颤音随之回来)。
-+ * 带宽仍是 opus 的 ~2KB/s。若颤音不可接受,注释下一行切纯 PCM 下行(实测不颤)。*/
-+#define TUYA_DOWNLINK_OPUS_ENABLE
-+
-+/* ===== 涂鸦 barge-in(用户打断 TTS)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
-+ * 不定义(默认)= 不支持打断:TTS 期间不上行,简单稳定。
-+ * 定义 = 支持:本地 VAD 在 TTS 期间检测到说话 → tai_chat_break 停 TTS → 发新一轮上行。
-+ *   ⚠️ 强依赖 AEC:TTS 期间也上行,靠 AEC 去掉喇叭回声;AEC 不行则 VAD 被回声误触发→TTS 动辄自断。
-+ *   ⚠️ 实验性,有竞态(老轮 END 可能让新轮提前结束)。误触发多就关掉先调 AEC。*/
-+#define TUYA_BARGE_IN_ENABLE
-+
-+/* ===== 涂鸦云端 VAD(停说判定)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
-+ * 涂鸦语音对话的"开口"永远由本地 VAD(get_recoder_state)负责(云端无法做开口检测)。
-+ * 这里控制的是"停说"判定:
-+ * 定义(默认)= 云端 VAD:本地VAD开口后持续上行,云端ASR+VAD分析,云端检测到停说
-+ *   下发 TAI_EVT_SERVER_VAD 事件 → 设备结束上行。云端模型更强,停说更准。
-+ *   带"本地超时兜底":云端事件丢失时,本地VAD持续判静音超2秒则强制收尾。
-+ * 不定义 = 本地 VAD:本地VAD直接判停说(get_recoder_state 由1变0即收尾)。
-+ *   简单但易误判(话没说好就触发→ASR收空文本)。*/
-+#define TUYA_SERVER_VAD_ENABLE
-+
-+/* ===== 涂鸦音乐技能(音乐播放)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
-+ * 定义(默认)= 支持"播放XXX的歌":云端音乐 SKILL 回试听 mp3 URL(参考
-+ *   agentic-kit music_play_demo),设备解析后交给杰理网络音乐解码链播放
-+ *   (net_download→mp3 解码,https 自动 TLS)。实现:
-+ *   apps/common/LLM/tuya_agentic/tuya_music.c(解析)+ app_music.c(导出
-+ *   app_music_tuya_play_url)+ tuya_agentic_demo.c ⑤ 交接块。
-+ *   ⚠️ 试听版仅 ~30s 片段;完整歌曲需在涂鸦平台购买音乐高级能力授权。
-+ *   ⚠️ 播放期间不上行(音乐回采不进 ASR);说话可打断——VAD+能量门 3 帧双
-+ *      确认停乐回听音,若"音乐自己把自己打断"就调 BARGE_MIN_ENERGY(demo ⑤)。
-+ * 不定义 = 音乐 SKILL 回复仅当普通文本打印,不起播。*/
-+#define TUYA_MUSIC_ENABLE
-+
-+/* ===== 涂鸦云 OTA(固件升级)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
-+ * TUYA_FIRMWARE_VERSION:固件版本号(编译期写死)。⚠️手动方案:每次发版前改成与
-+ *   涂鸦平台上传固件时填的版本号一致,再编译+出 OTA 包+传平台。
-+ *   (曾尝试跨 OTA 自动持久化版本号——VM 方案重启后读回 CRC 损坏,实测不可靠,
-+ *    已回退手动;tuya_get_effective_sw_ver() 直接返回本宏,见 tuya_ota.c。)
-+ * TUYA_OTA_ENABLE:1=开机连 AI 前检查一次涂鸦云 OTA;0=关闭(不检查)。
-+ *   检查到新固件会:播报提示音 -> HTTPS 下载 -> 烧写 flash -> 自动重启。
-+ *   实现见 apps/common/LLM/tuya_agentic/tuya_ota.c。*/
-+#define TUYA_FIRMWARE_VERSION   "1.0.11"
-+#define TUYA_OTA_ENABLE         1
-+
- // #define CONFIG_ONESDK_LLM_ENABLE
- // #define CONFIG_SXY_QYAI_ENABLE
- // #define CONFIG_DUER_LC_DEMO_ENABLE           //小度澜川AI对话DEMO
-@@ -341,7 +395,7 @@
- 
- #ifdef CONFIG_AEC_ENC_ENABLE
- #define CONFIG_USB_AUDIO_AEC_ENABLE          //usb mic使能回声消除功能
--// #define CONFIG_AEC_LINEIN_CHANNEL_ENABLE     //AEC回采使用硬件通道数据
-+// #define CONFIG_AEC_LINEIN_CHANNEL_ENABLE   //AEC硬件回采(通道3采DAC)。实测未生效——自说自话照旧,通道3大概率没接DAC环采(喂垃圾参考)。已回退走软件参考(output_way=0)。要重试需先确认板子7916AB的ch3环采通路
- // #define CONFIG_AEC_USE_PLAY_MUSIC_ENABLE       //播歌时需要使用AEC
- 
- // #define CONFIG_AEC_USE_SMS_TDE   //使用tde算法, 编码参数req.enc.aec_enable设置为2
-@@ -413,7 +467,7 @@
- #endif
- #endif
- 
--#define CONFIG_DOUBLE_BANK_ENABLE           0//1: 双备份方式升级 0:单备份方式升级
-+#define CONFIG_DOUBLE_BANK_ENABLE           1//1: 双备份方式升级 0:单备份方式升级
- 
- #define CONFIG_UPGRADE_FILE_NAME            "update.ufw"
- #define CONFIG_UPGRADE_PATH                 CONFIG_ROOT_PATH\
---- a/apps/wifi_story_machine/board/wl82/Makefile
-+++ b/apps/wifi_story_machine/board/wl82/Makefile
-@@ -148,9 +148,11 @@
- 
- 
- DEFINES += $(EXT_CFLAGS) # 额外的一些定义
-+DEFINES += -DHTTP_DO_NOT_USE_CUSTOM_CONFIG -DMQTT_DO_NOT_USE_CUSTOM_CONFIG -DIOT_DO_NOT_USE_CUSTOM_CONFIG
- 
- # 头文件搜索路径
- INCLUDES := \
-+	-I../../../../apps/common/LLM/tuya_agentic/tuya_inc \
- 	-I../../../../include_lib/c++ \
- 	-I../../../../include_lib/c++/include \
- 	-I../../../../include_lib/newlib/include \
-@@ -211,8 +213,6 @@
- 	-I../../../../include_lib/utils/btmesh \
- 	-I../../../../include_lib/utils/btmesh/adaptation \
- 	-I../../../../apps/common/LLM/audio \
--	-I../../../../apps/common/LLM/volc/inc \
--	-I../../../../apps/common/LLM/volc \
- 	-I../../../../apps/common/LLM/extra \
- 	-I../../../../include_lib/net/cJSON_common \
- 	-I../../../../include_lib/net/curl/include \
-@@ -221,199 +221,26 @@
- 	-I../../../../include_lib/system/os \
- 	-I../../../../include_lib/net/libwebsockets/include \
- 	-I../../../../include_lib/net/libwebsockets/include/libwebsockets \
--	-I../../../../apps/common/LLM/onesdk/src \
--	-I../../../../apps/common/LLM/onesdk/src/aigw \
--	-I../../../../apps/common/LLM/onesdk/src/util \
--	-I../../../../apps/common/LLM/onesdk/src/aws \
--	-I../../../../apps/common/LLM/onesdk/include \
--	-I../../../../apps/common/LLM/onesdk/include/iot \
--	-I../../../../apps/common/LLM/onesdk/include/protocols \
--	-I../../../../apps/common/LLM/onesdk/include/thing_model \
--	-I../../../../apps/common/LLM/onesdk/include/platform/plat \
--	-I../../../../apps/common/LLM/onesdk/platform \
--	-I../../../../apps/common/LLM/onesdk \
- 	-I../../../../include_lib/net/web_socket \
--	-I../../../../apps/common/LLM/ifly_aiui/include \
--	-I../../../../apps/common/LLM/duer/intelligent_duer \
--	-I../../../../apps/common/LLM/duer/my_platform \
- 	-I../../../../include_lib/net/network_download \
--	-I../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/inc \
--	-I../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws \
-+	-I../../../../apps/common/LLM/tuya_agentic \
-+	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/pal \
-+	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/common \
-+	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/include \
-+	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/include \
-+	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src \
-+	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/include \
-+	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/interface \
-+	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/dependency/3rdparty/llhttp/include \
-+	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/include \
-+	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/interface \
-+	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya-ble/include \
- 
- 
- # 需要编译的 .c 文件
- c_SRC_FILES := \
--	../../../../apps/common/LLM/QYAI/net_music.c \
--	../../../../apps/common/LLM/QYAI/qyai_instruct_word.c \
--	../../../../apps/common/LLM/QYAI/qyai_pcm.c \
--	../../../../apps/common/LLM/QYAI/qyai_platform.c \
--	../../../../apps/common/LLM/aitoye2e/e2e_demo.c \
- 	../../../../apps/common/LLM/audio/audio_input.c \
--	../../../../apps/common/LLM/duer/intelligent_duer/duer_auth_algorithm.c \
--	../../../../apps/common/LLM/duer/intelligent_duer/duer_http_req.c \
--	../../../../apps/common/LLM/duer/intelligent_duer/duer_json_parse.c \
--	../../../../apps/common/LLM/duer/intelligent_duer/duer_json_request.c \
--	../../../../apps/common/LLM/duer/intelligent_duer/duer_record.c \
--	../../../../apps/common/LLM/duer/intelligent_duer/duer_socket.c \
--	../../../../apps/common/LLM/duer/intelligent_duer/test_demo.c \
--	../../../../apps/common/LLM/duer/my_platform/my_platform_http.c \
--	../../../../apps/common/LLM/duer/my_platform/my_platform_http_api.c \
--	../../../../apps/common/LLM/duer/my_platform/my_platform_list_download.c \
--	../../../../apps/common/LLM/duer/my_platform/my_platform_record.c \
--	../../../../apps/common/LLM/duer/my_platform/my_platform_url_list.c \
- 	../../../../apps/common/LLM/extra/g711.c \
--	../../../../apps/common/LLM/ifly_aiui/ifly_aiui_demo.c \
--	../../../../apps/common/LLM/ifly_aiui/ifly_aiui_user.c \
--	../../../../apps/common/LLM/ifly_aiui/ifly_model_parse.c \
--	../../../../apps/common/LLM/onesdk/examples/onesdk_realtime/chat_agent/realtime_demo.c \
--	../../../../apps/common/LLM/onesdk/platform/plat/alloc.c \
--	../../../../apps/common/LLM/onesdk/platform/plat/platform.c \
--	../../../../apps/common/LLM/onesdk/platform/plat/util.c \
--	../../../../apps/common/LLM/onesdk/src/aigw/auth.c \
--	../../../../apps/common/LLM/onesdk/src/aigw/llm.c \
--	../../../../apps/common/LLM/onesdk/src/aws/common/allocator.c \
--	../../../../apps/common/LLM/onesdk/src/aws/common/array_list.c \
--	../../../../apps/common/LLM/onesdk/src/aws/common/assert.c \
--	../../../../apps/common/LLM/onesdk/src/aws/common/atomics.c \
--	../../../../apps/common/LLM/onesdk/src/aws/common/byte_buf.c \
--	../../../../apps/common/LLM/onesdk/src/aws/common/byte_order.c \
--	../../../../apps/common/LLM/onesdk/src/aws/common/clock.c \
--	../../../../apps/common/LLM/onesdk/src/aws/common/common.c \
--	../../../../apps/common/LLM/onesdk/src/aws/common/data_time.c \
--	../../../../apps/common/LLM/onesdk/src/aws/common/encoding.c \
--	../../../../apps/common/LLM/onesdk/src/aws/common/error.c \
--	../../../../apps/common/LLM/onesdk/src/aws/common/hash_table.c \
--	../../../../apps/common/LLM/onesdk/src/aws/common/json.c \
--	../../../../apps/common/LLM/onesdk/src/aws/common/linked_list.c \
--	../../../../apps/common/LLM/onesdk/src/aws/common/math.c \
--	../../../../apps/common/LLM/onesdk/src/aws/common/string.c \
--	../../../../apps/common/LLM/onesdk/src/aws/common/time.c \
--	../../../../apps/common/LLM/onesdk/src/aws/common/zero.c \
--	../../../../apps/common/LLM/onesdk/src/infer_inner_chat.c \
--	../../../../apps/common/LLM/onesdk/src/infer_realtime_ws.c \
--	../../../../apps/common/LLM/onesdk/src/iot/dynreg.c \
--	../../../../apps/common/LLM/onesdk/src/iot/iot_kv.c \
--	../../../../apps/common/LLM/onesdk/src/iot/iot_mqtt.c \
--	../../../../apps/common/LLM/onesdk/src/iot/iot_popen.c \
--	../../../../apps/common/LLM/onesdk/src/iot/iot_utils.c \
--	../../../../apps/common/LLM/onesdk/src/iot/log/iot_log.c \
--	../../../../apps/common/LLM/onesdk/src/iot/log/iot_log_report.c \
--	../../../../apps/common/LLM/onesdk/src/iot/ota/iot_ota_api.c \
--	../../../../apps/common/LLM/onesdk/src/iot/ota/iot_ota_utils.c \
--	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/custom_topic.c \
--	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/device_delay.c \
--	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/event.c \
--	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/gateway.c \
--	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/iot_ntp.c \
--	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/iot_tm_api.c \
--	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/property.c \
--	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/service.c \
--	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/shadow.c \
--	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/webshell.c \
--	../../../../apps/common/LLM/onesdk/src/iot_basic.c \
--	../../../../apps/common/LLM/onesdk/src/onesdk.c \
--	../../../../apps/common/LLM/onesdk/src/onesdk_chat.c \
--	../../../../apps/common/LLM/onesdk/src/onesdk_iot.c \
--	../../../../apps/common/LLM/onesdk/src/onesdk_rt.c \
--	../../../../apps/common/LLM/onesdk/src/protocols/http.c \
--	../../../../apps/common/LLM/onesdk/src/protocols/http_libs.c \
--	../../../../apps/common/LLM/onesdk/src/protocols/lws_http_client.c \
--	../../../../apps/common/LLM/onesdk/src/protocols/lws_http_download.c \
--	../../../../apps/common/LLM/onesdk/src/protocols/lws_http_upload.c \
--	../../../../apps/common/LLM/onesdk/src/util/aes.c \
--	../../../../apps/common/LLM/onesdk/src/util/aes_decode.c \
--	../../../../apps/common/LLM/onesdk/src/util/aws_json.c \
--	../../../../apps/common/LLM/onesdk/src/util/hmac_sha256.c \
--	../../../../apps/common/LLM/onesdk/src/util/md5.c \
--	../../../../apps/common/LLM/onesdk/src/util/sha256.c \
--	../../../../apps/common/LLM/onesdk/src/util/util.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_File_free_rtos.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_OS_free_rtos.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_SoftAP_ac79.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_TCP_free_rtos.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_Timer_free_rtos.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_UDP_free_rtos.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_nvs_ac79.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_ota_ac79.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_wifi_ac79.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/qcloud_iot_link_ble_ac79.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/ble_llsync_device_info.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/ble_llsync_service.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/cos_download.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_action.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_cloud.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_config.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_event.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_mqtt.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_parse.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_property.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/dynreg_request.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/dynreg_signature.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/http_ca.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/http_client.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/http_signed.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_client.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_client_common.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_client_connect.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_client_publish.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_client_subscribe.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_client_yield.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_packet_deserialize.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_packet_serialize.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/network_interface.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/ota_mqtt.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/qcloud_iot_device.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/qcloud_iot_link.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/qcloud_iot_timer.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/qcloud_iot_tls_client.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/sevice_mqtt.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/system_mqtt.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_aes.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_base64.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_crc.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_downloader.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_hmac.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_json.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_list.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_log.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_md5.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_min_heap.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_ringbuffer.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_sha1.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_sha256.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_signature.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/wifi_bind.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/wifi_config.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/wifi_llsync.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/wifi_softap.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/wifi_udp.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws/data_template_app.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws/ota_downloader.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws/test_audio_opus.c \
--	../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws/twetalk_app.c \
--	../../../../apps/common/LLM/volc/VolcEngineRTCLiteDemo.c \
--	../../../../apps/common/LLM/volc/access_token.c \
--	../../../../apps/common/LLM/volc/net_request.c \
--	../../../../apps/common/LLM/volc/src/common/volc_crypto.c \
--	../../../../apps/common/LLM/volc/src/common/volc_sprintf.c \
--	../../../../apps/common/LLM/volc/src/common/volc_string.c \
--	../../../../apps/common/LLM/volc/src/common/volc_tls.c \
--	../../../../apps/common/LLM/volc/src/platform/volc_atomic.c \
--	../../../../apps/common/LLM/volc/src/platform/volc_device.c \
--	../../../../apps/common/LLM/volc/src/platform/volc_device_finger_print.c \
--	../../../../apps/common/LLM/volc/src/platform/volc_directory.c \
--	../../../../apps/common/LLM/volc/src/platform/volc_errno.c \
--	../../../../apps/common/LLM/volc/src/platform/volc_fileio.c \
--	../../../../apps/common/LLM/volc/src/platform/volc_log.c \
--	../../../../apps/common/LLM/volc/src/platform/volc_memory.c \
--	../../../../apps/common/LLM/volc/src/platform/volc_mutex.c \
--	../../../../apps/common/LLM/volc/src/platform/volc_network.c \
--	../../../../apps/common/LLM/volc/src/platform/volc_socket.c \
--	../../../../apps/common/LLM/volc/src/platform/volc_thread.c \
--	../../../../apps/common/LLM/volc/src/platform/volc_time.c \
--	../../../../apps/common/LLM/volc/src/platform/volc_uuid.c \
--	../../../../apps/common/LLM/volc/src/platform/volc_zlib.c \
- 	../../../../apps/common/asr/aisp/aisp.c \
- 	../../../../apps/common/asr/jlkws/jlkws.c \
- 	../../../../apps/common/asr/roobo/roobo.c \
-@@ -432,10 +259,6 @@
- 	../../../../apps/common/ble/le_hogp.c \
- 	../../../../apps/common/ble/le_net_central.c \
- 	../../../../apps/common/ble/le_net_cfg.c \
--	../../../../apps/common/ble/le_net_cfg_dui.c \
--	../../../../apps/common/ble/le_net_cfg_qyai.c \
--	../../../../apps/common/ble/le_net_cfg_tencent.c \
--	../../../../apps/common/ble/le_net_cfg_turing.c \
- 	../../../../apps/common/ble/le_trans_data.c \
- 	../../../../apps/common/ble/mesh/examples/AliGenie_fan.c \
- 	../../../../apps/common/ble/mesh/examples/AliGenie_light.c \
-@@ -585,8 +408,6 @@
- 	../../../../apps/common/usb/usb_host_config.c \
- 	../../../../apps/wifi_story_machine/app_main.c \
- 	../../../../apps/wifi_story_machine/app_music.c \
--	../../../../apps/wifi_story_machine/app_music_dui.c \
--	../../../../apps/wifi_story_machine/app_music_tencent.c \
- 	../../../../apps/wifi_story_machine/board/wl82/board_7911B.c \
- 	../../../../apps/wifi_story_machine/board/wl82/board_7911D.c \
- 	../../../../apps/wifi_story_machine/board/wl82/board_7912D.c \
-@@ -618,6 +439,40 @@
- 	../../../../cpu/wl82/key/rdec.c \
- 	../../../../cpu/wl82/port_waked_up.c \
- 	../../../../cpu/wl82/setup.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_attrs.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_client.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_crypto.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_packet.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_pkt_log.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_protocol.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_transport.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop_base.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/cipher_wrapper.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/http_client_interface.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client_message.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_dns.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_dp.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_on_boarding.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_ota.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/mqtt.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/common/tls.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/common/log.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/common/rng.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/core_http_client.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/dependency/3rdparty/llhttp/src/api.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/dependency/3rdparty/llhttp/src/http.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/dependency/3rdparty/llhttp/src/llhttp.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/core_mqtt.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/core_mqtt_serializer.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/core_mqtt_state.c \
-+	../../../../apps/common/LLM/tuya_agentic/pal_ac791n.c \
-+	../../../../apps/common/LLM/tuya_agentic/tuya_agentic_demo.c \
-+	../../../../apps/common/LLM/tuya_agentic/tuya_music.c \
-+	../../../../apps/common/LLM/tuya_agentic/tuya_ota.c \
-+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya-ble/src/tuya_ble_prov.c \
-+	../../../../apps/common/LLM/tuya_agentic/le_net_cfg_tuya.c \
- 
- 
- # 需要编译的 .S 文件
-@@ -760,25 +615,18 @@
- 	../../../../cpu/wl82/liba/https_cli.a \
- 	../../../../cpu/wl82/liba/http_server.a \
- 	../../../../cpu/wl82/liba/json.a \
--	../../../../cpu/wl82/liba/libduer-device.a \
- 	../../../../cpu/wl82/liba/network_download.a \
- 	../../../../cpu/wl82/liba/lib_mqtt.a \
- 	../../../../cpu/wl82/liba/lib_sound_wave.a \
--	../../../../cpu/wl82/liba/libturing.a \
--	../../../../cpu/wl82/liba/libdui.a \
- 	../../../../cpu/wl82/liba/libJlCloud.a \
- 	../../../../cpu/wl82/liba/libecho_cloud.a \
- 	../../../../cpu/wl82/liba/libmpeg.a \
- 	../../../../cpu/wl82/liba/libdcl.a \
- 	../../../../cpu/wl82/liba/libdlna.a \
- 	../../../../cpu/wl82/liba/libqrcode.a \
--	../../../../cpu/wl82/liba/libwt.a \
- 	../../../../cpu/wl82/liba/libvtbk.a \
--	../../../../cpu/wl82/liba/libtencent.a \
- 	../../../../cpu/wl82/liba/websocket.a \
- 	../../../../cpu/wl82/liba/iperf.a \
--	../../../../cpu/wl82/liba/tmallgenie.a \
--	../../../../cpu/wl82/liba/tmallgenie_todo.a \
- 	../../../../cpu/wl82/liba/cJSON.a \
- 	../../../../cpu/wl82/liba/ftpserver_new.a \
- 	../../../../cpu/wl82/liba/http_server.a  \
-@@ -795,18 +643,13 @@
- 	../../../../cpu/wl82/liba/res.a \
- 	../../../../cpu/wl82/liba/font.a \
- 	../../../../cpu/wl82/liba/ui_draw.a \
--	../../../../cpu/wl82/liba/libVolcEngineRTCLite.a \
- 	../../../../cpu/wl82/liba/libcurl.a \
- 	../../../../cpu/wl82/liba/libwebsockets.a \
- 	../../../../cpu/wl82/liba/cJSON.a  \
- 	../../../../cpu/wl82/liba/libmbedtls_3_4_0.a  \
--	../../../../cpu/wl82/liba/sxy_qyai.a \
--	../../../../cpu/wl82/liba/libe2e.a \
- 	../../../../cpu/wl82/liba/websocket.a  \
--	../../../../cpu/wl82/liba/libifly_aiui_lib.a \
- 	../../../../cpu/wl82/liba/websocket.a   \
- 	../../../../cpu/wl82/liba/cJSON.a   \
--	../../../../cpu/wl82/liba/lib_twetalk.a \
- 	-T../../../../cpu/wl82/sdk.ld \
- 	-M=../../../../cpu/wl82/tools/sdk.map \
- 	--end-group  \
---- a/apps/wifi_story_machine/board/wl82/board_7916A.c
-+++ b/apps/wifi_story_machine/board/wl82/board_7916A.c
-@@ -24,7 +24,7 @@
- // *INDENT-OFF*
- 
- UART0_PLATFORM_DATA_BEGIN(uart0_data)
--    .baudrate = 1000000,
-+    .baudrate = 115200,
-     /* .port = PORTA_5_6, */
-     .port = PORTA_3_4,
-     /* .tx_pin = IO_PORTA_05, */
-@@ -49,7 +49,7 @@
- UART1_PLATFORM_DATA_END();
- 
- UART2_PLATFORM_DATA_BEGIN(uart2_data)
--    .baudrate = 1000000,
-+    .baudrate = 115200,
-     .port = PORT_REMAP,
- #if CONFIG_AUDIO_ENC_SAMPLE_SOURCE == AUDIO_ENC_SAMPLE_SOURCE_PLNK0
-     .output_channel = OUTPUT_CHANNEL3,
+diff --git a/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp b/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp
+index 53b90818..b4c7f2fa 100644
 --- a/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp
 +++ b/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp
-@@ -72,6 +72,19 @@
+@@ -72,6 +72,20 @@
  <Add option="-D_XOPEN_SOURCE=700" />
  <Add option="-D_GNU_SOURCE" />
  <Add option="-D__ELF__" />
 +<Add directory="../../../../apps/common/LLM/tuya_agentic/tuya_inc" />
++			<Add directory="../../../../apps/common/LLM/tuya_agentic/libopus" />
 +<Add directory="../../../../apps/common/LLM/tuya_agentic" />
 +<Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/pal" />
 +<Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/common" />
@@ -904,7 +462,7 @@
  <Add directory="../../../../include_lib/c++" />
  <Add directory="../../../../include_lib/c++/include" />
  <Add directory="../../../../include_lib/newlib/include" />
-@@ -132,7 +145,6 @@
+@@ -132,7 +146,6 @@
  <Add directory="../../../../include_lib/utils/btmesh" />
  <Add directory="../../../../include_lib/utils/btmesh/adaptation" />
  <Add directory="../../../../apps/common/LLM/audio" />
@@ -912,7 +470,7 @@
  <Add directory="../../../../apps/common/LLM/volc" />
  <Add directory="../../../../apps/common/LLM/extra" />
  <Add directory="../../../../include_lib/net/cJSON_common" />
-@@ -142,24 +154,12 @@
+@@ -142,24 +155,16 @@
  <Add directory="../../../../include_lib/system/os" />
  <Add directory="../../../../include_lib/net/libwebsockets/include" />
  <Add directory="../../../../include_lib/net/libwebsockets/include/libwebsockets" />
@@ -934,13 +492,25 @@
  <Add directory="../../../../include_lib/net/network_download" />
 -<Add directory="../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/inc" />
 -<Add directory="../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws" />
++			<Add directory="../../../../apps/common/LLM/tuya_agentic/libopus/include" />
++			<Add directory="../../../../apps/common/LLM/tuya_agentic/libopus/celt" />
++			<Add directory="../../../../apps/common/LLM/tuya_agentic/libopus/silk" />
++			<Add directory="../../../../apps/common/LLM/tuya_agentic/libopus/silk/fixed" />
 +<Add option="-DHTTP_DO_NOT_USE_CUSTOM_CONFIG" />
 +<Add option="-DMQTT_DO_NOT_USE_CUSTOM_CONFIG" />
 +<Add option="-DIOT_DO_NOT_USE_CUSTOM_CONFIG" />
  </Compiler>
  <Linker>
  <Add option="--plugin-opt=-pi32v2-always-use-itblock=false" />
-@@ -267,25 +267,18 @@
+@@ -217,6 +222,7 @@
+ <Add option="../../../../cpu/wl82/liba/lib_wav_dec.a" />
+ <Add option="../../../../cpu/wl82/liba/lib_dts_dec.a" />
+ <Add option="../../../../cpu/wl82/liba/lib_opus_dec.a" />
++			<Add option="../../../../apps/common/LLM/tuya_agentic/libopus/libopus_tuya.a" />
+ <Add option="../../../../cpu/wl82/liba/lib_amr_dec.a" />
+ <Add option="../../../../cpu/wl82/liba/lib_amr_enc.a" />
+ <Add option="../../../../cpu/wl82/liba/lib_amrwb_enc.a" />
+@@ -267,25 +273,18 @@
  <Add option="../../../../cpu/wl82/liba/https_cli.a" />
  <Add option="../../../../cpu/wl82/liba/http_server.a" />
  <Add option="../../../../cpu/wl82/liba/json.a" />
@@ -966,7 +536,7 @@
  <Add option="../../../../cpu/wl82/liba/cJSON.a" />
  <Add option="../../../../cpu/wl82/liba/ftpserver_new.a" />
  <Add option="../../../../cpu/wl82/liba/http_server.a " />
-@@ -302,18 +295,13 @@
+@@ -302,18 +301,13 @@
  <Add option="../../../../cpu/wl82/liba/res.a" />
  <Add option="../../../../cpu/wl82/liba/font.a" />
  <Add option="../../../../cpu/wl82/liba/ui_draw.a" />
@@ -985,7 +555,7 @@
  <Add option="-T../../../../cpu/wl82/sdk.ld" />
  <Add option="-M=../../../../cpu/wl82/tools/sdk.map" />
  <Add option="--end-group " />
-@@ -332,351 +320,10 @@
+@@ -332,351 +326,10 @@
  </ExtraCommands>
  </Target>
  </Build>
@@ -1337,7 +907,7 @@
  <Unit filename="../../../../apps/common/asr/aisp/aisp.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/common/asr/jlkws/jlkws.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/common/asr/jlkws/jlsp_far_keyword.h" />
-@@ -701,18 +348,11 @@
+@@ -701,18 +354,11 @@
  <Unit filename="../../../../apps/common/ble/include/le_hogp.h" />
  <Unit filename="../../../../apps/common/ble/include/le_net_central.h" />
  <Unit filename="../../../../apps/common/ble/include/le_net_cfg.h" />
@@ -1356,7 +926,7 @@
  <Unit filename="../../../../apps/common/ble/le_trans_data.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/common/ble/mesh/examples/AliGenie_fan.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/common/ble/mesh/examples/AliGenie_light.c"><Option compilerVer="CC"/></Unit>
-@@ -938,8 +578,6 @@
+@@ -938,8 +584,6 @@
  <Unit filename="../../../../apps/common/usb/usb_std_class_def.h" />
  <Unit filename="../../../../apps/wifi_story_machine/app_main.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/wifi_story_machine/app_music.c"><Option compilerVer="CC"/></Unit>
@@ -1365,7 +935,7 @@
  <Unit filename="../../../../apps/wifi_story_machine/board/wl82/board_7911B.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/wifi_story_machine/board/wl82/board_7911B0_cfg.h" />
  <Unit filename="../../../../apps/wifi_story_machine/board/wl82/board_7911B8_cfg.h" />
-@@ -1456,7 +1094,6 @@
+@@ -1456,7 +1100,6 @@
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/FreeRTOS.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/FreeRTOSConfig.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/deprecated_definitions.h" />
@@ -1373,7 +943,7 @@
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/list.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/mpu_wrappers.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/pi32v2/portmacro.h" />
-@@ -1465,7 +1102,6 @@
+@@ -1465,7 +1108,6 @@
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/queue.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/semphr.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/task.h" />
@@ -1381,7 +951,7 @@
  <Unit filename="../../../../include_lib/system/os/os_api.h" />
  <Unit filename="../../../../include_lib/system/os/os_cpu.h" />
  <Unit filename="../../../../include_lib/system/os/os_error.h" />
-@@ -1571,5 +1207,39 @@
+@@ -1571,5 +1213,40 @@
  <Unit filename="../../../../lib/net/version.z.S" />
  <Unit filename="../../../../lib/server/version.z.S" />
  <Unit filename="../../../../lib/utils/version.z.S" />
@@ -1419,5 +989,506 @@
 +<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/core_mqtt_serializer.c"><Option compilerVar="CC" /></Unit>
 +<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/core_mqtt_state.c"><Option compilerVar="CC" /></Unit>
 +<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya-ble/src/tuya_ble_prov.c"><Option compilerVar="CC" /></Unit>
++		<Unit filename="../../../../apps/common/LLM/tuya_agentic/tuya_opus_enc.c"><Option compilerVar="CC" /></Unit>
  </Project>
  </CodeBlocks_project_file>
+diff --git a/apps/wifi_story_machine/board/wl82/Makefile b/apps/wifi_story_machine/board/wl82/Makefile
+index 2012bf8a..4b6affee 100644
+--- a/apps/wifi_story_machine/board/wl82/Makefile
++++ b/apps/wifi_story_machine/board/wl82/Makefile
+@@ -148,9 +148,12 @@ DEFINES := \
+ 
+ 
+ DEFINES += $(EXT_CFLAGS) # 额外的一些定义
++DEFINES += -DHTTP_DO_NOT_USE_CUSTOM_CONFIG -DMQTT_DO_NOT_USE_CUSTOM_CONFIG -DIOT_DO_NOT_USE_CUSTOM_CONFIG
+ 
+ # 头文件搜索路径
+ INCLUDES := \
++	-I../../../../apps/common/LLM/tuya_agentic/tuya_inc \
++    ../../../../apps/common/LLM/tuya_agentic/libopus \
+ 	-I../../../../include_lib/c++ \
+ 	-I../../../../include_lib/c++/include \
+ 	-I../../../../include_lib/newlib/include \
+@@ -211,8 +214,6 @@ INCLUDES := \
+ 	-I../../../../include_lib/utils/btmesh \
+ 	-I../../../../include_lib/utils/btmesh/adaptation \
+ 	-I../../../../apps/common/LLM/audio \
+-	-I../../../../apps/common/LLM/volc/inc \
+-	-I../../../../apps/common/LLM/volc \
+ 	-I../../../../apps/common/LLM/extra \
+ 	-I../../../../include_lib/net/cJSON_common \
+ 	-I../../../../include_lib/net/curl/include \
+@@ -221,199 +222,30 @@ INCLUDES := \
+ 	-I../../../../include_lib/system/os \
+ 	-I../../../../include_lib/net/libwebsockets/include \
+ 	-I../../../../include_lib/net/libwebsockets/include/libwebsockets \
+-	-I../../../../apps/common/LLM/onesdk/src \
+-	-I../../../../apps/common/LLM/onesdk/src/aigw \
+-	-I../../../../apps/common/LLM/onesdk/src/util \
+-	-I../../../../apps/common/LLM/onesdk/src/aws \
+-	-I../../../../apps/common/LLM/onesdk/include \
+-	-I../../../../apps/common/LLM/onesdk/include/iot \
+-	-I../../../../apps/common/LLM/onesdk/include/protocols \
+-	-I../../../../apps/common/LLM/onesdk/include/thing_model \
+-	-I../../../../apps/common/LLM/onesdk/include/platform/plat \
+-	-I../../../../apps/common/LLM/onesdk/platform \
+-	-I../../../../apps/common/LLM/onesdk \
+ 	-I../../../../include_lib/net/web_socket \
+-	-I../../../../apps/common/LLM/ifly_aiui/include \
+-	-I../../../../apps/common/LLM/duer/intelligent_duer \
+-	-I../../../../apps/common/LLM/duer/my_platform \
+ 	-I../../../../include_lib/net/network_download \
+-	-I../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/inc \
+-	-I../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws \
++	-I../../../../apps/common/LLM/tuya_agentic \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/pal \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/common \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/include \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/include \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/include \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/interface \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/dependency/3rdparty/llhttp/include \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/include \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/interface \
++	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya-ble/include \
++    ../../../../apps/common/LLM/tuya_agentic/libopus/include \
++    ../../../../apps/common/LLM/tuya_agentic/libopus/celt \
++    ../../../../apps/common/LLM/tuya_agentic/libopus/silk \
++    ../../../../apps/common/LLM/tuya_agentic/libopus/silk/fixed \
+ 
+ 
+ # 需要编译的 .c 文件
+ c_SRC_FILES := \
+-	../../../../apps/common/LLM/QYAI/net_music.c \
+-	../../../../apps/common/LLM/QYAI/qyai_instruct_word.c \
+-	../../../../apps/common/LLM/QYAI/qyai_pcm.c \
+-	../../../../apps/common/LLM/QYAI/qyai_platform.c \
+-	../../../../apps/common/LLM/aitoye2e/e2e_demo.c \
+ 	../../../../apps/common/LLM/audio/audio_input.c \
+-	../../../../apps/common/LLM/duer/intelligent_duer/duer_auth_algorithm.c \
+-	../../../../apps/common/LLM/duer/intelligent_duer/duer_http_req.c \
+-	../../../../apps/common/LLM/duer/intelligent_duer/duer_json_parse.c \
+-	../../../../apps/common/LLM/duer/intelligent_duer/duer_json_request.c \
+-	../../../../apps/common/LLM/duer/intelligent_duer/duer_record.c \
+-	../../../../apps/common/LLM/duer/intelligent_duer/duer_socket.c \
+-	../../../../apps/common/LLM/duer/intelligent_duer/test_demo.c \
+-	../../../../apps/common/LLM/duer/my_platform/my_platform_http.c \
+-	../../../../apps/common/LLM/duer/my_platform/my_platform_http_api.c \
+-	../../../../apps/common/LLM/duer/my_platform/my_platform_list_download.c \
+-	../../../../apps/common/LLM/duer/my_platform/my_platform_record.c \
+-	../../../../apps/common/LLM/duer/my_platform/my_platform_url_list.c \
+ 	../../../../apps/common/LLM/extra/g711.c \
+-	../../../../apps/common/LLM/ifly_aiui/ifly_aiui_demo.c \
+-	../../../../apps/common/LLM/ifly_aiui/ifly_aiui_user.c \
+-	../../../../apps/common/LLM/ifly_aiui/ifly_model_parse.c \
+-	../../../../apps/common/LLM/onesdk/examples/onesdk_realtime/chat_agent/realtime_demo.c \
+-	../../../../apps/common/LLM/onesdk/platform/plat/alloc.c \
+-	../../../../apps/common/LLM/onesdk/platform/plat/platform.c \
+-	../../../../apps/common/LLM/onesdk/platform/plat/util.c \
+-	../../../../apps/common/LLM/onesdk/src/aigw/auth.c \
+-	../../../../apps/common/LLM/onesdk/src/aigw/llm.c \
+-	../../../../apps/common/LLM/onesdk/src/aws/common/allocator.c \
+-	../../../../apps/common/LLM/onesdk/src/aws/common/array_list.c \
+-	../../../../apps/common/LLM/onesdk/src/aws/common/assert.c \
+-	../../../../apps/common/LLM/onesdk/src/aws/common/atomics.c \
+-	../../../../apps/common/LLM/onesdk/src/aws/common/byte_buf.c \
+-	../../../../apps/common/LLM/onesdk/src/aws/common/byte_order.c \
+-	../../../../apps/common/LLM/onesdk/src/aws/common/clock.c \
+-	../../../../apps/common/LLM/onesdk/src/aws/common/common.c \
+-	../../../../apps/common/LLM/onesdk/src/aws/common/data_time.c \
+-	../../../../apps/common/LLM/onesdk/src/aws/common/encoding.c \
+-	../../../../apps/common/LLM/onesdk/src/aws/common/error.c \
+-	../../../../apps/common/LLM/onesdk/src/aws/common/hash_table.c \
+-	../../../../apps/common/LLM/onesdk/src/aws/common/json.c \
+-	../../../../apps/common/LLM/onesdk/src/aws/common/linked_list.c \
+-	../../../../apps/common/LLM/onesdk/src/aws/common/math.c \
+-	../../../../apps/common/LLM/onesdk/src/aws/common/string.c \
+-	../../../../apps/common/LLM/onesdk/src/aws/common/time.c \
+-	../../../../apps/common/LLM/onesdk/src/aws/common/zero.c \
+-	../../../../apps/common/LLM/onesdk/src/infer_inner_chat.c \
+-	../../../../apps/common/LLM/onesdk/src/infer_realtime_ws.c \
+-	../../../../apps/common/LLM/onesdk/src/iot/dynreg.c \
+-	../../../../apps/common/LLM/onesdk/src/iot/iot_kv.c \
+-	../../../../apps/common/LLM/onesdk/src/iot/iot_mqtt.c \
+-	../../../../apps/common/LLM/onesdk/src/iot/iot_popen.c \
+-	../../../../apps/common/LLM/onesdk/src/iot/iot_utils.c \
+-	../../../../apps/common/LLM/onesdk/src/iot/log/iot_log.c \
+-	../../../../apps/common/LLM/onesdk/src/iot/log/iot_log_report.c \
+-	../../../../apps/common/LLM/onesdk/src/iot/ota/iot_ota_api.c \
+-	../../../../apps/common/LLM/onesdk/src/iot/ota/iot_ota_utils.c \
+-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/custom_topic.c \
+-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/device_delay.c \
+-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/event.c \
+-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/gateway.c \
+-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/iot_ntp.c \
+-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/iot_tm_api.c \
+-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/property.c \
+-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/service.c \
+-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/shadow.c \
+-	../../../../apps/common/LLM/onesdk/src/iot/thingmodel/webshell.c \
+-	../../../../apps/common/LLM/onesdk/src/iot_basic.c \
+-	../../../../apps/common/LLM/onesdk/src/onesdk.c \
+-	../../../../apps/common/LLM/onesdk/src/onesdk_chat.c \
+-	../../../../apps/common/LLM/onesdk/src/onesdk_iot.c \
+-	../../../../apps/common/LLM/onesdk/src/onesdk_rt.c \
+-	../../../../apps/common/LLM/onesdk/src/protocols/http.c \
+-	../../../../apps/common/LLM/onesdk/src/protocols/http_libs.c \
+-	../../../../apps/common/LLM/onesdk/src/protocols/lws_http_client.c \
+-	../../../../apps/common/LLM/onesdk/src/protocols/lws_http_download.c \
+-	../../../../apps/common/LLM/onesdk/src/protocols/lws_http_upload.c \
+-	../../../../apps/common/LLM/onesdk/src/util/aes.c \
+-	../../../../apps/common/LLM/onesdk/src/util/aes_decode.c \
+-	../../../../apps/common/LLM/onesdk/src/util/aws_json.c \
+-	../../../../apps/common/LLM/onesdk/src/util/hmac_sha256.c \
+-	../../../../apps/common/LLM/onesdk/src/util/md5.c \
+-	../../../../apps/common/LLM/onesdk/src/util/sha256.c \
+-	../../../../apps/common/LLM/onesdk/src/util/util.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_File_free_rtos.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_OS_free_rtos.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_SoftAP_ac79.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_TCP_free_rtos.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_Timer_free_rtos.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_UDP_free_rtos.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_nvs_ac79.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_ota_ac79.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/HAL_wifi_ac79.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/port/qcloud_iot_link_ble_ac79.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/ble_llsync_device_info.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/ble_llsync_service.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/cos_download.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_action.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_cloud.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_config.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_event.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_mqtt.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_parse.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/data_template_property.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/dynreg_request.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/dynreg_signature.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/http_ca.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/http_client.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/http_signed.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_client.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_client_common.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_client_connect.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_client_publish.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_client_subscribe.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_client_yield.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_packet_deserialize.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/mqtt_packet_serialize.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/network_interface.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/ota_mqtt.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/qcloud_iot_device.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/qcloud_iot_link.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/qcloud_iot_timer.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/qcloud_iot_tls_client.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/sevice_mqtt.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/system_mqtt.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_aes.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_base64.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_crc.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_downloader.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_hmac.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_json.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_list.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_log.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_md5.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_min_heap.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_ringbuffer.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_sha1.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_sha256.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/utils_signature.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/wifi_bind.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/wifi_config.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/wifi_llsync.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/wifi_softap.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/src/wifi_udp.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws/data_template_app.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws/ota_downloader.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws/test_audio_opus.c \
+-	../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws/twetalk_app.c \
+-	../../../../apps/common/LLM/volc/VolcEngineRTCLiteDemo.c \
+-	../../../../apps/common/LLM/volc/access_token.c \
+-	../../../../apps/common/LLM/volc/net_request.c \
+-	../../../../apps/common/LLM/volc/src/common/volc_crypto.c \
+-	../../../../apps/common/LLM/volc/src/common/volc_sprintf.c \
+-	../../../../apps/common/LLM/volc/src/common/volc_string.c \
+-	../../../../apps/common/LLM/volc/src/common/volc_tls.c \
+-	../../../../apps/common/LLM/volc/src/platform/volc_atomic.c \
+-	../../../../apps/common/LLM/volc/src/platform/volc_device.c \
+-	../../../../apps/common/LLM/volc/src/platform/volc_device_finger_print.c \
+-	../../../../apps/common/LLM/volc/src/platform/volc_directory.c \
+-	../../../../apps/common/LLM/volc/src/platform/volc_errno.c \
+-	../../../../apps/common/LLM/volc/src/platform/volc_fileio.c \
+-	../../../../apps/common/LLM/volc/src/platform/volc_log.c \
+-	../../../../apps/common/LLM/volc/src/platform/volc_memory.c \
+-	../../../../apps/common/LLM/volc/src/platform/volc_mutex.c \
+-	../../../../apps/common/LLM/volc/src/platform/volc_network.c \
+-	../../../../apps/common/LLM/volc/src/platform/volc_socket.c \
+-	../../../../apps/common/LLM/volc/src/platform/volc_thread.c \
+-	../../../../apps/common/LLM/volc/src/platform/volc_time.c \
+-	../../../../apps/common/LLM/volc/src/platform/volc_uuid.c \
+-	../../../../apps/common/LLM/volc/src/platform/volc_zlib.c \
+ 	../../../../apps/common/asr/aisp/aisp.c \
+ 	../../../../apps/common/asr/jlkws/jlkws.c \
+ 	../../../../apps/common/asr/roobo/roobo.c \
+@@ -432,10 +264,6 @@ c_SRC_FILES := \
+ 	../../../../apps/common/ble/le_hogp.c \
+ 	../../../../apps/common/ble/le_net_central.c \
+ 	../../../../apps/common/ble/le_net_cfg.c \
+-	../../../../apps/common/ble/le_net_cfg_dui.c \
+-	../../../../apps/common/ble/le_net_cfg_qyai.c \
+-	../../../../apps/common/ble/le_net_cfg_tencent.c \
+-	../../../../apps/common/ble/le_net_cfg_turing.c \
+ 	../../../../apps/common/ble/le_trans_data.c \
+ 	../../../../apps/common/ble/mesh/examples/AliGenie_fan.c \
+ 	../../../../apps/common/ble/mesh/examples/AliGenie_light.c \
+@@ -585,8 +413,6 @@ c_SRC_FILES := \
+ 	../../../../apps/common/usb/usb_host_config.c \
+ 	../../../../apps/wifi_story_machine/app_main.c \
+ 	../../../../apps/wifi_story_machine/app_music.c \
+-	../../../../apps/wifi_story_machine/app_music_dui.c \
+-	../../../../apps/wifi_story_machine/app_music_tencent.c \
+ 	../../../../apps/wifi_story_machine/board/wl82/board_7911B.c \
+ 	../../../../apps/wifi_story_machine/board/wl82/board_7911D.c \
+ 	../../../../apps/wifi_story_machine/board/wl82/board_7912D.c \
+@@ -618,6 +444,41 @@ c_SRC_FILES := \
+ 	../../../../cpu/wl82/key/rdec.c \
+ 	../../../../cpu/wl82/port_waked_up.c \
+ 	../../../../cpu/wl82/setup.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_attrs.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_client.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_crypto.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_packet.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_pkt_log.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_protocol.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_transport.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop_base.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/cipher_wrapper.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/http_client_interface.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client_message.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_dns.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_dp.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_on_boarding.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_ota.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/mqtt.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/common/tls.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/common/log.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/common/rng.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/core_http_client.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/dependency/3rdparty/llhttp/src/api.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/dependency/3rdparty/llhttp/src/http.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreHTTP/source/dependency/3rdparty/llhttp/src/llhttp.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/core_mqtt.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/core_mqtt_serializer.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/core_mqtt_state.c \
++	../../../../apps/common/LLM/tuya_agentic/pal_ac791n.c \
++	../../../../apps/common/LLM/tuya_agentic/tuya_agentic_demo.c \
++	../../../../apps/common/LLM/tuya_agentic/tuya_music.c \
++	../../../../apps/common/LLM/tuya_agentic/tuya_ota.c \
++	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya-ble/src/tuya_ble_prov.c \
++	../../../../apps/common/LLM/tuya_agentic/le_net_cfg_tuya.c \
++    ../../../../apps/common/LLM/tuya_agentic/tuya_opus_enc.c \
+ 
+ 
+ # 需要编译的 .S 文件
+@@ -710,6 +571,7 @@ LFLAGS := \
+ 	../../../../cpu/wl82/liba/lib_wav_dec.a \
+ 	../../../../cpu/wl82/liba/lib_dts_dec.a \
+ 	../../../../cpu/wl82/liba/lib_opus_dec.a \
++	../../../../apps/common/LLM/tuya_agentic/libopus/libopus_tuya.a \
+ 	../../../../cpu/wl82/liba/lib_amr_dec.a \
+ 	../../../../cpu/wl82/liba/lib_amr_enc.a \
+ 	../../../../cpu/wl82/liba/lib_amrwb_enc.a \
+@@ -760,25 +622,18 @@ LFLAGS := \
+ 	../../../../cpu/wl82/liba/https_cli.a \
+ 	../../../../cpu/wl82/liba/http_server.a \
+ 	../../../../cpu/wl82/liba/json.a \
+-	../../../../cpu/wl82/liba/libduer-device.a \
+ 	../../../../cpu/wl82/liba/network_download.a \
+ 	../../../../cpu/wl82/liba/lib_mqtt.a \
+ 	../../../../cpu/wl82/liba/lib_sound_wave.a \
+-	../../../../cpu/wl82/liba/libturing.a \
+-	../../../../cpu/wl82/liba/libdui.a \
+ 	../../../../cpu/wl82/liba/libJlCloud.a \
+ 	../../../../cpu/wl82/liba/libecho_cloud.a \
+ 	../../../../cpu/wl82/liba/libmpeg.a \
+ 	../../../../cpu/wl82/liba/libdcl.a \
+ 	../../../../cpu/wl82/liba/libdlna.a \
+ 	../../../../cpu/wl82/liba/libqrcode.a \
+-	../../../../cpu/wl82/liba/libwt.a \
+ 	../../../../cpu/wl82/liba/libvtbk.a \
+-	../../../../cpu/wl82/liba/libtencent.a \
+ 	../../../../cpu/wl82/liba/websocket.a \
+ 	../../../../cpu/wl82/liba/iperf.a \
+-	../../../../cpu/wl82/liba/tmallgenie.a \
+-	../../../../cpu/wl82/liba/tmallgenie_todo.a \
+ 	../../../../cpu/wl82/liba/cJSON.a \
+ 	../../../../cpu/wl82/liba/ftpserver_new.a \
+ 	../../../../cpu/wl82/liba/http_server.a  \
+@@ -795,18 +650,13 @@ LFLAGS := \
+ 	../../../../cpu/wl82/liba/res.a \
+ 	../../../../cpu/wl82/liba/font.a \
+ 	../../../../cpu/wl82/liba/ui_draw.a \
+-	../../../../cpu/wl82/liba/libVolcEngineRTCLite.a \
+ 	../../../../cpu/wl82/liba/libcurl.a \
+ 	../../../../cpu/wl82/liba/libwebsockets.a \
+ 	../../../../cpu/wl82/liba/cJSON.a  \
+ 	../../../../cpu/wl82/liba/libmbedtls_3_4_0.a  \
+-	../../../../cpu/wl82/liba/sxy_qyai.a \
+-	../../../../cpu/wl82/liba/libe2e.a \
+ 	../../../../cpu/wl82/liba/websocket.a  \
+-	../../../../cpu/wl82/liba/libifly_aiui_lib.a \
+ 	../../../../cpu/wl82/liba/websocket.a   \
+ 	../../../../cpu/wl82/liba/cJSON.a   \
+-	../../../../cpu/wl82/liba/lib_twetalk.a \
+ 	-T../../../../cpu/wl82/sdk.ld \
+ 	-M=../../../../cpu/wl82/tools/sdk.map \
+ 	--end-group  \
+diff --git a/apps/wifi_story_machine/board/wl82/board_7916A.c b/apps/wifi_story_machine/board/wl82/board_7916A.c
+index 2b69d8d3..196777e8 100644
+--- a/apps/wifi_story_machine/board/wl82/board_7916A.c
++++ b/apps/wifi_story_machine/board/wl82/board_7916A.c
+@@ -24,7 +24,7 @@
+ // *INDENT-OFF*
+ 
+ UART0_PLATFORM_DATA_BEGIN(uart0_data)
+-    .baudrate = 1000000,
++    .baudrate = 115200,
+     /* .port = PORTA_5_6, */
+     .port = PORTA_3_4,
+     /* .tx_pin = IO_PORTA_05, */
+@@ -49,7 +49,7 @@ UART1_PLATFORM_DATA_BEGIN(uart1_data)
+ UART1_PLATFORM_DATA_END();
+ 
+ UART2_PLATFORM_DATA_BEGIN(uart2_data)
+-    .baudrate = 1000000,
++    .baudrate = 115200,
+     .port = PORT_REMAP,
+ #if CONFIG_AUDIO_ENC_SAMPLE_SOURCE == AUDIO_ENC_SAMPLE_SOURCE_PLNK0
+     .output_channel = OUTPUT_CHANNEL3,
+diff --git a/apps/wifi_story_machine/include/app_config.h b/apps/wifi_story_machine/include/app_config.h
+index f3cd60cb..40557de8 100644
+--- a/apps/wifi_story_machine/include/app_config.h
++++ b/apps/wifi_story_machine/include/app_config.h
+@@ -115,10 +115,10 @@
+ 
+ #if defined CONFIG_VOICE_PROMPT_FILE_SAVE_IN_RESERVED_EXPAND_ZONE
+ #if defined CONFIG_UI_FILE_SAVE_IN_RESERVED_EXPAND_ZONE
+-#define CONFIG_AUDIO_PACKRES_LEN 0x180000
++#define CONFIG_AUDIO_PACKRES_LEN 0x80000
+ #define CONFIG_AUDIO_PACKRES_ADR ((__FLASH_SIZE__) - (CONFIG_UI_PACKRES_LEN) - 0x1000 - CONFIG_AUDIO_PACKRES_LEN)
+ #else
+-#define CONFIG_AUDIO_PACKRES_LEN 0x180000
++#define CONFIG_AUDIO_PACKRES_LEN 0x80000
+ #define CONFIG_AUDIO_PACKRES_ADR ((__FLASH_SIZE__) - CONFIG_AUDIO_PACKRES_LEN - 0x1000)
+ #endif
+ #else
+@@ -226,6 +226,71 @@
+ // #define CONFIG_HTTP_SERVER_ENABLE            //HTTP服务器
+ // #define CONFIG_FTP_SERVER_ENABLE             //FTP服务器
+ // #define CONFIG_VOLC_LLM_ENABLE               //火山大模型
++#define CONFIG_TUYA_AGENTIC_ENABLE            //涂鸦 AgenticKit(连涂鸦 AI 云,apps/common/LLM/tuya_agentic)
++/* ===== 涂鸦下行 TTS 编码开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下生效)=====
++ * 不定义(默认)= PCM:稳定能播,但 16k/16bit/mono=32KB/s,拥挤测试网易卡顿。
++ * 定义下面宏 = opus:~2KB/s(1/16 带宽),云端确认支持(codec=111),帧长 80B/16kbps/40ms。
++ *   opus 解码目前还在调(啸叫,疑 TCP 分帧重组 / 解码器兼容问题),先留开关切回 PCM。
++ *   调 opus 时把下一行注释去掉即可。*/
++/* 2026-08-27 颤音排查:opus 下行(48k 解码→软件 SRC 降 16k)播 TTS 有颤音,PCM 16k 直通干净(开机提示音验证)。
++ * 暂切 PCM 做对照:PCM 也不颤→元凶在 opus 解码/SRC;PCM 也颤→元凶在网络播放链路。
++ * 要恢复 opus 下行,取消下一行注释即可。*/
++/* 2026-08-28 回退:本地 libopus 软解方案在 silk_Decode 内触发确定性 axi_wr_inv 崩溃(根因未解),
++ * 已放弃,恢复原杰理闭源 opus 解码路径(48k 出→软件 SRC 降 16k,颤音随之回来)。
++ * 带宽仍是 opus 的 ~2KB/s。若颤音不可接受,注释下一行切纯 PCM 下行(实测不颤)。*/
++#define TUYA_DOWNLINK_OPUS_ENABLE
++
++/* ===== 涂鸦上行 ASR 编码开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下生效)=====
++ * 不定义(默认)= PCM:mic 管线直出 1280B/40ms 上行(32KB/s),拥挤网络易卡。
++ * 定义 = opus:本地 libopus 1.4【定点】软编码(移植在 tuya_agentic/libopus/,
++ *   封装 tuya_opus_enc.c),16k/mono/VOIP/CBR 16kbps/40ms → 每包 ~80B(~2KB/s,1/16 带宽)。
++ *   mic 管线保持 PCM 不动(VAD/AEC/能量门/barge-in 全不受影响),只在上行发送处
++ *   逐帧编码;编码器初始化失败自动回退 PCM,不废会话。
++ *   ⚠️ 工具链风险(记录在案):clang 4.0.1+LTO 曾对本地 libopus 浮点解码产生
++ *   axi_wr_inv 崩溃(2026-08-28 回退),故本编码器走定点;若上电/说话再现崩溃,
++ *   注释掉本宏即回 PCM 上行。参数对齐 agentic-kit audio_chat_demo(云端验证过)。*/
++#define TUYA_UPLINK_OPUS_ENABLE
++
++/* ===== 涂鸦 barge-in(用户打断 TTS)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
++ * 不定义(默认)= 不支持打断:TTS 期间不上行,简单稳定。
++ * 定义 = 支持:本地 VAD 在 TTS 期间检测到说话 → tai_chat_break 停 TTS → 发新一轮上行。
++ *   ⚠️ 强依赖 AEC:TTS 期间也上行,靠 AEC 去掉喇叭回声;AEC 不行则 VAD 被回声误触发→TTS 动辄自断。
++ *   ⚠️ 实验性,有竞态(老轮 END 可能让新轮提前结束)。误触发多就关掉先调 AEC。*/
++#define TUYA_BARGE_IN_ENABLE
++
++/* ===== 涂鸦云端 VAD(停说判定)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
++ * 涂鸦语音对话的"开口"永远由本地 VAD(get_recoder_state)负责(云端无法做开口检测)。
++ * 这里控制的是"停说"判定:
++ * 定义(默认)= 云端 VAD:本地VAD开口后持续上行,云端ASR+VAD分析,云端检测到停说
++ *   下发 TAI_EVT_SERVER_VAD 事件 → 设备结束上行。云端模型更强,停说更准。
++ *   带"本地超时兜底":云端事件丢失时,本地VAD持续判静音超2秒则强制收尾。
++ * 不定义 = 本地 VAD:本地VAD直接判停说(get_recoder_state 由1变0即收尾)。
++ *   简单但易误判(话没说好就触发→ASR收空文本)。*/
++#define TUYA_SERVER_VAD_ENABLE
++
++/* ===== 涂鸦音乐技能(音乐播放)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
++ * 定义(默认)= 支持"播放XXX的歌":云端音乐 SKILL 回试听 mp3 URL(参考
++ *   agentic-kit music_play_demo),设备解析后交给杰理网络音乐解码链播放
++ *   (net_download→mp3 解码,https 自动 TLS)。实现:
++ *   apps/common/LLM/tuya_agentic/tuya_music.c(解析)+ app_music.c(导出
++ *   app_music_tuya_play_url)+ tuya_agentic_demo.c ⑤ 交接块。
++ *   ⚠️ 试听版仅 ~30s 片段;完整歌曲需在涂鸦平台购买音乐高级能力授权。
++ *   ⚠️ 播放期间不上行(音乐回采不进 ASR);说话可打断——VAD+能量门 3 帧双
++ *      确认停乐回听音,若"音乐自己把自己打断"就调 BARGE_MIN_ENERGY(demo ⑤)。
++ * 不定义 = 音乐 SKILL 回复仅当普通文本打印,不起播。*/
++#define TUYA_MUSIC_ENABLE
++
++/* ===== 涂鸦云 OTA(固件升级)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
++ * TUYA_FIRMWARE_VERSION:固件版本号(编译期写死)。⚠️手动方案:每次发版前改成与
++ *   涂鸦平台上传固件时填的版本号一致,再编译+出 OTA 包+传平台。
++ *   (曾尝试跨 OTA 自动持久化版本号——VM 方案重启后读回 CRC 损坏,实测不可靠,
++ *    已回退手动;tuya_get_effective_sw_ver() 直接返回本宏,见 tuya_ota.c。)
++ * TUYA_OTA_ENABLE:1=开机连 AI 前检查一次涂鸦云 OTA;0=关闭(不检查)。
++ *   检查到新固件会:播报提示音 -> HTTPS 下载 -> 烧写 flash -> 自动重启。
++ *   实现见 apps/common/LLM/tuya_agentic/tuya_ota.c。*/
++#define TUYA_FIRMWARE_VERSION   "1.0.11"
++#define TUYA_OTA_ENABLE         1
++
+ // #define CONFIG_ONESDK_LLM_ENABLE
+ // #define CONFIG_SXY_QYAI_ENABLE
+ // #define CONFIG_DUER_LC_DEMO_ENABLE           //小度澜川AI对话DEMO
+@@ -341,7 +406,7 @@
+ 
+ #ifdef CONFIG_AEC_ENC_ENABLE
+ #define CONFIG_USB_AUDIO_AEC_ENABLE          //usb mic使能回声消除功能
+-// #define CONFIG_AEC_LINEIN_CHANNEL_ENABLE     //AEC回采使用硬件通道数据
++// #define CONFIG_AEC_LINEIN_CHANNEL_ENABLE   //AEC硬件回采(通道3采DAC)。实测未生效——自说自话照旧,通道3大概率没接DAC环采(喂垃圾参考)。已回退走软件参考(output_way=0)。要重试需先确认板子7916AB的ch3环采通路
+ // #define CONFIG_AEC_USE_PLAY_MUSIC_ENABLE       //播歌时需要使用AEC
+ 
+ // #define CONFIG_AEC_USE_SMS_TDE   //使用tde算法, 编码参数req.enc.aec_enable设置为2
+@@ -413,7 +478,7 @@
+ #endif
+ #endif
+ 
+-#define CONFIG_DOUBLE_BANK_ENABLE           0//1: 双备份方式升级 0:单备份方式升级
++#define CONFIG_DOUBLE_BANK_ENABLE           1//1: 双备份方式升级 0:单备份方式升级
+ 
+ #define CONFIG_UPGRADE_FILE_NAME            "update.ufw"
+ #define CONFIG_UPGRADE_PATH                 CONFIG_ROOT_PATH\
+diff --git a/apps/wifi_story_machine/wifi_app_task.c b/apps/wifi_story_machine/wifi_app_task.c
+index dc4f1e38..cdfb9d69 100644
+--- a/apps/wifi_story_machine/wifi_app_task.c
++++ b/apps/wifi_story_machine/wifi_app_task.c
+@@ -658,6 +658,9 @@ static int wifi_event_callback(void *network_ctx, enum WIFI_EVENT event)
+         thread_fork("realtime_demo", 4, 5 * 1024, 0, 0, realtime_demo, NULL);
+ #endif
+ 
++/* 涂鸦 AgenticKit 流程改为由 tuya_agentic_main 在 boot 时(late_initcall)自启动,
++ * 它自己管理 BLE 配网 → WiFi → 激活 → 连 AI 的完整流程,不再挂在 DHCP 钩子上。*/
++
+ #ifdef CONFIG_TWETALK_ENABLE
+         // 联网成功后 初始化twetlak
+         extern int start_tc_iot_twetalk(void);

@@ -33,6 +33,9 @@ int  app_music_tuya_play_url(const char *url, void (*on_dec_end)(int));
 void app_music_tuya_music_stop(void);
 int  app_music_tuya_music_busy(void);   /* 网络音乐仍占用(下载/解码中):等待循环感知失败退出 */
 #endif
+#ifdef TUYA_UPLINK_OPUS_ENABLE
+#include "tuya_opus_enc.h"        /* 上行 opus 软编码(libopus 1.4 定点,实现 tuya_opus_enc.c) */
+#endif
 
 /* 阶段3 用的音频流接口(实现见 apps/common/LLM/audio/audio_input.c)。
  * 这里【故意不】#include "audio_input.h":它会经 audio_server.h → utils/fs/fs.h 引入
@@ -694,6 +697,22 @@ static int barge_in_energy_confirmed(void)
 }
 #endif
 
+#ifdef TUYA_UPLINK_OPUS_ENABLE
+/* 上行编码发送:PCM 整帧(1280B = 640 采样 = 40ms)→ opus 包(CBR 16kbps 下 ~80B)→ TAI。
+ * mic 管线/VAD/能量门全工作在 PCM 上,这里是"发出去前"的唯一编码点(含 barge-in
+ * onset 补发路径)。编码失败只丢本帧(定点路径实际无失败分支),不废链路。
+ * 返回 TAI_OK / 发送错误码,与 tai_send_audio_chunk 一致。*/
+static int tuya_uplink_send_frame(tai_ctx_t *ctx, unsigned char *pcm1280)
+{
+    unsigned char opkt[TUYA_OPUS_PKT_MAX];
+    int n = tuya_opus_enc_frame((const short *)pcm1280, opkt, sizeof(opkt));
+    if (n <= 0) {
+        return TAI_OK;   /* 丢帧保链路:见上,实际不可达 */
+    }
+    return tai_send_audio_chunk(ctx, opkt, (size_t)n);
+}
+#endif
+
 /* 单次 AI 会话:get_session_token → tai_connect → 语音循环(直到 on_disconnect
  * 置 g_exit 或发送失败置 g_link_broken)。返回会话存活时长 ms——supervisor
  * (tuya_ai_run)据此复位重连退避。任何失败都【不碰 iot】:激活凭证/MQTT 由
@@ -771,7 +790,8 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
     /* ===== 阶段3:免唤醒语音对话(本地 VAD 驱动)=====
      * 会话状态标志由 supervisor 在每次尝试前复位;音频流(mic 采集 + DAC 播放)
      * 也由 supervisor 只起一次、跨会话存活(重连期间采集照跑,cbuf 环形覆盖无害)。
-     * 循环:本地VAD检测开口 → 上行PCM → 停说收尾 → 云端回复(on_audio 播TTS)→ 重新待命。
+     * 循环:本地VAD检测开口 → 上行(PCM 1280B/40ms,opus 时逐帧编码成 ~80B 包)
+     * → 停说收尾 → 云端回复(on_audio 播TTS)→ 重新待命。
      * 回声抑制:TTS 期间 g_tts_playing=1 暂停上行,播完冷却 ~300ms 再听。 */
     g_audio_ready        = 1;
     g_tts_playing        = 0;
@@ -781,7 +801,17 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
     g_music_playing      = 0;
     tuya_music_reset();                /* 清上一会话残留的半截文本流/未消费的音乐结果 */
 #endif
-    printf("[TUYA] voice loop ready (local-VAD, uplink=PCM 16k/mono)"
+#ifdef TUYA_UPLINK_OPUS_ENABLE
+    /* 上行 opus 编码器:幂等 init(编码器常驻堆,跨会话/重连复用);失败自动回退
+     * PCM 上行(仍能对话,只是带宽大),不废会话。 */
+    int use_opus_uplink = (tuya_opus_enc_init() == 0);
+    if (!use_opus_uplink) {
+        printf("[TUYA] opus enc init fail -> uplink fallback PCM\r\n");
+    }
+#else
+    const int use_opus_uplink = 0;
+#endif
+    printf("[TUYA] voice loop ready (local-VAD, uplink=%s 16k/mono)"
 #ifdef TUYA_DOWNLINK_OPUS_ENABLE
             " downlink=opus"
 #else
@@ -790,7 +820,8 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
 #ifdef TUYA_MUSIC_ENABLE
             " +music"
 #endif
-            "\r\n");
+            "\r\n",
+           use_opus_uplink ? "opus" : "pcm");
 
     /* MQTT 心跳线程由 supervisor(tuya_ai_run)启动,生命周期跨会话。
      * 不能在语音循环里调 iot_client_process——它内部 TLS recv 会阻塞语音线程。*/
@@ -909,7 +940,13 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
         silence_frames = 0;       /* 清掉上轮残留的静音兜底计数 */
 #endif
         printf("[TUYA] speak-start: uplink begin (cbuf_level=%u B)\r\n", _device_get_voice_level());
-        if (tai_send_audio_start(ctx, TAI_AUDIO_PCM, 1, 16, 16000) != TAI_OK) {
+        if (tai_send_audio_start(ctx,
+#ifdef TUYA_UPLINK_OPUS_ENABLE
+                                 use_opus_uplink ? TAI_AUDIO_OPUS : TAI_AUDIO_PCM,   /* opus=111:云端 ASR 走 opus 解码 */
+#else
+                                 TAI_AUDIO_PCM,
+#endif
+                                 1, 16, 16000) != TAI_OK) {
 #ifdef TUYA_BARGE_IN_ENABLE
             g_barge_prefill = 0;   /* 本轮没起上行,别让 prefill 漏到下一轮 */
 #endif
@@ -929,14 +966,21 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
         if (g_barge_prefill) {
             unsigned int k;
             for (k = 0; k < g_barge_prefill; k++) {
-                tai_send_audio_chunk(ctx, &g_barge_prebuf[k * 1280], 1280);
+#ifdef TUYA_UPLINK_OPUS_ENABLE
+                if (use_opus_uplink) {
+                    tuya_uplink_send_frame(ctx, &g_barge_prebuf[k * 1280]);   /* onset 帧同样走编码 */
+                } else
+#endif
+                {
+                    tai_send_audio_chunk(ctx, &g_barge_prebuf[k * 1280], 1280);
+                }
             }
             printf("[TUYA] barge-in: prepended %u confirm frames\r\n", g_barge_prefill);
             g_barge_prefill = 0;
         }
 #endif
 
-        /* ②③ 内循环:每帧(≈60ms)上行 180B;VAD 判停说或云端已开始回话则收尾 */
+        /* ②③ 内循环:每帧(40ms)上行(PCM 1280B;opus 时编码后 ~80B);VAD 判停说或云端已开始回话则收尾 */
         while (!g_exit) {
             if (g_tts_playing && barge_cooldown_expired()) {  /* 云端开始回话;冷却内忽略老轮在途 TTS,别截断 barge-in 新轮上行 */
                 break;
@@ -947,14 +991,19 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                 opus_frame_stat(abuf, TUYA_OPUS_FRAME_LEN, &fsum, &fact);
 
 #ifdef TUYA_UPLINK_LATENCY_DEBUG
-                /* 测 send 耗时 + 前后 cbuf 水位 + TTS 上下文。
-                 * 正常: send 5-15ms,cbuf 水位接近 0(每帧 mdelay40 消费节拍)。
+                /* 测 发送(+opus编码) 耗时 + 前后 cbuf 水位 + TTS 上下文。
+                 * 正常: 编码 ~1ms + send 5-15ms,cbuf 水位接近 0(每帧 mdelay40 消费节拍)。
                  * 异常: send 几十~几百ms,cbuf 水位涨(锁竞争/网络抖动/被抢占)。
                  * 只在超阈值时打印,避免刷屏;阈值见文件顶 UPLINK_LAT_WARN_MS。*/
                 unsigned int _lvl_pre = _device_get_voice_level();
                 unsigned int _t0 = timer_get_ms();
                 int _tts_flag = g_tts_playing;   /* 快照:send 时 TTS 是否在播(锁竞争假说关键信号)*/
+#ifdef TUYA_UPLINK_OPUS_ENABLE
+                int _snd_rt = use_opus_uplink ? tuya_uplink_send_frame(ctx, abuf)
+                                              : tai_send_audio_chunk(ctx, abuf, TUYA_OPUS_FRAME_LEN);
+#else
                 int _snd_rt = tai_send_audio_chunk(ctx, abuf, TUYA_OPUS_FRAME_LEN);
+#endif
                 unsigned int _dt = timer_get_ms() - _t0;
                 unsigned int _lvl_post = _device_get_voice_level();
                 if (_snd_rt != TAI_OK) {
@@ -969,11 +1018,25 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                            _tts_flag ? "[TTS!]" : "");
                 }
 #else
+#ifdef TUYA_UPLINK_OPUS_ENABLE
+                if (use_opus_uplink) {
+                    if (tuya_uplink_send_frame(ctx, abuf) != TAI_OK) {
+                        printf("[TUYA] tai_send_audio_chunk fail\r\n");
+                        g_link_broken = 1;   /* 发送失败=链路断,快速报废本会话(supervisor 重连) */
+                        break;
+                    }
+                } else if (tai_send_audio_chunk(ctx, abuf, TUYA_OPUS_FRAME_LEN) != TAI_OK) {
+                    printf("[TUYA] tai_send_audio_chunk fail\r\n");
+                    g_link_broken = 1;
+                    break;
+                }
+#else
                 if (tai_send_audio_chunk(ctx, abuf, TUYA_OPUS_FRAME_LEN) != TAI_OK) {
                     printf("[TUYA] tai_send_audio_chunk fail\r\n");
                     g_link_broken = 1;   /* 发送失败=链路断,快速报废本会话(supervisor 重连) */
                     break;
                 }
+#endif
 #endif
 
                 uplink_frames++;
