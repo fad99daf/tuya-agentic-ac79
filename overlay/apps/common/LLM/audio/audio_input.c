@@ -162,7 +162,14 @@ int _device_get_voice_data(void *data, unsigned int max_len)
 #elif defined CONFIG_TWETALK_ENABLE
     mdelay(60);
 #elif defined CONFIG_TUYA_AGENTIC_ENABLE
-    mdelay(40);                /* PCM 40ms/帧(1280B),按帧节拍取数 */
+    /* 不能每次无条件等 40ms：STM 发送本身实测约 10ms，叠加后消费周期变成
+     * 50ms，慢于录音 40ms/帧，cbuf 会持续涨满并丢话。仅在不足一帧时短轮询
+     * 等待；有积压就立即读取，让发送侧追平生产侧。*/
+    for (unsigned int wait = 0;
+         cbuf_get_data_size(cbuf) < voice_buf_size && wait < 40;
+         wait += 5) {
+        mdelay(5);
+    }
 #else
     mdelay(30);
 #endif
@@ -206,9 +213,21 @@ unsigned int _device_get_play_level(void)
     return cbuf_get_data_size(&g_audio_hdl.pcm_cbuff_r);   /* 下行 TTS 播放 cbuf 水位:排空≈DAC 播完 */
 }
 
+#if defined(CONFIG_TUYA_AGENTIC_ENABLE)
+/* TTS 播放中断供(underrun)诊断:解码器 fread 空仓等满 500ms 即计一次。
+ * 区分"网络断流卡顿"(此计数增长)与"解码/重采样颤音"(此计数=0 但声音仍颤)。
+ * 轮次间空闲(解码器常驻等数,无播放)不计:最近 3s 内有写入才算播放中。*/
+extern unsigned int timer_get_ms(void);
+static volatile unsigned int s_tts_last_write_ms;
+static unsigned int s_tts_underrun_cnt;
+#endif
+
 int _device_write_voice_data(void *data, unsigned int len)
 {
     cbuffer_t *cbuf = (cbuffer_t *)&g_audio_hdl.pcm_cbuff_r;
+#if defined(CONFIG_TUYA_AGENTIC_ENABLE)
+    s_tts_last_write_ms = timer_get_ms();   /* 供 fread 侧判定"播放中"(3s 内有下行写入) */
+#endif
     if (len > 0) {
 #if defined(CONFIG_TUYA_AGENTIC_ENABLE) && defined(TUYA_DOWNLINK_OPUS_ENABLE)
         /* Opus 下行:云端帧长可变(400B/640B 实测),整包直写 cbuf,不做帧重组。
@@ -267,16 +286,34 @@ void tts_prebuffer_arm(void)
 //编码器输出PCM数据
 static int recorder_vfs_fwrite(void *file, void *data, unsigned int len)
 {
-    static int cnt;
-    int ret;
     cbuffer_t *cbuf = (cbuffer_t *)file;
 
+#if defined(CONFIG_TUYA_AGENTIC_ENABLE)
+    /* 录音 cbuf 满时保留最新话音。旧逻辑 write=0 就 clear 全缓冲，TTS 期间 cbuf
+     * 容易积满，用户抢答的整段 onset 会被瞬间清掉，只剩能量确认读到的 120ms，
+     * 云端往往无法识别。空间不足时只丢最旧的一帧，再完整写入当前新帧。*/
+    if (cbuf->total_len - cbuf_get_data_size(cbuf) < len) {
+        static unsigned char stale[AUDIO_RECORD_VOICE_UPLORD_LEN];
+        unsigned int drop = len;
+        unsigned int used = cbuf_get_data_size(cbuf);
+        if (drop > used) {
+            drop = used;
+        }
+        if (drop <= sizeof(stale)) {
+            cbuf_read(cbuf, stale, drop);
+        } else {
+            cbuf_clear(cbuf);   /* 配置异常保护；涂鸦固定 1280B/帧不会走到这里 */
+        }
+    }
+    cbuf_write(cbuf, data, len);
+#else
     if (0 == cbuf_write(cbuf, data, len)) {
         // 上层buf写不进去时清空一下，避免出现声音滞后的情况
         cbuf_clear(cbuf);
     } else {
         // audio_debug("cbuf write %d data", len);
     }
+#endif
 
     return len;
 }
@@ -476,8 +513,18 @@ static int audio_play_net_vfs_fread(void *file, void *data, unsigned int len)
         }
 
         g_audio_ctrl.pcm_wait_sem = 1;
-        os_sem_pend(&g_audio_ctrl.r_sem, _AUDIO_WAIT_TIMEOUT);
+        int pend_ret = os_sem_pend(&g_audio_ctrl.r_sem, _AUDIO_WAIT_TIMEOUT);
         g_audio_ctrl.pcm_wait_sem = 0;
+#if defined(CONFIG_TUYA_AGENTIC_ENABLE)
+        /* 空仓等满 500ms(超时而非被写入唤醒)=真断供。仅播放中(3s 内有写入)计数,
+         * 轮次间解码器常驻等数不算。计数涨=网络/生产断流;恒 0 仍颤音=解码/重采样/模拟链路问题。*/
+        if (pend_ret != 0 && (int)(timer_get_ms() - s_tts_last_write_ms) < 3000) {
+            if (++s_tts_underrun_cnt % 5 == 1) {
+                printf("[TTS] underrun #%u (lvl=%u)\r\n",
+                       s_tts_underrun_cnt, cbuf_get_data_size(cbuf));
+            }
+        }
+#endif
 
     } while (1);
 

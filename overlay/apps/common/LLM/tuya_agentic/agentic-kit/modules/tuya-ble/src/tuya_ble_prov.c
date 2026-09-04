@@ -1,3 +1,23 @@
+/* 配网诊断:点亮 HAL 日志宏(默认是空操作,编译后什么都看不到)。
+ * 目的:抓 App 经 BLE 下发的完整 WiFi 配置 JSON(看有没有 timezone 等额外字段)、
+ * 以及 App 发的其它命令(Unhandled CMD/subcmd 若出现,说明有我们没处理的数据)。
+ * BLE 只在配网期间运行,日志量可控;诊断完可注释掉这 4 个 define 恢复安静。*/
+#include <stdio.h>
+static void ble_prov_hexdump(const uint8_t *buf, size_t len)
+{
+    size_t i;
+    printf("[BLE-HEX]");
+    for (i = 0; i < len; i++) {
+        printf(" %02X", buf[i]);
+        if ((i & 0x0F) == 0x0F) printf("\r\n[BLE-HEX]");
+    }
+    printf("\r\n");
+}
+#define TUYA_BLE_HAL_LOGI(fmt, ...)   printf("[BLE-PROV] " fmt "\r\n", ##__VA_ARGS__)
+#define TUYA_BLE_HAL_LOGW(fmt, ...)   printf("[BLE-PROV][W] " fmt "\r\n", ##__VA_ARGS__)
+#define TUYA_BLE_HAL_LOGE(fmt, ...)   printf("[BLE-PROV][E] " fmt "\r\n", ##__VA_ARGS__)
+#define TUYA_BLE_HAL_HEXDUMP(buf, len) ble_prov_hexdump(buf, len)
+
 #include "tuya_ble_prov.h"
 
 #include "cJSON.h"

@@ -112,8 +112,16 @@ static int ac_tcp_send(void *handle, const uint8_t *buf, size_t len, uint32_t ti
         tv.tv_usec = (timeout_ms % 1000) * 1000;
         setsockopt(h->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
+    /* 海外数据中心慢链路诊断:测 send() 系统调用本身耗时(不含上层 TLS/锁开销)。
+     * 正常 <5ms;若普遍 >50ms 说明是 TCP/网络层慢(拥塞/RTT 大/VPN),非 SDK 问题。*/
+    unsigned int _t0 = sys_timer_get_ms();
     int n;
     do { n = send(h->fd, buf, len, flags); } while (n < 0 && errno == EINTR);
+    unsigned int _dt = sys_timer_get_ms() - _t0;
+    if (_dt >= 50) {
+        printf("[NET-SND] tcp send=%ums len=%u to=%u n=%d errno=%d\r\n",
+               _dt, (unsigned)len, timeout_ms, n, errno);
+    }
     if (n > 0) return n;
     if (n == 0) return 0;
     if (errno == EAGAIN || errno == EWOULDBLOCK) return PAL_ERR_AGAIN;

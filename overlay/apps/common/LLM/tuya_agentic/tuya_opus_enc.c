@@ -7,6 +7,7 @@
  *   再现崩溃,注释 app_config.h 的 TUYA_UPLINK_OPUS_ENABLE 即回 PCM 上行。*/
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdint.h>
 #include "app_config.h"            /* 拿 TUYA_UPLINK_OPUS_ENABLE:开关关闭时本文件整体空编译 */
 
 #ifdef TUYA_UPLINK_OPUS_ENABLE
@@ -55,6 +56,14 @@ int tuya_opus_enc_init(void)
 int tuya_opus_enc_frame(const short *pcm, unsigned char *out, int out_max)
 {
     if (!s_enc || !pcm || !out || out_max < TUYA_OPUS_PKT_MAX) {
+        return -1;
+    }
+    /* pi32v2 上 16bit 访问奇地址 = 硬件 misalign_err 崩溃(2026-08-31 实测,根因与修复见
+     * tuya_agentic_demo.c abuf 的 aligned(4) 注释)。调用方缓冲若漏了对齐,这里丢帧+日志,
+     * 绝不把奇指针送进 libopus——丢 40ms 一帧,好过硬重启。*/
+    if ((unsigned long)(uintptr_t)pcm & 1ul) {
+        printf("[OPUS-ENC] misaligned pcm=0x%08x, frame dropped\r\n",
+               (unsigned)(uintptr_t)pcm);
         return -1;
     }
     /* OPUS_RESET_STATE 每帧调用会让编码器失去跨帧预测,音质劣化——不重置,

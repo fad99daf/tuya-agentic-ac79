@@ -290,7 +290,7 @@ void iot_dp_rebuild(iot_client_t *client)
     dp_entries_free(pal, old_entries, old_count);
     /* Use the local copy, not ctx->loose, which is shared state read here without
      * the lock. */
-    log_info("dp: registry rebuilt (%zu DPs, %s)", new_count, loose ? "loose" : "schema");
+    log_info("dp: registry rebuilt (%u DPs, %s)", new_count, loose ? "loose" : "schema");
 }
 
 /* ============================================================================
@@ -672,7 +672,7 @@ static int dp_publish_report(iot_client_t *client, char *json)
     const pal_t *pal = client->pal;
     size_t jl = strlen(json);
     if (jl + DP_PV23_OVERHEAD > DP_MQTT_MAX_PAYLOAD) {
-        log_error("dp: report payload too large (%zu bytes, max %d) — split via iot_dp_report",
+        log_error("dp: report payload too large (%u bytes, max %d) — split via iot_dp_report",
                   jl, DP_MQTT_MAX_PAYLOAD - DP_PV23_OVERHEAD);
         pal->free(json);
         return OPRT_DP_PAYLOAD_TOO_LARGE;
@@ -1064,7 +1064,7 @@ bool iot_dp_dispatch_downlink(iot_client_t *client, const char *topic, size_t to
                 }
                 pal->free(snap);
             } else if (dp_cb && nchanged > 0) {
-                log_warn("dp: callback snapshot alloc failed; skipped %zu downlink callbacks", nchanged);
+                log_warn("dp: callback snapshot alloc failed; skipped %u downlink callbacks", nchanged);
             }
             if (nchanged > 0) dp_fire_save(client);
         }

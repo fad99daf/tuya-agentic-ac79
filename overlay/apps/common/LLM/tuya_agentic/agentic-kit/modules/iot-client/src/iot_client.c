@@ -511,7 +511,7 @@ IOT_API int iot_client_get_session_token(iot_client_t *client, const char *agent
     }
     size_t resp_token_len = strlen(resp.token);
     if (resp_token_len >= token_len) {
-        log_error("token buffer too small: need %zu, have %zu", resp_token_len + 1, token_len);
+        log_error("token buffer too small: need %u, have %u", resp_token_len + 1, token_len);
         client->pal->free(resp.token);
         return OPRT_INVALID_RESULT;
     }

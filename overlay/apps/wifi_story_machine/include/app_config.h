@@ -249,6 +249,13 @@
  *   ⚠️ 工具链风险(记录在案):clang 4.0.1+LTO 曾对本地 libopus 浮点解码产生
  *   axi_wr_inv 崩溃(2026-08-28 回退),故本编码器走定点;若上电/说话再现崩溃,
  *   注释掉本宏即回 PCM 上行。参数对齐 agentic-kit audio_chat_demo(云端验证过)。*/
+/* 2026-09-03 定论:PCM=101 全链路验证通过(ASR/NLG/TTS/音乐/多轮)。
+ * 2026-09-04 定位 Opus 静默根因:对照 D:\code\agentic-kit 最新官方源码,
+ * TCP 协议 OPUS=111 且上行必带帧参数(80B/帧→40ms/16000bps,从帧长推导);
+ * STM/UDP 官方 demo(udp_chat_demo,Mac 实测可用)audio_params 全填。
+ * 三轮现象闭环:3=云端不认→静默;111 无帧参数=切帧失败→8/31 乱码;
+ * 101=PCM 自描述→全通。适配层已改 111+bitrate/fd/fs(tuya_stm_ai.c),
+ * 失败注释下一行即回 PCM。*/
 #define TUYA_UPLINK_OPUS_ENABLE
 
 /* ===== 涂鸦 barge-in(用户打断 TTS)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
@@ -267,6 +274,43 @@
  * 不定义 = 本地 VAD:本地VAD直接判停说(get_recoder_state 由1变0即收尾)。
  *   简单但易误判(话没说好就触发→ASR收空文本)。*/
 #define TUYA_SERVER_VAD_ENABLE
+
+/* ===== 涂鸦语音通道传输层开关(TCP / UDP)(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
+ * 0(默认)= TCP:走原 rtc-tcp-client 源码(tai_*,agentic-kit/modules/rtc-tcp-client),
+ *           行为与历史版本完全一致。
+ * 1       = UDP(STM OPEN SDK):换成团队预编译库 libstm_tuya.a(725KB,LLVM IR,
+ *           LTO 兼容),库内部 UDP(DTLS) 与 TCP 竞速、UDP 优先,UDP 不通自动回落 TCP,
+ *           上层无法也无需指定。适配层 apps/common/LLM/tuya_agentic/stm/:
+ *           tuya_stm_ai.c 以 tstm_* 实现 tai_* 同义 API,tuya_ai_select.h 把
+ *           demo 里的 tai_* 调用重定向过去(原 tai_*.c 仍编译但未被引用)。
+ *   ⚠️ 连接参数改为来自云端下发的原始 session token(demo 里已自动绑定),
+ *      tai_config_t 的 host/port/tls_sni 等不再使用;local_key 仍用。
+ *   ⚠️ 依赖云端 token 里带 udpport/udpport_backup 字段(缺了库会报错,见
+ *      stm/README.md 待确认项)。
+ *   ⚠️ 已知行为差异(详见 stm/README.md):云端 VAD 事件(TAI_EVT_SERVER_VAD)
+ *      在 stm 下行无法区分表达 → 云端 VAD 模式实际退化为本地静音兜底;
+ *      上行打断/MCP 回应走库未公开底层接口(有 sid 校验兜底)。*/
+#define TUYA_TRANSPORT_STM_ENABLE     0
+/* 2026-09-04:STM/UDP 联调已通(上行 Opus codec=111+帧参数,中文 ASR/NLG/TTS
+ * 正常;上行带宽降为 PCM 的 1/16)。默认仍回 TCP:行为与历史版本完全一致、
+ * 云端 VAD 事件原生可用。要体验 UDP 改回 1 即可,证据链见 stm/README.md。 */
+
+/* ★排查期临时(UDP 联调完成后改回 3 或删除):libstm 应用侧日志过滤。
+ * 日志有两道闸门:库内部阈值 TUYA_STM_LIB_LOG_LEVEL(tuya_stm_ai.c,现默认
+ * WARN=3)先过滤,这里(TUYA_STM_LOG_PRINT_LEVEL)是应用侧第二道——想看库
+ * DEBUG 两处都要开。⚠️ 库 DEBUG 洪流曾导致音频首包必崩 axi_rd_inv(引擎线程
+ * 回调 printf × demo 任务 printf 无锁撞车,2026-08-31 轮B实测;现库日志已改
+ * 环形缓冲延迟打印由 demo 任务统一刷出,崩溃源已除,但 DEBUG 串口量仍大)。*/
+#define TUYA_STM_LOG_PRINT_LEVEL      1
+/* MCP 回应通道/上行 codec 两项实验 2026-08-31 已定论(证据详见 stm/README.md 第5节):
+ * ① codec:轮换实验证明 3=正确(ASR 正常),111=乱码/空 → 已定死 3
+ *   (tuya_stm_ai.c TUYA_STM_CODEC_ALTERNATE=0),此处无需再配。
+ * ② MCP 回应:必须走 TEXT(TUYA_STM_MCP_VIA_TEXT=1)——2026-09-02 反证实验:
+ *   改私有指令 type=1000 后云端对语音全程零响应(管线不激活,三次独立开机
+ *   同现象);TEXT 虽被云端当用户聊天输入(开机答非所问一句),但管线能激活。
+ *   官方回应通道的类型号待云端 FAE 确认后改 TUYA_STM_MCP_INSTR_TYPE 替换。 */
+#define TUYA_STM_MCP_VIA_TEXT         1
+#define TUYA_STM_MCP_INSTR_TYPE       1000
 
 /* ===== 涂鸦音乐技能(音乐播放)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
  * 定义(默认)= 支持"播放XXX的歌":云端音乐 SKILL 回试听 mp3 URL(参考

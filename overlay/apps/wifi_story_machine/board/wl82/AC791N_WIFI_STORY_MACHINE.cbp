@@ -75,6 +75,8 @@
 <Add directory="../../../../apps/common/LLM/tuya_agentic/tuya_inc" />
 			<Add directory="../../../../apps/common/LLM/tuya_agentic/libopus" />
 <Add directory="../../../../apps/common/LLM/tuya_agentic" />
+<Add directory="../../../../apps/common/LLM/tuya_agentic/stm" />
+<Add directory="../../../../apps/common/LLM/tuya_agentic/stm/include" />
 <Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/pal" />
 <Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/common" />
 <Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/include" />
@@ -223,6 +225,7 @@
 <Add option="../../../../cpu/wl82/liba/lib_dts_dec.a" />
 <Add option="../../../../cpu/wl82/liba/lib_opus_dec.a" />
 			<Add option="../../../../apps/common/LLM/tuya_agentic/libopus/libopus_tuya.a" />
+			<Add option="../../../../apps/common/LLM/tuya_agentic/stm/libstm_tuya.a" />
 <Add option="../../../../cpu/wl82/liba/lib_amr_dec.a" />
 <Add option="../../../../cpu/wl82/liba/lib_amr_enc.a" />
 <Add option="../../../../cpu/wl82/liba/lib_amrwb_enc.a" />
@@ -1225,6 +1228,8 @@
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_pkt_log.c"><Option compilerVar="CC" /></Unit>
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_protocol.c"><Option compilerVar="CC" /></Unit>
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_transport.c"><Option compilerVar="CC" /></Unit>
+<Unit filename="../../../../apps/common/LLM/tuya_agentic/stm/tuya_stm_ai.c"><Option compilerVar="CC" /></Unit>
+<Unit filename="../../../../apps/common/LLM/tuya_agentic/stm/stm_port_ac79_shim.c"><Option compilerVar="CC" /></Unit>
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop.c"><Option compilerVar="CC" /></Unit>
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop_base.c"><Option compilerVar="CC" /></Unit>
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/cipher_wrapper.c"><Option compilerVar="CC" /></Unit>

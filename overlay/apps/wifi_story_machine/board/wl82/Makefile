@@ -225,6 +225,8 @@ INCLUDES := \
 	-I../../../../include_lib/net/web_socket \
 	-I../../../../include_lib/net/network_download \
 	-I../../../../apps/common/LLM/tuya_agentic \
+	-I../../../../apps/common/LLM/tuya_agentic/stm \
+	-I../../../../apps/common/LLM/tuya_agentic/stm/include \
 	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/pal \
 	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/common \
 	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/include \
@@ -451,6 +453,8 @@ c_SRC_FILES := \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_pkt_log.c \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_protocol.c \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_transport.c \
+	../../../../apps/common/LLM/tuya_agentic/stm/tuya_stm_ai.c \
+	../../../../apps/common/LLM/tuya_agentic/stm/stm_port_ac79_shim.c \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop.c \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop_base.c \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/cipher_wrapper.c \
@@ -572,6 +576,7 @@ LFLAGS := \
 	../../../../cpu/wl82/liba/lib_dts_dec.a \
 	../../../../cpu/wl82/liba/lib_opus_dec.a \
 	../../../../apps/common/LLM/tuya_agentic/libopus/libopus_tuya.a \
+	../../../../apps/common/LLM/tuya_agentic/stm/libstm_tuya.a \
 	../../../../cpu/wl82/liba/lib_amr_dec.a \
 	../../../../cpu/wl82/liba/lib_amr_enc.a \
 	../../../../cpu/wl82/liba/lib_amrwb_enc.a \

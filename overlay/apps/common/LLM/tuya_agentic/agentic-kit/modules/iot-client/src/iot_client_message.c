@@ -25,10 +25,25 @@ static void mqtt_message_handler(const char *topic, size_t topic_len,
                            (const uint8_t *)client->local_key,
                            decrypted, &decrypted_len);
     if (ret == 0 && decrypted_len > 0) {
+        /* 打断/控制命令双通道诊断:涂鸦云端打断会同时在 TCP(TAI) 和 MQTT 两条通道
+         * 下发。这里打 MQTT 通道收到的每一条解密后明文,对比 TAI 通道的 chat_break
+         * 是否有 MQTT 侧的伴随下发。
+         * 截断到 200B 防 DP 全量 schema 下发刷屏;只看前缀即可判断命令类型。*/
+        unsigned int dump_len = (unsigned int)decrypted_len;
+        if (dump_len > 200) dump_len = 200;
+        log_info("[MQTT-RX] decrypted %uB: %.*s%s",
+                 (unsigned)decrypted_len,
+                 (int)dump_len, (const char *)decrypted,
+                 decrypted_len > 200 ? "..." : "");
+
         /* Offer the plaintext to the DP layer first; if it does not consume it,
          * forward to the user's raw message callback (backward compatible). */
-        if (!iot_dp_dispatch_downlink(client, topic, topic_len, decrypted, decrypted_len)
-            && client->message_callback) {
+        bool dp_consumed = iot_dp_dispatch_downlink(client, topic, topic_len,
+                                                    decrypted, decrypted_len);
+        log_info("[MQTT-RX] dp_dispatch=%s %s",
+                 dp_consumed ? "consumed" : "pass-through",
+                 client->message_callback ? "-> user_cb" : "(no user_cb)");
+        if (!dp_consumed && client->message_callback) {
             client->message_callback(topic, topic_len, decrypted, decrypted_len);
         }
     } else {

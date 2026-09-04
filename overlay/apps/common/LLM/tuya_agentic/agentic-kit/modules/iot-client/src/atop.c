@@ -249,6 +249,10 @@ int atop_activate_request(const pal_t *pal, const activite_request_t *request, a
         return OPRT_COMMUNICATION_ERROR;
     }
 
+    /* [ACT-RSP] 激活响应逐字段诊断已移除:会打印 localKey/secKey 到串口,存在泄漏风险。
+     * 时区结论已确认——激活响应 result 里含 stdTimeZone("+08:00")与 timeZone 字段,
+     * 需要时用云端/抓包侧确认。*/
+
     memset(response, 0, sizeof(activite_response_t));
 
     response->devid = pal_strdup(pal, cJSON_GetStringValue(cJSON_GetObjectItem(result, "devId")));
@@ -570,7 +574,7 @@ int atop_ai_token_get(const pal_t *pal, const ai_token_request_t *request, ai_to
         return OPRT_MALLOC_FAILED;
     }
 
-    log_debug("token: [%zu chars, prefix=%.4s...]",
+    log_debug("token: [%u chars, prefix=%.4s...]",
               strlen(response->token),
               strlen(response->token) >= 4 ? response->token : "----");
     return OPRT_OK;
@@ -624,7 +628,7 @@ int atop_schema_newest_get(const pal_t *pal, const schema_newest_request_t *requ
         return OPRT_MALLOC_FAILED;
     }
 
-    log_debug("schema newest get post data:%s", post_data);
+    log_info("schema newest get post data:%s", post_data);
 
     atop_base_request_t atop_request = {
         .devid = request->devid,
@@ -698,10 +702,10 @@ int atop_schema_newest_get(const pal_t *pal, const schema_newest_request_t *requ
     atop_base_response_free(pal, &atop_response);
 
     if (response->updated) {
-        log_info("atop_schema_newest_get: newer schema received (%zu bytes)",
+        log_info("atop_schema_newest_get: newer schema received (%u bytes)",
                  strlen(response->schema));
     } else {
-        log_debug("atop_schema_newest_get: no newer schema");
+        log_info("atop_schema_newest_get: no newer schema (version=%s)", request->version);
     }
     return OPRT_OK;
 }

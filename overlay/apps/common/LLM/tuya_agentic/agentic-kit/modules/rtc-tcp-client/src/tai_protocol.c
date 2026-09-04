@@ -619,7 +619,7 @@ static int media_audio(tai_ctx_t *ctx,
                        const uint8_t *payload, size_t payload_len)
 {
     if (payload_len < 8) {
-        TAI_LOGW(ctx->pal, TAG, "audio media header truncated (%zu < 8)", payload_len);
+        TAI_LOGW(ctx->pal, TAG, "audio media header truncated (%u < 8)", payload_len);
         return TAI_PROTO_ERR_MEDIA_HDR;
     }
     uint16_t data_id = 0; uint8_t stream_flag = 0; uint64_t ts_ms = 0;
@@ -649,7 +649,7 @@ static int media_text(tai_ctx_t *ctx,
                       const uint8_t *payload, size_t payload_len)
 {
     if (payload_len < 3) {
-        TAI_LOGW(ctx->pal, TAG, "text media header truncated (%zu < 3)", payload_len);
+        TAI_LOGW(ctx->pal, TAG, "text media header truncated (%u < 3)", payload_len);
         return TAI_PROTO_ERR_MEDIA_HDR;
     }
     uint16_t data_id = tai_r16(payload);
@@ -678,7 +678,7 @@ static int media_image(tai_ctx_t *ctx,
                        const uint8_t *payload, size_t payload_len)
 {
     if (payload_len < 8) {
-        TAI_LOGW(ctx->pal, TAG, "image media header truncated (%zu < 8)", payload_len);
+        TAI_LOGW(ctx->pal, TAG, "image media header truncated (%u < 8)", payload_len);
         return TAI_PROTO_ERR_MEDIA_HDR;
     }
     uint16_t data_id = 0; uint8_t stream_flag = 0; uint64_t ts_ms = 0;

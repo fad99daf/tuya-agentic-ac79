@@ -23,6 +23,7 @@
 #include "pal.h"
 #include "iot_client.h"
 #include "tuya_ai.h"
+#include "tuya_ai_select.h"        /* 传输层选择:TUYA_TRANSPORT_STM_ENABLE=1 时 tai_* 重定向到 stm(UDP优先)后端 */
 #include "tuya_agentic.h"
 #include "tuya_ble_prov.h"        /* tuya_ble_wifi_creds_t(BLE 配网结果类型)*/
 #ifdef TUYA_MUSIC_ENABLE
@@ -59,17 +60,17 @@ void _device_net_audio_play(bool flag);       /* 停/起 TTS 网络播放器(音
  * 打开后在 tai_send_audio_chunk 前后打时间戳,超 UPLINK_LAT_WARN_MS 才打印(避免刷屏)。
  * 同时打印 send 期间的 mic cbuf 水位变化,判断"send 慢→堆积→丢音"是否成立。
  * 以及 send 发生时 TTS 是否在播(锁竞争假说: TTS drain 期间 worker 频繁持 yield_mutex)。
- * 用法: 定位上行延迟/丢音问题时打开(取消下一行注释),默认关闭。*/
-/* #define TUYA_UPLINK_LATENCY_DEBUG */
+ * 用法: 定位完注释掉这行宏即可恢复原样。*/
+#define TUYA_UPLINK_LATENCY_DEBUG
 #ifdef TUYA_UPLINK_LATENCY_DEBUG
   #define UPLINK_LAT_WARN_MS     30      /* send 单帧耗时超过此值才打印(正常 ~5-15ms) */
   #define UPLINK_LAT_CBUF_WARN   2560    /* cbuf 水位超过此值(2 帧=80ms)才告警 */
 #endif
 
 /* === 产品三件套(涂鸦 IoT 平台创建产品时获得,构建期固定)===(前端填这个)*/
-#define TUYA_PRODUCT_KEY    "YOUR_PID_HERE"                 /* PID */
-#define TUYA_UUID           "YOUR_UUID_HERE"                /* 设备 UUID */
-#define TUYA_AUTH_KEY       "YOUR_AUTHKEY_HERE"             /* 授权码 AuthKey */
+#define TUYA_PRODUCT_KEY    "YOUR_PID_HERE"              /* PID */
+#define TUYA_UUID           "YOUR_UUID_HERE"          /* 设备 UUID */
+#define TUYA_AUTH_KEY       "YOUR_AUTHKEY_HERE"  /* 授权码 AuthKey */
 
 /* === 激活 token(配网时涂鸦 App 下发;调试期可从平台/App 取一次填这里)===(前端填这个)*/
 #define TUYA_ACTIVATION_TOKEN "xxxxxxxx"
@@ -87,7 +88,14 @@ void _device_net_audio_play(bool flag);       /* 停/起 TTS 网络播放器(音
 
 #define TUYA_WAIT_MS    60000
 #define TUYA_BARGE_COOLDOWN_MS  1000   /* barge-in 后冷却(ms):此窗口内忽略老轮 chat_break 后在途 TTS 残响引起的二次触发(竞态) */
-#define BARGE_MIN_ENERGY        100000u /* barge-in 能量门:Σ|int16|/帧。真话音远>>此值,回声/噪音<<此值;3帧≥2帧达标才打断 */
+/* 起轮单帧能量门:Σ|int16|/帧。仅用于空闲起轮(无 TTS,底噪低),100k 够用;
+ * 真话音 onset 实测 110万~220万,回声/噪音远低于此。 */
+#define BARGE_MIN_ENERGY        100000u
+/* 播放中 barge-in 3帧确认门(每帧都要≥此值)。2026-09-04 深圳天气轮日志:
+ * AEC 残留骗过 3/3 确认三次(各帧 sum 最高仅 38.4万)→ 天气播报被掐、碎片
+ * 轮错乱;真人插话确认帧全部 ≥115.9万。取 60万:误触发余量 1.6×,真人余量
+ * 1.9×。贴耳小声插话若失灵,降到 50万;TTS 仍被误掐则升到 80万。 */
+#define BARGE_CONFIRM_ENERGY    600000u
 
 extern const pal_t *tai_pal_ac791n(void);
 
@@ -108,6 +116,14 @@ static volatile int g_mqtt_ka_run;        /* MQTT 心跳线程运行标志:生�
 static int g_audio_frame_logged;          /* 下行首帧帧长只打印一次,供核对 opus_cbr_pktlen */
 #ifdef TUYA_SERVER_VAD_ENABLE
 static volatile int g_server_vad_stop;    /* 云端VAD(TAI_EVT_SERVER_VAD)通知停说:上行循环据此收尾。on_event 在 worker 线程置位,主循环读 */
+#endif
+#if TUYA_STM_MCP_VIA_TEXT
+/* STM 暂用 TEXT 承载 MCP response，云端会误把 JSON 当作一轮用户文本并生成
+ * NLG/TTS。下一轮 AUDIO 前由 demo 任务 chat_break 隔离这轮污染。 */
+static volatile unsigned s_mcp_text_reply_pending;
+static volatile unsigned s_mcp_text_break_request;
+static volatile unsigned s_mcp_text_break_sent;
+static volatile unsigned s_mcp_text_reply_deadline;
 #endif
 static volatile unsigned int g_barge_cooldown_until; /* barge-in 冷却到期 ms 时间戳;此前的 g_tts_playing 视为老轮在途残响,忽略(0=始终过期) */
 #ifdef TUYA_MUSIC_ENABLE
@@ -374,6 +390,19 @@ static void on_audio(tai_ctx_t *ctx, const tai_audio_msg_t *msg, void *ud)
     if (!g_audio_ready || !msg || !msg->len) {
         return;
     }
+#if TUYA_STM_MCP_VIA_TEXT
+    if (s_mcp_text_reply_pending) {
+        /* 这次下行属于启动时的 MCP/TEXT 伪聊天轮；标记后丢弃其全部音频。
+         * 实测该轮 TTS 在 chat_break 之后约 1.2s 才陆续到达，固定排空窗口
+         * 关早了会把污染播报漏给喇叭——每收到一帧就顺延 1.5s，静音 1.5s
+         * 后主循环才放行。demo 任务在下一次循环安全调用 chat_break。 */
+        s_mcp_text_break_request = 1;
+        s_mcp_text_reply_deadline = timer_get_ms() + 1500;
+        _device_rbuf_clear();
+        g_tts_playing = 0;
+        return;
+    }
+#endif
     /* 任意下行帧到达即视为 TTS 正在播放;END 显式清(TAI_EVT_END 再兜底清一次) */
     g_tts_playing = (msg->stream_flag == TAI_STREAM_END) ? 0 : 1;
 
@@ -394,6 +423,68 @@ static void on_audio(tai_ctx_t *ctx, const tai_audio_msg_t *msg, void *ud)
     }
     _device_write_voice_data((void *)msg->data, msg->len);
 }
+/* ------------------------------------------------------------------------- */
+/* MCP 回应延迟发送(防死锁,与 stm 库日志环形缓冲同一套路)                      */
+/* ------------------------------------------------------------------------- */
+/* TAI_EVT_MCP_CMD 回调在 stm 引擎线程上下文执行(tstm_on_data_recv 直接派发)。
+ * 若在回调里同步 tai_send_mcp_response → 从引擎线程再进库的发送路径,而 demo
+ * 任务此刻可能正在发音频包:两条路径在库内同一会话锁上互等 → 双双永久卡死
+ * (2026-08-31 第五轮实测:MCP initialize 恰在音频上行中到达,demo 任务从第 3
+ * 帧起再无任何输出,无 exception,VAD 线程日志照常——轮 4 两次 MCP 都在空闲
+ * 期到达所以没踩到)。对策:回调只把回应存进 pending,由 demo 任务在 20ms 级
+ * 循环节拍处 mcp_resp_pump() 真正发送。TCP 模式回调同样不在 demo 任务,一并
+ * 走延迟(云端对 ≤60ms 的回应延迟无感)。 */
+static char s_mcp_resp[224];
+static volatile unsigned s_mcp_resp_len;      /* 0=无待发 */
+static volatile unsigned s_mcp_resp_drops;    /* 新回应覆盖未发走旧回应的次数 */
+
+static void mcp_resp_defer(const char *resp, unsigned len)
+{
+    OS_ENTER_CRITICAL();
+    if (s_mcp_resp_len) {
+        s_mcp_resp_drops++;    /* 上一条还没发走就被覆盖:云端按序等回应,极少发生 */
+    }
+    if (len > sizeof(s_mcp_resp) - 1) {
+        len = sizeof(s_mcp_resp) - 1;
+    }
+    memcpy(s_mcp_resp, resp, len);
+    s_mcp_resp[len] = 0;
+    s_mcp_resp_len = len;
+    OS_EXIT_CRITICAL();
+}
+
+/* demo 任务循环节拍处调用(与 tai_log_flush 同批):把待发 MCP 回应真正发出 */
+static void mcp_resp_pump(tai_ctx_t *ctx)
+{
+    char buf[sizeof(s_mcp_resp)];
+    unsigned len, n, drops;
+    int rc;
+
+    if (!s_mcp_resp_len) {
+        return;
+    }
+    OS_ENTER_CRITICAL();
+    len = s_mcp_resp_len;
+    n = (len < sizeof(buf)) ? len : sizeof(buf) - 1;
+    memcpy(buf, s_mcp_resp, n);
+    drops = s_mcp_resp_drops;
+    s_mcp_resp_drops = 0;
+    s_mcp_resp_len = 0;        /* 先取走:发送失败不重试,云端超时会重发请求 */
+    OS_EXIT_CRITICAL();
+    buf[n] = 0;
+    rc = tai_send_mcp_response(ctx, buf);
+#if TUYA_STM_MCP_VIA_TEXT
+    if (rc == TAI_OK) {
+        s_mcp_text_reply_pending = 1;
+        s_mcp_text_break_request = 0;
+        s_mcp_text_break_sent = 0;
+        s_mcp_text_reply_deadline = timer_get_ms() + 5000;
+    }
+#endif
+    printf("[TUYA-MCP] resp(%u B) rc=%d%s\r\n", len, rc,
+           drops ? " (pending overwritten!)" : "");
+}
+
 static void on_event(tai_ctx_t *ctx, const tai_event_msg_t *msg, void *ud)
 {
     demo_ctx_t *dc = (demo_ctx_t *)ud;
@@ -432,11 +523,47 @@ static void on_event(tai_ctx_t *ctx, const tai_event_msg_t *msg, void *ud)
         printf("[TUYA-MCP] recv len=%u: %.*s\r\n",
                (unsigned)msg->len, (int)(msg->len < 512 ? msg->len : 512),
                msg->data ? (const char *)msg->data : "(null)");
-        /* 最小 MCP 响应:空工具 */
-        const char *empty_result =
-            "{\"jsonrpc\":\"2.0\",\"id\":1,"
-            "\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"\"}]}}";
-        tai_send_mcp_response(ctx, empty_result);
+        /* 回应必须【原样回带请求的 id】(云端按 id 匹配响应;原实现硬编码
+         * id=1,云端 initialize 的 id 是字符串时间戳,回 id=1 会被当无关包丢弃)。
+         * 载荷可能不带 NUL 结尾,先拷进局部缓冲再解析。*/
+        char pbuf[256];
+        unsigned pl = (msg->data && msg->len) ? msg->len : 0;
+        if (pl > sizeof(pbuf) - 1) pl = sizeof(pbuf) - 1;
+        memcpy(pbuf, msg->data ? msg->data : "", pl);
+        pbuf[pl] = 0;
+        char rid[36] = "1";   /* 找不到 id 时兜底用 1 */
+        const char *idk = strstr(pbuf, "\"id\"");
+        if (idk) {
+            const char *p = idk + 4;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == ':') {
+                p++;
+                while (*p == ' ' || *p == '\t') p++;
+                const char *e = p;
+                if (*e == '"') {            /* 字符串 id:含引号整体回带 */
+                    for (e++; *e && *e != '"' && e - p < 30; e++) {}
+                    if (*e == '"') e++;
+                } else {                    /* 数字 id */
+                    while (*e >= '0' && *e <= '9' && e - p < 30) e++;
+                }
+                if (e > p && (size_t)(e - p) < sizeof(rid)) {
+                    memcpy(rid, p, e - p);
+                    rid[e - p] = 0;
+                }
+            }
+        }
+        char resp[192];
+        int rn = snprintf(resp, sizeof(resp),
+                          "{\"jsonrpc\":\"2.0\",\"id\":%s,"
+                          "\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"\"}]}}",
+                          rid);
+        if (rn > 0 && rn < (int)sizeof(resp)) {
+            /* ★不能在这里直接 tai_send_mcp_response:本回调跑在引擎线程,
+             * 同步发包会与 demo 任务的音频上行在库内会话锁上互等卡死
+             * (见上方 mcp 回应延迟发送注释)。只存,demo 任务节拍处发。*/
+            mcp_resp_defer(resp, (unsigned)rn);
+            printf("[TUYA-MCP] resp(id=%s) deferred\r\n", rid);
+        }
     }
 }
 static void on_disconnect(tai_ctx_t *ctx, const tai_disconnect_msg_t *msg, void *ud)
@@ -513,6 +640,7 @@ void tuya_agentic_demo(void *arg)
         free(token); iot_client_deinit(iot); return;
     }
     printf("[TUYA] got session token (len=%d)\r\n", (int)strlen(token));
+    tai_bind_session_token(token); /* stm(UDP)后端用;tcp 后端空操作 */
 
     /* ④ 解析 token */
     tai_conn_params_t cp;
@@ -669,8 +797,9 @@ static void opus_frame_stat(const unsigned char *p, int len,
 #ifdef TUYA_BARGE_IN_ENABLE
 /* 能量确认读走的 onset 帧保留进 g_barge_prebuf,barge-in 新上行时补发——否则确认消耗的
  * ~120ms(常是打断 onset,最响那段)丢失,后续上行只收到尾音/静音→ASR 空(实测"明天去哪玩"
- * 被 barge-in 切了却没播报,即此)。g_barge_prefill=有效帧数,仅确认通过时置。*/
-static unsigned char g_barge_prebuf[1280 * 3];
+ * 被 barge-in 切了却没播报,即此)。g_barge_prefill=有效帧数,仅确认通过时置。
+ * 容量 12 帧(480ms):确认帧占前 3 帧；余量保留给后续可能扩展的 onset 缓存。*/
+static unsigned char g_barge_prebuf[1280 * 12] __attribute__((aligned(4)));   /* 转 short* 进 opus 编码,align 1 全局无偶地址保证,同 abuf */
 static unsigned int g_barge_prefill;
 /* barge-in 能量确认:VAD 触发时连读 3 帧(≈120ms),3 帧 sum 均≥BARGE_MIN_ENERGY 才算真话音。
  * 滤掉 AEC 残留回声/噪音的瞬时 spike——TTS 念密集数字(金价等)时某个响音爆破会在 1~2 帧内冲过
@@ -685,7 +814,7 @@ static int barge_in_energy_confirmed(void)
         if (_device_get_voice_data(&g_barge_prebuf[k * 1280], 1280) != 1280) break;
         opus_frame_stat(&g_barge_prebuf[k * 1280], 1280, &s, &a);
         sums[k] = s;
-        if (s >= BARGE_MIN_ENERGY) hi++;
+        if (s >= BARGE_CONFIRM_ENERGY) hi++;
         n++;
     }
     if (hi >= 3 && n >= 3) {   /* 3-of-3:滤 ≤2 帧 spike;读不够 3 帧也算失败 */
@@ -727,6 +856,7 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
         printf("[TUYA] get_session_token fail (will retry)\r\n"); free(token); return 0;
     }
     tai_conn_params_t cp;
+    tai_bind_session_token(token); /* stm(UDP)后端用;tcp 后端空操作 */
     if (parse_token(token, &cp) != 0) {
         printf("[TUYA] parse_token fail (will retry)\r\n"); free(token); return 0;
     }
@@ -745,16 +875,21 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
      *   开 = 请求 opus(~2KB/s,治拥挤网卡顿;云端确认支持 codec=111,帧 80B/16kbps/40ms,解码仍在调);
      *   关 = PCM(稳定能播,32KB/s)。上行 ASR 始终 PCM(opus format_mode 无标准裸包,不赌正常 ASR)。*/
 #ifdef TUYA_DOWNLINK_OPUS_ENABLE
+    /* 本 demo 没有设备侧自定义 MCP 工具，必须显式 false。NULL 也不行：协议层默认
+     * 会补 true，云端随后下发 initialize；若它恰在 AUDIO 上行中到达，TEXT 承载的
+     * response 会与语音事件重叠并阻塞 STM 任务，表现为只发出前几帧后彻底无响应。 */
     static const char SA[] =
-        "{\"deviceMcp\":{\"supportCustomMCP\":true},"
-        "\"tts.order.supports\":[{\"format\":\"opus\",\"sampleRate\":16000,\"channels\":1}]}";
+        "{\"deviceMcp\":{\"supportCustomMCP\":false},"
+        "\"tts.order.supports\":[{\"format\":\"opus\",\"sampleRate\":16000,"
+        "\"bitDepth\":\"16\",\"channels\":1}]}";
 #else
-    static const char SA[] = "{\"deviceMcp\":{\"supportCustomMCP\":true}}";
+    static const char SA[] = "{\"deviceMcp\":{\"supportCustomMCP\":false}}";
 #endif
 #ifdef TUYA_SERVER_VAD_ENABLE
-    /* chatAttributes(event_user_data):asr.enableVad / tts.alternate / processing.interrupt。
-     * tts.alternate:"true" 让云端"一句文字→这句音频→下一句文字→下一句音频"交替下发,
-     *   而不是"文字全发完→音频慢慢发"。文字和音频天然按句对齐,接屏幕做字幕不需额外计时。*/
+    /* chatAttributes 保持 8-31 最后一次流式 ASR 成功会话的原始字节(字符串布尔,
+     * 无 sys.workflow)。同节点 rtc-ai1-5 对照:该格式云端正常流式返回 ASR;
+     * 换成原生 true+workflow 后(9-2)云端对整个 AUDIO 事件零响应(连空 ASR/
+     * server-VAD 都没有),疑 STM 通道 schema 严格校验拒绝事件,故回退。 */
     static const char EU[] =
         "{\"asr.enableVad\":\"true\","
         "\"tts.alternate\":\"true\","
@@ -764,6 +899,7 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
         "{\"sys.workflow\":\"asr-llm-tts\","
         "\"tts.alternate\":\"true\"}";
 #endif
+    printf("[TUYA] chat attrs: %s\r\n", EU);
     demo_ctx_t dc = {0};
     tai_config_t tc;
     memset(&tc, 0, sizeof(tc));
@@ -849,16 +985,20 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
 #endif
 
 #define TUYA_OPUS_FRAME_LEN 1280   /* PCM 16k/16bit/mono 40ms = 1280B/帧(原 opus 180B 改 PCM) */
-    unsigned char abuf[TUYA_OPUS_FRAME_LEN];
+    /* ★ aligned(4) 不能省:char 数组对齐默认 1,LTO 后 alloca 仍是 align 1,栈布局恰把它放
+     *   到奇地址时,转 short* 进 opus 编码器(biquad 做 16bit load)→ pi32v2 misalign_err
+     *   崩溃(2026-08-31 UDP 构建实测:寄存器 R0=奇地址 + 最终 IR alloca align 1 双证实;
+     *   TCP 旧构建没崩纯属栈布局运气)。所有要转 short* 进 opus 的缓冲都必须 4 对齐。*/
+    unsigned char abuf[TUYA_OPUS_FRAME_LEN] __attribute__((aligned(4)));
     /* 上行诊断:本轮帧计数/有效帧数 + 空闲排空的底噪基线 */
     unsigned int uplink_frames = 0, uplink_active = 0;
     unsigned int start_fails = 0;      /* audio_start 连续失败计数:≥5(≈1s)判链路死 */
     unsigned int idle_cnt = 0, idle_sum = 0, idle_act_sum = 0;
 #ifdef TUYA_SERVER_VAD_ENABLE
-    /* 云端VAD模式的本地超时兜底:本地VAD连续判静音的帧数计数。
-     * 超过 LOCAL_SILENCE_TIMEOUT_FRAMES 帧强制收尾,防云端SERVER_VAD丢失导致一直上行。
-     * 每帧~40ms,50帧≈2秒持续静音。保留2s给云端VAD足够时间响应(上班后确认云端VAD开通)。*/
-    #define LOCAL_SILENCE_TIMEOUT_FRAMES  50
+    /* STM 当前不能稳定区分 server-VAD 指令。历史成功轮的 ASR 是流式返回，
+     * 无需等待云端 stop；本地 VAD 已做 600ms debounce，直接 fin 可避免事件
+     * 长时间不闭合及用户再次说话把2秒静音计数清零。 */
+    #define LOCAL_SILENCE_TIMEOUT_FRAMES  1
     unsigned int silence_frames = 0;
 #endif
 
@@ -868,10 +1008,37 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
          *   保证 VAD 触发时缓冲里没有积压旧音频——上行直接发"此刻"的实时语音。
          *   ⚠️ 绝不能在 VAD 触发时再 clear():那会把刚触发到的那句语音一并清掉,
          *      之前正是这样导致云端 ASR 收到静音、回空文本。*/
+        int mcp_text_poll = 0;
+#if TUYA_STM_MCP_VIA_TEXT
+        /* MCP response 经 TEXT 发出后，必须先等伪回复并 chat_break，再允许 AUDIO。
+         * 否则用户恰好开口会让两个事件重叠，复现“只回空内容、语音无 ASR”。 */
+        if (s_mcp_text_reply_pending) {
+            if ((s_mcp_text_break_request ||
+                 (int)(timer_get_ms() - s_mcp_text_reply_deadline) >= 0) &&
+                !s_mcp_text_break_sent) {
+                int break_rc = tai_chat_break(ctx);
+                _device_rbuf_clear();
+                g_tts_playing = 0;
+                g_turn_done = 1;
+                s_mcp_text_break_request = 0;
+                s_mcp_text_break_sent = 1;
+                s_mcp_text_reply_deadline = timer_get_ms() + 1200;
+                printf("[TUYA-MCP] TEXT pollution break rc=%d\r\n", break_rc);
+            }
+            if (s_mcp_text_break_sent &&
+                (int)(timer_get_ms() - s_mcp_text_reply_deadline) >= 0) {
+                s_mcp_text_reply_pending = 0;
+                s_mcp_text_break_sent = 0;
+                printf("[TUYA-MCP] TEXT pollution drained, voice enabled\r\n");
+            } else {
+                mcp_text_poll = 1;
+            }
+        }
+#endif
 #ifdef TUYA_BARGE_IN_ENABLE
         /* barge-in:TTS 期间也听(不再被 g_tts_playing 门控),靠 AEC 去回声保证 VAD 不被喇叭误触发。
          * AEC 不行时这里会让回声触发 VAD→TTS 动辄自断,误触发多就关 TUYA_BARGE_IN_ENABLE 先调 AEC。*/
-        int start_turn = get_recoder_state();
+        int start_turn = mcp_text_poll ? 0 : get_recoder_state();
         /* 普通轮 turn-start 能量门:无唤醒词+单麦开麦,任何持续声响都触发 VAD→设备自言自语。
          * VAD 触发后再核 1 帧能量(近场话音够响),达标才起轮并把这帧作 onset 补发;否则当噪音丢弃。
          * barge-in 轮(g_barge_in)已在 ④/drain 做过能量确认,这里跳过直接起轮。*/
@@ -911,26 +1078,23 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                     idle_cnt = 0; idle_sum = 0; idle_act_sum = 0;
                 }
             }
+            tai_log_flush();   /* idle 排空节拍:顺带刷出 stm 库延迟日志(唯一 printf 出口在本任务) */
+            mcp_resp_pump(ctx);   /* MCP initialize 多在空闲期到:这里就是回应的实际发送点 */
             continue;
         }
 #ifdef TUYA_BARGE_IN_ENABLE
-        /* barge-in 起新上行前:排掉 TTS 期间积压的 stale mic 数据,只留最近 3 帧(刚触发的话音)。
-         * 不排则 cbuf 压着 9~12 帧旧残音,新上行先发静音/回声残响→ASR 收垃圾/空文本。
-         * _device_get_voice_data 内部 mdelay(40)/帧,故封顶 6 帧(≤240ms)防被持续说话拖住。
-         * g_barge_in 在此处排完才清(让 barge-in 标记从 ④/drain 贯穿到新上行起点);普通轮
-         * gate 的 idle-drain 已持续保持缓冲新鲜,不会进这里。*/
+        /* barge-in 起新上行前不再排 mic cbuf。录音写侧在满时丢最旧帧、保留最新
+         * 话音；这里若再按水位排空会把抢答正文当 stale 吞掉。确认帧由 prebuf 先发，
+         * cbuf 中的后续帧紧接着由实时上行消费。g_barge_in 在这里清除。*/
         if (g_barge_in) {
             unsigned int olvl = _device_get_voice_level();
-            unsigned int keep = TUYA_OPUS_FRAME_LEN * 3;   /* 保留最近 3 帧(≈120ms 话音) */
-            unsigned char _stale[TUYA_OPUS_FRAME_LEN];
-            unsigned int drained = 0;
-            while (_device_get_voice_level() > keep && drained < 6) {
-                if (_device_get_voice_data(_stale, sizeof(_stale)) != TUYA_OPUS_FRAME_LEN) break;
-                drained++;
+            /* cbuf 已由录音写侧维护成“最新窗口”，这里不再人为丢帧。旧实现按水位
+             * 再排最多 6 帧，即使把帧放进 prebuf 也会额外等待约 240ms，并把抢答
+             * 话音延迟到 audio_start 之后才发送。直接保留现有帧给实时上行即可。*/
+            if (olvl > TUYA_OPUS_FRAME_LEN * 3) {
+                printf("[TUYA] barge-in: keep mic backlog %u B for uplink\r\n", olvl);
             }
-            if (drained) printf("[TUYA] barge-in: drained %u stale frames (lvl %u→%u)\r\n",
-                                drained, olvl, _device_get_voice_level());
-            g_barge_in = 0;   /* 排完才清 */
+            g_barge_in = 0;
         }
 #endif
         g_turn_done = 0;
@@ -975,16 +1139,26 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                     tai_send_audio_chunk(ctx, &g_barge_prebuf[k * 1280], 1280);
                 }
             }
-            printf("[TUYA] barge-in: prepended %u confirm frames\r\n", g_barge_prefill);
+            if (g_barge_prefill == 1) {
+                printf("[TUYA] turn-start: prepended 1 onset frame\r\n");
+            } else {
+                printf("[TUYA] barge-in: prepended %u confirm frames\r\n", g_barge_prefill);
+            }
             g_barge_prefill = 0;
         }
 #endif
 
-        /* ②③ 内循环:每帧(40ms)上行(PCM 1280B;opus 时编码后 ~80B);VAD 判停说或云端已开始回话则收尾 */
+        /* 回复开始后不要立即截断上行：本轮若尚无实时帧，g_tts_playing 很可能仍是
+         * 上一轮/启动 MCP 污染回复的尾部状态。至少发出 3 帧实时音频后才允许按新 TTS
+         * 收尾，避免出现“audio start + prepended 1 frame，但实时上行 0 帧”的空轮。*/
         while (!g_exit) {
-            if (g_tts_playing && barge_cooldown_expired()) {  /* 云端开始回话;冷却内忽略老轮在途 TTS,别截断 barge-in 新轮上行 */
+            if (g_tts_playing && uplink_frames >= 3 && barge_cooldown_expired()) {
                 break;
             }
+            tai_log_flush();   /* 每帧节拍刷库日志:首包发送时段正是引擎线程日志高发窗口 */
+            /* 不在 AUDIO 事件期间发送 MCP/TEXT。STM 的 TEXT 与 AUDIO 共用会话事件通道，
+             * initialize 若在上行中抵达，此处发 TEXT 会与音频事件重叠并卡住发送线程。
+             * response 留在 s_mcp_resp，audio_end 后的等待循环再安全发送。 */
             int n = _device_get_voice_data(abuf, TUYA_OPUS_FRAME_LEN);
             if (n == TUYA_OPUS_FRAME_LEN) {
                 unsigned int fsum, fact;
@@ -1052,11 +1226,12 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                        uplink_frames, uplink_active);
                 break;
             }
-            /* 本地超时兜底:云端VAD事件丢失/延迟时,本地VAD连续判静音超过阈值则强制收尾。
-             * 本地VAD还在说话(=1)就重置计数;持续静音(=0)累积,到50帧(≈2s)兜底。*/
+            /* STM 下行无法可靠区分 SERVER_VAD；本地 VAD 已经过去抖，判停后立即
+             * 结束事件。仍优先接受可识别的 chat_break/server-vad 标志。 */
             if (!get_recoder_state()) {
-                if (++silence_frames > LOCAL_SILENCE_TIMEOUT_FRAMES) {
-                    printf("[TUYA] speak-stop: local timeout fallback (frames=%u)\r\n", uplink_frames);
+                if (++silence_frames >= LOCAL_SILENCE_TIMEOUT_FRAMES) {
+                    printf("[TUYA] speak-stop: local-vad (frames=%u active=%u)\r\n",
+                           uplink_frames, uplink_active);
                     break;
                 }
             } else {
@@ -1071,11 +1246,33 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
             }
 #endif
         }
-        tai_send_audio_end(ctx);
+        {
+            int end_rc = tai_send_audio_end(ctx);
+            printf("[TUYA] audio-end rc=%d frames=%u active=%u\r\n",
+                   end_rc, uplink_frames, uplink_active);
+            if (end_rc != TAI_OK) {
+                g_link_broken = 1;
+            }
+        }
 
-        /* ④ 等本轮回复结束(云端 TTS 播完,TAI_EVT_END 置 g_turn_done)再回 ① */
+        /* ④ 等本轮回复结束(云端 TTS 播完,TAI_EVT_END 置 g_turn_done)再回 ①。
+         * barge-in 抢答轮进入这里时用户通常还没说完；不能因旧轮 chat_break 已把
+         * g_turn_done 置位而直接跳过等待，否则后续话音无人消费。*/
+#ifdef TUYA_BARGE_IN_ENABLE
+        if (g_barge_in) {
+            g_turn_done = 0;
+        }
+#endif
         int w = 0;
         while (!g_exit && !g_link_broken && !g_turn_done && w < TUYA_WAIT_MS) {
+            /* 云端沉默兜底:TTS 一直没来(g_tts_playing 未置位且下行 cbuf 无数据)
+             * 就只等 10s 回听音——STM 首轮实测云端无响应,原 60s 干等让设备像死机,
+             * 后续说话全被忽略(2026-08-31)。TTS 只要来过(g_tts_playing 置位过,
+             * 播放期间会持续为 1),60s 上限内继续等播完。*/
+            if (!g_tts_playing && _device_get_play_level() == 0 && w >= 10000) {
+                printf("[TUYA] no TTS in 10s (cloud silent?), back to listening\r\n");
+                break;
+            }
 #ifdef TUYA_BARGE_IN_ENABLE
             /* barge-in:TTS 播放期间本地 VAD 检测到说话 → 打断。靠 AEC 保证 VAD 不是被回声触发。*/
             if (g_tts_playing && get_recoder_state() && barge_cooldown_expired()) {
@@ -1092,6 +1289,8 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                 }
             }
 #endif
+            tai_log_flush();   /* 等待期刷库日志:云端回话/出错(WARN+)集中在本阶段 */
+            mcp_resp_pump(ctx);
             msleep(20); w += 20;   /* ④ 轮询 50→20ms,压低 barge-in 检测延迟 */
         }
         /* 回复期间(TTS 播放/等云端)录音 cbuf 积压了环境音/TTS 回采,这里清掉——
@@ -1111,6 +1310,8 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
              *   不论 TTS 是否在播,只要本地确认是话音就打断当前轮、发新一轮。*/
             unsigned int wait_start = 0;
             while (!g_exit && _device_get_play_level() == 0 && wait_start < 3000) {
+                tai_log_flush();
+                mcp_resp_pump(ctx);
                 msleep(20); wait_start += 20;
 #ifdef TUYA_BARGE_IN_ENABLE
                 /* TTS 未到达阶段也检测 barge-in:用户改口不等 TTS,确认话音即打断当前轮。*/
@@ -1129,6 +1330,8 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
             }
             unsigned int wait_ms = 0;
             while (!g_exit && _device_get_play_level() > 640 && wait_ms < 35000) {  /* 等 32s 缓冲排空(≈喇叭真播完);35s 是兜底,正常排完就提前退 */
+                tai_log_flush();
+                mcp_resp_pump(ctx);
                 msleep(20); wait_ms += 20;
 #ifdef TUYA_BARGE_IN_ENABLE
                 /* barge-in 也要在 play-drain-wait 里检测!云端 EVT_END 后 ④ 已退出,但喇叭还在放
@@ -1233,6 +1436,8 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                     if (_device_get_voice_data(_mt, sizeof(_mt)) != sizeof(_mt)) {
                         continue;               /* 读不够一帧:等下一拍再来 */
                     }
+                    tai_log_flush();            /* 音乐长循环(可达10min)也保持库日志节拍 */
+                    mcp_resp_pump(ctx);
 #ifdef TUYA_BARGE_IN_ENABLE
                     mframes++;
                     unsigned int mes, mea;
@@ -1241,7 +1446,7 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                         printf("[MUSIC-DBG] playing, mic post-AEC: sum=%u act=%u%% rec=%d\r\n",
                                mes, mea, get_recoder_state());
                     }
-                    if (mframes > 25 && get_recoder_state() && mes >= BARGE_MIN_ENERGY) {
+                    if (mframes > 25 && get_recoder_state() && mes >= BARGE_CONFIRM_ENERGY) {
                         msums[mhi++] = mes;
                         if (mhi >= 3) {         /* 3 帧连续达标:确认真话音,停乐 */
                             printf("[TUYA-MUSIC] barge-in: stop music (sums=%u,%u,%u)\r\n",

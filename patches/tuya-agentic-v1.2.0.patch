@@ -1,5 +1,5 @@
 diff --git a/apps/common/LLM/audio/audio_input.c b/apps/common/LLM/audio/audio_input.c
-index f963e0e0..976dea8e 100644
+index f963e0e0..182c01a2 100644
 --- a/apps/common/LLM/audio/audio_input.c
 +++ b/apps/common/LLM/audio/audio_input.c
 @@ -22,7 +22,7 @@
@@ -20,16 +20,23 @@ index f963e0e0..976dea8e 100644
  #else
  #define AUDIO_RECORD_VOICE_UPLORD_LEN (1280)
  #endif
-@@ -159,6 +161,8 @@ int _device_get_voice_data(void *data, unsigned int max_len)
+@@ -159,6 +161,15 @@ int _device_get_voice_data(void *data, unsigned int max_len)
      mdelay(1);
  #elif defined CONFIG_TWETALK_ENABLE
      mdelay(60);
 +#elif defined CONFIG_TUYA_AGENTIC_ENABLE
-+    mdelay(40);                /* PCM 40ms/帧(1280B),按帧节拍取数 */
++    /* 不能每次无条件等 40ms：STM 发送本身实测约 10ms，叠加后消费周期变成
++     * 50ms，慢于录音 40ms/帧，cbuf 会持续涨满并丢话。仅在不足一帧时短轮询
++     * 等待；有积压就立即读取，让发送侧追平生产侧。*/
++    for (unsigned int wait = 0;
++         cbuf_get_data_size(cbuf) < voice_buf_size && wait < 40;
++         wait += 5) {
++        mdelay(5);
++    }
  #else
      mdelay(30);
  #endif
-@@ -192,20 +196,47 @@ void _device_wbuf_clear()
+@@ -192,20 +203,59 @@ void _device_wbuf_clear()
      cbuf_clear(&g_audio_hdl.pcm_cbuff_w);
  }
  
@@ -43,9 +50,21 @@ index f963e0e0..976dea8e 100644
 +    return cbuf_get_data_size(&g_audio_hdl.pcm_cbuff_r);   /* 下行 TTS 播放 cbuf 水位:排空≈DAC 播完 */
 +}
 +
++#if defined(CONFIG_TUYA_AGENTIC_ENABLE)
++/* TTS 播放中断供(underrun)诊断:解码器 fread 空仓等满 500ms 即计一次。
++ * 区分"网络断流卡顿"(此计数增长)与"解码/重采样颤音"(此计数=0 但声音仍颤)。
++ * 轮次间空闲(解码器常驻等数,无播放)不计:最近 3s 内有写入才算播放中。*/
++extern unsigned int timer_get_ms(void);
++static volatile unsigned int s_tts_last_write_ms;
++static unsigned int s_tts_underrun_cnt;
++#endif
++
  int _device_write_voice_data(void *data, unsigned int len)
  {
      cbuffer_t *cbuf = (cbuffer_t *)&g_audio_hdl.pcm_cbuff_r;
++#if defined(CONFIG_TUYA_AGENTIC_ENABLE)
++    s_tts_last_write_ms = timer_get_ms();   /* 供 fread 侧判定"播放中"(3s 内有下行写入) */
++#endif
      if (len > 0) {
 +#if defined(CONFIG_TUYA_AGENTIC_ENABLE) && defined(TUYA_DOWNLINK_OPUS_ENABLE)
 +        /* Opus 下行:云端帧长可变(400B/640B 实测),整包直写 cbuf,不做帧重组。
@@ -85,7 +104,7 @@ index f963e0e0..976dea8e 100644
      }
  
      os_sem_set(&g_audio_ctrl.r_sem, 0);
-@@ -214,6 +245,25 @@ int _device_write_voice_data(void *data, unsigned int len)
+@@ -214,19 +264,56 @@ int _device_write_voice_data(void *data, unsigned int len)
      return len;
  }
  
@@ -111,7 +130,40 @@ index f963e0e0..976dea8e 100644
  //编码器输出PCM数据
  static int recorder_vfs_fwrite(void *file, void *data, unsigned int len)
  {
-@@ -284,6 +334,14 @@ static void audio_recoder_init()
+-    static int cnt;
+-    int ret;
+     cbuffer_t *cbuf = (cbuffer_t *)file;
+ 
++#if defined(CONFIG_TUYA_AGENTIC_ENABLE)
++    /* 录音 cbuf 满时保留最新话音。旧逻辑 write=0 就 clear 全缓冲，TTS 期间 cbuf
++     * 容易积满，用户抢答的整段 onset 会被瞬间清掉，只剩能量确认读到的 120ms，
++     * 云端往往无法识别。空间不足时只丢最旧的一帧，再完整写入当前新帧。*/
++    if (cbuf->total_len - cbuf_get_data_size(cbuf) < len) {
++        static unsigned char stale[AUDIO_RECORD_VOICE_UPLORD_LEN];
++        unsigned int drop = len;
++        unsigned int used = cbuf_get_data_size(cbuf);
++        if (drop > used) {
++            drop = used;
++        }
++        if (drop <= sizeof(stale)) {
++            cbuf_read(cbuf, stale, drop);
++        } else {
++            cbuf_clear(cbuf);   /* 配置异常保护；涂鸦固定 1280B/帧不会走到这里 */
++        }
++    }
++    cbuf_write(cbuf, data, len);
++#else
+     if (0 == cbuf_write(cbuf, data, len)) {
+         // 上层buf写不进去时清空一下，避免出现声音滞后的情况
+         cbuf_clear(cbuf);
+     } else {
+         // audio_debug("cbuf write %d data", len);
+     }
++#endif
+ 
+     return len;
+ }
+@@ -284,6 +371,14 @@ static void audio_recoder_init()
      req.enc.bitrate     = 24000;
      req.enc.format_mode = 0;
      req.enc.frame_ms    = 60;
@@ -126,7 +178,7 @@ index f963e0e0..976dea8e 100644
  #endif
      req.enc.sample_source = "mic";
      req.enc.vfs_ops = &recorder_vfs_ops;
-@@ -299,6 +357,19 @@ static void audio_recoder_init()
+@@ -299,6 +394,19 @@ static void audio_recoder_init()
          req.enc.vad_start_threshold = 300;    //ms
          req.enc.vad_stop_threshold  = 0;    //ms
      }
@@ -146,7 +198,7 @@ index f963e0e0..976dea8e 100644
  
  #ifdef CONFIG_AEC_ENC_ENABLE
      struct aec_s_attr aec_param = {0};
-@@ -365,6 +436,28 @@ static int audio_play_net_vfs_fread(void *file, void *data, unsigned int len)
+@@ -365,6 +473,28 @@ static int audio_play_net_vfs_fread(void *file, void *data, unsigned int len)
      unsigned int c_rlen = 0;
      cbuf = (cbuffer_t *)file;
  
@@ -175,7 +227,27 @@ index f963e0e0..976dea8e 100644
      do {
          cbuf_len = cbuf_get_data_size(cbuf);
          rlen = cbuf_len > len ? len : cbuf_len;
-@@ -426,12 +519,6 @@ static void audio_player_net_init()
+@@ -383,8 +513,18 @@ static int audio_play_net_vfs_fread(void *file, void *data, unsigned int len)
+         }
+ 
+         g_audio_ctrl.pcm_wait_sem = 1;
+-        os_sem_pend(&g_audio_ctrl.r_sem, _AUDIO_WAIT_TIMEOUT);
++        int pend_ret = os_sem_pend(&g_audio_ctrl.r_sem, _AUDIO_WAIT_TIMEOUT);
+         g_audio_ctrl.pcm_wait_sem = 0;
++#if defined(CONFIG_TUYA_AGENTIC_ENABLE)
++        /* 空仓等满 500ms(超时而非被写入唤醒)=真断供。仅播放中(3s 内有写入)计数,
++         * 轮次间解码器常驻等数不算。计数涨=网络/生产断流;恒 0 仍颤音=解码/重采样/模拟链路问题。*/
++        if (pend_ret != 0 && (int)(timer_get_ms() - s_tts_last_write_ms) < 3000) {
++            if (++s_tts_underrun_cnt % 5 == 1) {
++                printf("[TTS] underrun #%u (lvl=%u)\r\n",
++                       s_tts_underrun_cnt, cbuf_get_data_size(cbuf));
++            }
++        }
++#endif
+ 
+     } while (1);
+ 
+@@ -426,12 +566,6 @@ static void audio_player_net_init()
      req.dec.channel         = CHANNEL;  /*dac 差分输出 单路*/
      req.dec.sample_rate     = SAMPLE_RATE;
      req.dec.vfs_ops         = &audio_play_net_vfs_ops;
@@ -188,7 +260,7 @@ index f963e0e0..976dea8e 100644
  #ifdef AUDIO_TYPE_G711A
      req.dec.dec_type 		= "pcm";
  #elif defined(AUDIO_TYPE_AACLC)
-@@ -446,6 +533,27 @@ static void audio_player_net_init()
+@@ -446,6 +580,27 @@ static void audio_player_net_init()
      req.dec.sample_rate     = 0;
      req.dec.attr |= AUDIO_ATTR_OPUS_CBR_PKTLEN_TYPE;
      req.dec.opus_cbr_pktlen = 180;
@@ -216,7 +288,7 @@ index f963e0e0..976dea8e 100644
  #endif
      req.dec.sample_source   = "dac";
      req.dec.file            = (FILE *)&g_audio_hdl.pcm_cbuff_r;
-@@ -650,6 +758,13 @@ static int _audio_soft_init(void)
+@@ -650,6 +805,13 @@ static int _audio_soft_init(void)
  #elif defined CONFIG_TWETALK_ENABLE
      pcm_buff_r = malloc(SAMPLE_RATE * CHANNEL * 1);
      cbuf_init(&g_audio_hdl.pcm_cbuff_r, pcm_buff_r, SAMPLE_RATE * CHANNEL * 1);
@@ -438,16 +510,18 @@ index acba599d..b27106a5 100644
      if (__this->call_flag && (key->value != KEY_UP && key->value != KEY_DOWN && key->value != KEY_VOLUME_DEC && key->value != KEY_VOLUME_INC && key->value != KEY_OK && key->value != KEY_ENC)) {
          return true;	//通话模式下只有音量键和暂停键能起作用
 diff --git a/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp b/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp
-index 53b90818..b4c7f2fa 100644
+index 53b90818..ecb388d2 100644
 --- a/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp
 +++ b/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp
-@@ -72,6 +72,20 @@
+@@ -72,6 +72,22 @@
  <Add option="-D_XOPEN_SOURCE=700" />
  <Add option="-D_GNU_SOURCE" />
  <Add option="-D__ELF__" />
 +<Add directory="../../../../apps/common/LLM/tuya_agentic/tuya_inc" />
 +			<Add directory="../../../../apps/common/LLM/tuya_agentic/libopus" />
 +<Add directory="../../../../apps/common/LLM/tuya_agentic" />
++<Add directory="../../../../apps/common/LLM/tuya_agentic/stm" />
++<Add directory="../../../../apps/common/LLM/tuya_agentic/stm/include" />
 +<Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/pal" />
 +<Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/common" />
 +<Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/include" />
@@ -462,7 +536,7 @@ index 53b90818..b4c7f2fa 100644
  <Add directory="../../../../include_lib/c++" />
  <Add directory="../../../../include_lib/c++/include" />
  <Add directory="../../../../include_lib/newlib/include" />
-@@ -132,7 +146,6 @@
+@@ -132,7 +148,6 @@
  <Add directory="../../../../include_lib/utils/btmesh" />
  <Add directory="../../../../include_lib/utils/btmesh/adaptation" />
  <Add directory="../../../../apps/common/LLM/audio" />
@@ -470,7 +544,7 @@ index 53b90818..b4c7f2fa 100644
  <Add directory="../../../../apps/common/LLM/volc" />
  <Add directory="../../../../apps/common/LLM/extra" />
  <Add directory="../../../../include_lib/net/cJSON_common" />
-@@ -142,24 +155,16 @@
+@@ -142,24 +157,16 @@
  <Add directory="../../../../include_lib/system/os" />
  <Add directory="../../../../include_lib/net/libwebsockets/include" />
  <Add directory="../../../../include_lib/net/libwebsockets/include/libwebsockets" />
@@ -502,15 +576,16 @@ index 53b90818..b4c7f2fa 100644
  </Compiler>
  <Linker>
  <Add option="--plugin-opt=-pi32v2-always-use-itblock=false" />
-@@ -217,6 +222,7 @@
+@@ -217,6 +224,8 @@
  <Add option="../../../../cpu/wl82/liba/lib_wav_dec.a" />
  <Add option="../../../../cpu/wl82/liba/lib_dts_dec.a" />
  <Add option="../../../../cpu/wl82/liba/lib_opus_dec.a" />
 +			<Add option="../../../../apps/common/LLM/tuya_agentic/libopus/libopus_tuya.a" />
++			<Add option="../../../../apps/common/LLM/tuya_agentic/stm/libstm_tuya.a" />
  <Add option="../../../../cpu/wl82/liba/lib_amr_dec.a" />
  <Add option="../../../../cpu/wl82/liba/lib_amr_enc.a" />
  <Add option="../../../../cpu/wl82/liba/lib_amrwb_enc.a" />
-@@ -267,25 +273,18 @@
+@@ -267,25 +276,18 @@
  <Add option="../../../../cpu/wl82/liba/https_cli.a" />
  <Add option="../../../../cpu/wl82/liba/http_server.a" />
  <Add option="../../../../cpu/wl82/liba/json.a" />
@@ -536,7 +611,7 @@ index 53b90818..b4c7f2fa 100644
  <Add option="../../../../cpu/wl82/liba/cJSON.a" />
  <Add option="../../../../cpu/wl82/liba/ftpserver_new.a" />
  <Add option="../../../../cpu/wl82/liba/http_server.a " />
-@@ -302,18 +301,13 @@
+@@ -302,18 +304,13 @@
  <Add option="../../../../cpu/wl82/liba/res.a" />
  <Add option="../../../../cpu/wl82/liba/font.a" />
  <Add option="../../../../cpu/wl82/liba/ui_draw.a" />
@@ -555,7 +630,7 @@ index 53b90818..b4c7f2fa 100644
  <Add option="-T../../../../cpu/wl82/sdk.ld" />
  <Add option="-M=../../../../cpu/wl82/tools/sdk.map" />
  <Add option="--end-group " />
-@@ -332,351 +326,10 @@
+@@ -332,351 +329,10 @@
  </ExtraCommands>
  </Target>
  </Build>
@@ -907,7 +982,7 @@ index 53b90818..b4c7f2fa 100644
  <Unit filename="../../../../apps/common/asr/aisp/aisp.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/common/asr/jlkws/jlkws.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/common/asr/jlkws/jlsp_far_keyword.h" />
-@@ -701,18 +354,11 @@
+@@ -701,18 +357,11 @@
  <Unit filename="../../../../apps/common/ble/include/le_hogp.h" />
  <Unit filename="../../../../apps/common/ble/include/le_net_central.h" />
  <Unit filename="../../../../apps/common/ble/include/le_net_cfg.h" />
@@ -926,7 +1001,7 @@ index 53b90818..b4c7f2fa 100644
  <Unit filename="../../../../apps/common/ble/le_trans_data.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/common/ble/mesh/examples/AliGenie_fan.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/common/ble/mesh/examples/AliGenie_light.c"><Option compilerVer="CC"/></Unit>
-@@ -938,8 +584,6 @@
+@@ -938,8 +587,6 @@
  <Unit filename="../../../../apps/common/usb/usb_std_class_def.h" />
  <Unit filename="../../../../apps/wifi_story_machine/app_main.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/wifi_story_machine/app_music.c"><Option compilerVer="CC"/></Unit>
@@ -935,7 +1010,7 @@ index 53b90818..b4c7f2fa 100644
  <Unit filename="../../../../apps/wifi_story_machine/board/wl82/board_7911B.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/wifi_story_machine/board/wl82/board_7911B0_cfg.h" />
  <Unit filename="../../../../apps/wifi_story_machine/board/wl82/board_7911B8_cfg.h" />
-@@ -1456,7 +1100,6 @@
+@@ -1456,7 +1103,6 @@
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/FreeRTOS.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/FreeRTOSConfig.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/deprecated_definitions.h" />
@@ -943,7 +1018,7 @@ index 53b90818..b4c7f2fa 100644
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/list.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/mpu_wrappers.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/pi32v2/portmacro.h" />
-@@ -1465,7 +1108,6 @@
+@@ -1465,7 +1111,6 @@
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/queue.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/semphr.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/task.h" />
@@ -951,7 +1026,7 @@ index 53b90818..b4c7f2fa 100644
  <Unit filename="../../../../include_lib/system/os/os_api.h" />
  <Unit filename="../../../../include_lib/system/os/os_cpu.h" />
  <Unit filename="../../../../include_lib/system/os/os_error.h" />
-@@ -1571,5 +1213,40 @@
+@@ -1571,5 +1216,42 @@
  <Unit filename="../../../../lib/net/version.z.S" />
  <Unit filename="../../../../lib/server/version.z.S" />
  <Unit filename="../../../../lib/utils/version.z.S" />
@@ -967,6 +1042,8 @@ index 53b90818..b4c7f2fa 100644
 +<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_pkt_log.c"><Option compilerVar="CC" /></Unit>
 +<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_protocol.c"><Option compilerVar="CC" /></Unit>
 +<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_transport.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/stm/tuya_stm_ai.c"><Option compilerVar="CC" /></Unit>
++<Unit filename="../../../../apps/common/LLM/tuya_agentic/stm/stm_port_ac79_shim.c"><Option compilerVar="CC" /></Unit>
 +<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop.c"><Option compilerVar="CC" /></Unit>
 +<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop_base.c"><Option compilerVar="CC" /></Unit>
 +<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/cipher_wrapper.c"><Option compilerVar="CC" /></Unit>
@@ -993,7 +1070,7 @@ index 53b90818..b4c7f2fa 100644
  </Project>
  </CodeBlocks_project_file>
 diff --git a/apps/wifi_story_machine/board/wl82/Makefile b/apps/wifi_story_machine/board/wl82/Makefile
-index 2012bf8a..4b6affee 100644
+index 2012bf8a..f69347a2 100644
 --- a/apps/wifi_story_machine/board/wl82/Makefile
 +++ b/apps/wifi_story_machine/board/wl82/Makefile
 @@ -148,9 +148,12 @@ DEFINES := \
@@ -1018,7 +1095,7 @@ index 2012bf8a..4b6affee 100644
  	-I../../../../apps/common/LLM/extra \
  	-I../../../../include_lib/net/cJSON_common \
  	-I../../../../include_lib/net/curl/include \
-@@ -221,199 +222,30 @@ INCLUDES := \
+@@ -221,199 +222,32 @@ INCLUDES := \
  	-I../../../../include_lib/system/os \
  	-I../../../../include_lib/net/libwebsockets/include \
  	-I../../../../include_lib/net/libwebsockets/include/libwebsockets \
@@ -1041,6 +1118,8 @@ index 2012bf8a..4b6affee 100644
 -	-I../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/inc \
 -	-I../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws \
 +	-I../../../../apps/common/LLM/tuya_agentic \
++	-I../../../../apps/common/LLM/tuya_agentic/stm \
++	-I../../../../apps/common/LLM/tuya_agentic/stm/include \
 +	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/pal \
 +	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/common \
 +	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/include \
@@ -1234,7 +1313,7 @@ index 2012bf8a..4b6affee 100644
  	../../../../apps/common/asr/aisp/aisp.c \
  	../../../../apps/common/asr/jlkws/jlkws.c \
  	../../../../apps/common/asr/roobo/roobo.c \
-@@ -432,10 +264,6 @@ c_SRC_FILES := \
+@@ -432,10 +266,6 @@ c_SRC_FILES := \
  	../../../../apps/common/ble/le_hogp.c \
  	../../../../apps/common/ble/le_net_central.c \
  	../../../../apps/common/ble/le_net_cfg.c \
@@ -1245,7 +1324,7 @@ index 2012bf8a..4b6affee 100644
  	../../../../apps/common/ble/le_trans_data.c \
  	../../../../apps/common/ble/mesh/examples/AliGenie_fan.c \
  	../../../../apps/common/ble/mesh/examples/AliGenie_light.c \
-@@ -585,8 +413,6 @@ c_SRC_FILES := \
+@@ -585,8 +415,6 @@ c_SRC_FILES := \
  	../../../../apps/common/usb/usb_host_config.c \
  	../../../../apps/wifi_story_machine/app_main.c \
  	../../../../apps/wifi_story_machine/app_music.c \
@@ -1254,7 +1333,7 @@ index 2012bf8a..4b6affee 100644
  	../../../../apps/wifi_story_machine/board/wl82/board_7911B.c \
  	../../../../apps/wifi_story_machine/board/wl82/board_7911D.c \
  	../../../../apps/wifi_story_machine/board/wl82/board_7912D.c \
-@@ -618,6 +444,41 @@ c_SRC_FILES := \
+@@ -618,6 +446,43 @@ c_SRC_FILES := \
  	../../../../cpu/wl82/key/rdec.c \
  	../../../../cpu/wl82/port_waked_up.c \
  	../../../../cpu/wl82/setup.c \
@@ -1265,6 +1344,8 @@ index 2012bf8a..4b6affee 100644
 +	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_pkt_log.c \
 +	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_protocol.c \
 +	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/rtc-tcp-client/src/tai_transport.c \
++	../../../../apps/common/LLM/tuya_agentic/stm/tuya_stm_ai.c \
++	../../../../apps/common/LLM/tuya_agentic/stm/stm_port_ac79_shim.c \
 +	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop.c \
 +	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop_base.c \
 +	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/cipher_wrapper.c \
@@ -1296,15 +1377,16 @@ index 2012bf8a..4b6affee 100644
  
  
  # 需要编译的 .S 文件
-@@ -710,6 +571,7 @@ LFLAGS := \
+@@ -710,6 +575,8 @@ LFLAGS := \
  	../../../../cpu/wl82/liba/lib_wav_dec.a \
  	../../../../cpu/wl82/liba/lib_dts_dec.a \
  	../../../../cpu/wl82/liba/lib_opus_dec.a \
 +	../../../../apps/common/LLM/tuya_agentic/libopus/libopus_tuya.a \
++	../../../../apps/common/LLM/tuya_agentic/stm/libstm_tuya.a \
  	../../../../cpu/wl82/liba/lib_amr_dec.a \
  	../../../../cpu/wl82/liba/lib_amr_enc.a \
  	../../../../cpu/wl82/liba/lib_amrwb_enc.a \
-@@ -760,25 +622,18 @@ LFLAGS := \
+@@ -760,25 +627,18 @@ LFLAGS := \
  	../../../../cpu/wl82/liba/https_cli.a \
  	../../../../cpu/wl82/liba/http_server.a \
  	../../../../cpu/wl82/liba/json.a \
@@ -1330,7 +1412,7 @@ index 2012bf8a..4b6affee 100644
  	../../../../cpu/wl82/liba/cJSON.a \
  	../../../../cpu/wl82/liba/ftpserver_new.a \
  	../../../../cpu/wl82/liba/http_server.a  \
-@@ -795,18 +650,13 @@ LFLAGS := \
+@@ -795,18 +655,13 @@ LFLAGS := \
  	../../../../cpu/wl82/liba/res.a \
  	../../../../cpu/wl82/liba/font.a \
  	../../../../cpu/wl82/liba/ui_draw.a \
@@ -1372,7 +1454,7 @@ index 2b69d8d3..196777e8 100644
  #if CONFIG_AUDIO_ENC_SAMPLE_SOURCE == AUDIO_ENC_SAMPLE_SOURCE_PLNK0
      .output_channel = OUTPUT_CHANNEL3,
 diff --git a/apps/wifi_story_machine/include/app_config.h b/apps/wifi_story_machine/include/app_config.h
-index f3cd60cb..40557de8 100644
+index f3cd60cb..1bdbc6e1 100644
 --- a/apps/wifi_story_machine/include/app_config.h
 +++ b/apps/wifi_story_machine/include/app_config.h
 @@ -115,10 +115,10 @@
@@ -1388,7 +1470,7 @@ index f3cd60cb..40557de8 100644
  #define CONFIG_AUDIO_PACKRES_ADR ((__FLASH_SIZE__) - CONFIG_AUDIO_PACKRES_LEN - 0x1000)
  #endif
  #else
-@@ -226,6 +226,71 @@
+@@ -226,6 +226,115 @@
  // #define CONFIG_HTTP_SERVER_ENABLE            //HTTP服务器
  // #define CONFIG_FTP_SERVER_ENABLE             //FTP服务器
  // #define CONFIG_VOLC_LLM_ENABLE               //火山大模型
@@ -1415,6 +1497,13 @@ index f3cd60cb..40557de8 100644
 + *   ⚠️ 工具链风险(记录在案):clang 4.0.1+LTO 曾对本地 libopus 浮点解码产生
 + *   axi_wr_inv 崩溃(2026-08-28 回退),故本编码器走定点;若上电/说话再现崩溃,
 + *   注释掉本宏即回 PCM 上行。参数对齐 agentic-kit audio_chat_demo(云端验证过)。*/
++/* 2026-09-03 定论:PCM=101 全链路验证通过(ASR/NLG/TTS/音乐/多轮)。
++ * 2026-09-04 定位 Opus 静默根因:对照 D:\code\agentic-kit 最新官方源码,
++ * TCP 协议 OPUS=111 且上行必带帧参数(80B/帧→40ms/16000bps,从帧长推导);
++ * STM/UDP 官方 demo(udp_chat_demo,Mac 实测可用)audio_params 全填。
++ * 三轮现象闭环:3=云端不认→静默;111 无帧参数=切帧失败→8/31 乱码;
++ * 101=PCM 自描述→全通。适配层已改 111+bitrate/fd/fs(tuya_stm_ai.c),
++ * 失败注释下一行即回 PCM。*/
 +#define TUYA_UPLINK_OPUS_ENABLE
 +
 +/* ===== 涂鸦 barge-in(用户打断 TTS)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
@@ -1433,6 +1522,43 @@ index f3cd60cb..40557de8 100644
 + * 不定义 = 本地 VAD:本地VAD直接判停说(get_recoder_state 由1变0即收尾)。
 + *   简单但易误判(话没说好就触发→ASR收空文本)。*/
 +#define TUYA_SERVER_VAD_ENABLE
++
++/* ===== 涂鸦语音通道传输层开关(TCP / UDP)(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
++ * 0(默认)= TCP:走原 rtc-tcp-client 源码(tai_*,agentic-kit/modules/rtc-tcp-client),
++ *           行为与历史版本完全一致。
++ * 1       = UDP(STM OPEN SDK):换成团队预编译库 libstm_tuya.a(725KB,LLVM IR,
++ *           LTO 兼容),库内部 UDP(DTLS) 与 TCP 竞速、UDP 优先,UDP 不通自动回落 TCP,
++ *           上层无法也无需指定。适配层 apps/common/LLM/tuya_agentic/stm/:
++ *           tuya_stm_ai.c 以 tstm_* 实现 tai_* 同义 API,tuya_ai_select.h 把
++ *           demo 里的 tai_* 调用重定向过去(原 tai_*.c 仍编译但未被引用)。
++ *   ⚠️ 连接参数改为来自云端下发的原始 session token(demo 里已自动绑定),
++ *      tai_config_t 的 host/port/tls_sni 等不再使用;local_key 仍用。
++ *   ⚠️ 依赖云端 token 里带 udpport/udpport_backup 字段(缺了库会报错,见
++ *      stm/README.md 待确认项)。
++ *   ⚠️ 已知行为差异(详见 stm/README.md):云端 VAD 事件(TAI_EVT_SERVER_VAD)
++ *      在 stm 下行无法区分表达 → 云端 VAD 模式实际退化为本地静音兜底;
++ *      上行打断/MCP 回应走库未公开底层接口(有 sid 校验兜底)。*/
++#define TUYA_TRANSPORT_STM_ENABLE     0
++/* 2026-09-04:STM/UDP 联调已通(上行 Opus codec=111+帧参数,中文 ASR/NLG/TTS
++ * 正常;上行带宽降为 PCM 的 1/16)。默认仍回 TCP:行为与历史版本完全一致、
++ * 云端 VAD 事件原生可用。要体验 UDP 改回 1 即可,证据链见 stm/README.md。 */
++
++/* ★排查期临时(UDP 联调完成后改回 3 或删除):libstm 应用侧日志过滤。
++ * 日志有两道闸门:库内部阈值 TUYA_STM_LIB_LOG_LEVEL(tuya_stm_ai.c,现默认
++ * WARN=3)先过滤,这里(TUYA_STM_LOG_PRINT_LEVEL)是应用侧第二道——想看库
++ * DEBUG 两处都要开。⚠️ 库 DEBUG 洪流曾导致音频首包必崩 axi_rd_inv(引擎线程
++ * 回调 printf × demo 任务 printf 无锁撞车,2026-08-31 轮B实测;现库日志已改
++ * 环形缓冲延迟打印由 demo 任务统一刷出,崩溃源已除,但 DEBUG 串口量仍大)。*/
++#define TUYA_STM_LOG_PRINT_LEVEL      1
++/* MCP 回应通道/上行 codec 两项实验 2026-08-31 已定论(证据详见 stm/README.md 第5节):
++ * ① codec:轮换实验证明 3=正确(ASR 正常),111=乱码/空 → 已定死 3
++ *   (tuya_stm_ai.c TUYA_STM_CODEC_ALTERNATE=0),此处无需再配。
++ * ② MCP 回应:必须走 TEXT(TUYA_STM_MCP_VIA_TEXT=1)——2026-09-02 反证实验:
++ *   改私有指令 type=1000 后云端对语音全程零响应(管线不激活,三次独立开机
++ *   同现象);TEXT 虽被云端当用户聊天输入(开机答非所问一句),但管线能激活。
++ *   官方回应通道的类型号待云端 FAE 确认后改 TUYA_STM_MCP_INSTR_TYPE 替换。 */
++#define TUYA_STM_MCP_VIA_TEXT         1
++#define TUYA_STM_MCP_INSTR_TYPE       1000
 +
 +/* ===== 涂鸦音乐技能(音乐播放)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
 + * 定义(默认)= 支持"播放XXX的歌":云端音乐 SKILL 回试听 mp3 URL(参考
@@ -1460,7 +1586,7 @@ index f3cd60cb..40557de8 100644
  // #define CONFIG_ONESDK_LLM_ENABLE
  // #define CONFIG_SXY_QYAI_ENABLE
  // #define CONFIG_DUER_LC_DEMO_ENABLE           //小度澜川AI对话DEMO
-@@ -341,7 +406,7 @@
+@@ -341,7 +450,7 @@
  
  #ifdef CONFIG_AEC_ENC_ENABLE
  #define CONFIG_USB_AUDIO_AEC_ENABLE          //usb mic使能回声消除功能
@@ -1469,7 +1595,7 @@ index f3cd60cb..40557de8 100644
  // #define CONFIG_AEC_USE_PLAY_MUSIC_ENABLE       //播歌时需要使用AEC
  
  // #define CONFIG_AEC_USE_SMS_TDE   //使用tde算法, 编码参数req.enc.aec_enable设置为2
-@@ -413,7 +478,7 @@
+@@ -413,7 +522,7 @@
  #endif
  #endif
  

@@ -294,10 +294,17 @@ int tls_write(tls_t *t, const uint8_t *buf, size_t len, uint32_t timeout_ms)
     if (!t) return TLS_ERR_ARGS;
     size_t written = 0;
     uint64_t start = t->pal->time_ms();
+    uint64_t mutex_wait_total = 0;   /* 海外慢链路诊断:yield_mutex 等待累计 */
+    uint64_t ssl_total = 0;          /* mbedtls_ssl_write 本身累计(含 tcp_poll) */
 
     while (written < len) {
+        uint64_t _m0 = t->pal->time_ms();
         t->pal->mutex_lock(t->yield_mutex);
+        mutex_wait_total += t->pal->time_ms() - _m0;
+
+        uint64_t _s0 = t->pal->time_ms();
         int n = mbedtls_ssl_write(&t->ssl, buf + written, len - written);
+        ssl_total += t->pal->time_ms() - _s0;
         t->pal->mutex_unlock(t->yield_mutex);
 
         if (n > 0) { written += (size_t)n; continue; }
@@ -310,6 +317,14 @@ int tls_write(tls_t *t, const uint8_t *buf, size_t len, uint32_t timeout_ms)
             continue;
         }
         return TLS_ERR_NET;
+    }
+    /* 海外慢链路诊断:总耗时 >50ms 才打印,分解 mutex 等待 vs ssl_write(tcp) */
+    uint64_t total = t->pal->time_ms() - start;
+    if (total >= 50) {
+        log_emit(LOG_WARN,
+                 "[tls_write] total=%lums mutex_wait=%lums ssl=%lums len=%u",
+                 (unsigned long)total, (unsigned long)mutex_wait_total,
+                 (unsigned long)ssl_total, (unsigned)len);
     }
     return TLS_OK;
 }

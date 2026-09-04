@@ -9,12 +9,13 @@
 ## 功能特性
 
 - **语音对话** — 实时语音交互(ASR + LLM + TTS)
-- **上行 ASR** — opus(默认,本地 libopus 1.4 定点软编码,16k/mono/CBR 16kbps/40ms,~2KB/s 仅为 PCM 的 1/16)/ PCM(可选,32KB/s)。mic 管线保持 PCM(VAD/AEC/能量门/barge-in 全不受影响),仅在发送前逐帧编码;编码器初始化失败自动回退 PCM
+- **上行 ASR** — opus(默认,本地 libopus 1.4 定点软编码,16k/mono/CBR 16kbps/40ms,~2KB/s 仅为 PCM 的 1/16)/ PCM(可选,32KB/s)。mic 管线保持 PCM(VAD/AEC/能量门/barge-in 全不受影响),仅在发送前逐帧编码;编码器初始化失败自动回退 PCM。TCP / UDP 两种传输下均已实测调通
 - **下行 TTS** — opus(默认,~2KB/s 治拥挤网络卡顿)/ PCM(可选,稳定)。opus 已调通:CBR + `sample_rate=0` 自动重采样
+- **传输层可选(TCP / UDP)** — 默认 TCP(`rtc-tcp-client` 源码直连,行为与历史版本一致);可切涂鸦团队预编译的 STM OPEN SDK(`stm/libstm_tuya.a`,UDP/DTLS 与 TCP 竞速、UDP 优先、不通自动回落),`TUYA_TRANSPORT_STM_ENABLE` 一个开关切换,两个后端同时编译共存。切换细节与已知差异见 `stm/README.md`
 - **DNS 降噪强化** — 嘈杂环境 ASR 优化:强制开 DNS 位(不受 flash 旧配置影响)+ 降噪强度 over_drive=3,实测底噪基线 9k~64k → 3k~6k;若小声说话被吃,在 `user_cfg.c` 覆盖块回调 2.0~2.5
-- **打断 (barge-in)** — AEC + VAD + 多帧能量确认,用户可随时打断 TTS(实验性,强依赖 AEC)
+- **打断 (barge-in)** — AEC + VAD + 多帧能量确认,用户可随时打断 TTS(依赖 AEC)。空闲起轮与播报中打断用两道独立能量门(`BARGE_MIN_ENERGY` 10 万 / `BARGE_CONFIRM_ENERGY` 60 万),后者专门抗 TTS 回声的 AEC 残留误触发(实测残留确认帧 <40 万、真人插话 >110 万,取 60 万居中)
 - **音乐播放** — "播放XXX的歌":云端音乐 SKILL 回试听 mp3 URL,设备解析后走杰理网络解码链播放(https 自动 TLS);TTS 报幕后让出 DAC、播完自动恢复,播放中说话可打断停乐(VAD+3 帧能量门)。⚠️ 试听片段 ~30s,完整歌曲需在涂鸦平台购买音乐高级能力授权
-- **云端 VAD 停说判定** — 开口永远本地 VAD;停说由云端事件决定(TAI 2.1 协议经 ChatBreak 通知停说,代码兼容处理 ServerVad),带本地 2s 静音超时兜底
+- **云端 VAD 停说判定** — 开口永远本地 VAD;停说由云端事件决定(TAI 2.1 协议经 ChatBreak 通知停说,代码兼容处理 ServerVad),带本地 2s 静音超时兜底(TCP 通道)。STM/UDP 通道下该事件暂不可区分,自动退化为本地静音兜底,见 `stm/README.md`
 - **MQTT 常驻 + DP 下行** — MQTT 与 AI 的 TLS 各自独立连接并存,`tuya_mqtt_ka` 线程维持心跳收 DP 下行;App 里设备保持在线,云端下发的 DP/MCP 命令实时可收(`on_dp_downlink` / `on_event`)
 - **TTS 首字预蓄水** — 每轮 TTS 开头先攒 ~160ms 音频再喂解码器,治首帧短包 underrun 卡顿
 - **涂鸦云 OTA** — 开机连 AI 前检查升级,有新固件则下载烧写自动重启(双备份方式)
@@ -98,7 +99,7 @@ make ac791n_wifi_story_machine
 
 - overlay **覆盖 10 个 SDK 文件** + **新增 `tuya_agentic/` 整目录**。
 - patch 只改那 10 个文件(新增目录仍需 overlay 复制)。
-- 新增目录含自带 libopus 定点编码器与**预编译好的 `libopus_tuya.a`**——正常使用**无需**本地重编;只有修改了 `libopus/` 下源码才需重跑其 `build_tuya_libopus.sh`(需杰理 LLVM 工具链 `/c/JL/pi32/bin`)再编工程。
+- 新增目录含自带 libopus 定点编码器与**预编译好的 `libopus_tuya.a`**——正常使用**无需**本地重编;只有修改了 `libopus/` 下源码才需重跑其 `build_tuya_libopus.sh`(需杰理 LLVM 工具链 `/c/JL/pi32/bin`)再编工程。`stm/` 下的 `libstm.a`(涂鸦原厂库)/`libstm_tuya.a`(平台适配补丁版)同理为预编译库,仅换涂鸦新版原厂库时才需重跑 `patch_libstm.sh`
 
 > ⚠ **重跑 apply 会覆盖 `demo.c`,把你填的凭证盖回占位符**。若已填过凭证,后续改动请直接手改目标文件,或重跑后再填一次。
 
@@ -127,6 +128,7 @@ make ac791n_wifi_story_machine
 | 宏 | 说明 | 默认 |
 |---|---|---|
 | `CONFIG_TUYA_AGENTIC_ENABLE` | 涂鸦集成总开关(控制 Makefile 编入 + K6 重置分支 + 自启动) | 开 |
+| `TUYA_TRANSPORT_STM_ENABLE` | 语音传输层:0=TCP(rtc-tcp-client 源码);1=涂鸦 STM 库(UDP 优先,UDP/TCP 竞速自动回落),详见 `stm/README.md` | 0 |
 | `TUYA_BARGE_IN_ENABLE` | 用户打断 TTS(强依赖 AEC,实验性) | 开 |
 | `TUYA_DOWNLINK_OPUS_ENABLE` | 下行 TTS 用 opus(治卡顿);注释则用 PCM | 开 |
 | `TUYA_UPLINK_OPUS_ENABLE` | 上行 ASR 用本地 libopus 定点软编码(~2KB/s);注释则 PCM(32KB/s) | 开 |
@@ -162,7 +164,7 @@ make ac791n_wifi_story_machine
 | **下行 TTS 有啸叫/杂音** | 若开 opus 后有异常,可切回 PCM(注释掉 `TUYA_DOWNLINK_OPUS_ENABLE`)。当前 opus 已调通(CBR + sample_rate=0 自动重采样) |
 | **配网时连上就断(conn nack → 超时)** | 多为 2.4G 射频干扰。关掉手机 WiFi 再配、靠近设备、多试几次 |
 | **音乐只播 ~30 秒就停** | 平台试听片段限制;完整歌曲需在涂鸦平台购买音乐高级能力授权 |
-| **音乐放着放着自己停了** | 音乐 barge-in 误触发:音乐回采穿透了能量门。看日志 `[MUSIC-DBG]` 基线 sum,调高 `BARGE_MIN_ENERGY`(`tuya_agentic_demo.c`) |
+| **音乐放着放着自己停了** | 音乐 barge-in 误触发:音乐回采穿透了能量门。看日志 `[MUSIC-DBG]` 基线 sum,调高 `BARGE_CONFIRM_ENERGY`(`tuya_agentic_demo.c`) |
 | **嘈杂环境 ASR 识别不准** | 看串口 `idle drain avg_sum`(底噪基线)与说话帧 `act%`。DNS 已强制开且 over_drive=3(`user_cfg.c` 覆盖块);若**小声说话被吃/识别反而变差**(过压制),把 `DNS_over_drive` 回调 2.0~2.5。注意 DNS 只压稳态噪声(风扇/嗡嗡),旁边人声/电视等非稳态噪声无解,需离麦近一点 |
 | **patch 打不上 / 行号错位** | SDK 版本不对。必须用 `AC79NN_SDK_V1.2.12_2026-03-07`(内容 = 官方 V1.2.0 release 包,patch 基线) |
 
@@ -172,9 +174,10 @@ make ac791n_wifi_story_machine
 
 - **下行 opus 已调通**(CBR + `sample_rate=0` 让解码器自动输出 48k 重采样到 DAC),默认开启。早期 `sample_rate=16000` 强制对齐会致慢速低沉音、去掉 CBR 会致解码器卡死,均已修复。
 - **上行 opus 为本地 libopus 定点软编码**(符号全 `topus_` 前缀隔离,与杰理闭源 opus 库零冲突;仓内带预编译 `libopus_tuya.a`)。曾在另一场景记录过 clang+LTO 对本地 libopus **浮点解码**的崩溃(已弃用解码,仅保留定点**编码**);若上电/说话再现异常,注释 `TUYA_UPLINK_OPUS_ENABLE` 回 PCM 上行排查。修改 libopus 源码需重跑 `build_tuya_libopus.sh` 再编工程。
-- **音乐打断是"停乐后听"**:打断的那句话与音乐混叠、不作数(不补发 ASR),音乐停了再说下一句。若出现"音乐自己把自己打断",按 `[MUSIC-DBG]` 日志调高 `BARGE_MIN_ENERGY`(AEC 对连续音乐的效果未验证)。
+- **音乐打断是"停乐后听"**:打断的那句话与音乐混叠、不作数(不补发 ASR),音乐停了再说下一句。若出现"音乐自己把自己打断",按 `[MUSIC-DBG]` 日志调高 `BARGE_CONFIRM_ENERGY`(AEC 对连续音乐的效果未验证)。
 - **OTA 版本号为手动方案**:`TUYA_FIRMWARE_VERSION` 每次发版前要改成与涂鸦平台填的一致。跨 OTA 自动持久化版本号(VM/USER/BTIF/RTC)经验证全部不可靠,故不采用。
-- **barge-in 强依赖 AEC**,单麦环境下属实验性功能,调参细节见 [`docs/CHANGES.md`](docs/CHANGES.md)。
+- **barge-in 强依赖 AEC**,单麦环境下属实验性功能,调参细节见 [`docs/CHANGES.md`](docs/CHANGES.md)。播报中被 TTS 回声"自打断"(回复错乱、频繁掐断)时,调高 `BARGE_CONFIRM_ENERGY`(默认 60 万,2026-09-04 实测残留确认帧 <40 万、真人插话 >110 万)。
+- **传输层默认 TCP**。切 UDP(`TUYA_TRANSPORT_STM_ENABLE 1`)的用法、原理与已知差异(云端 VAD 事件不可区分、MCP 回应走 TEXT 通道等)见 `stm/README.md`;STM 库为涂鸦团队预编译(LLVM IR 归档,725KB)。
 - **版本绑定**:patch 基线 = 官方 V1.2.0 release 包内容(git tag `AC79NN_SDK_V1.2.12_2026-03-07`,已验证)。跟随官方 SDK 升级需重新生成 patch。
 
 ---
@@ -183,8 +186,8 @@ make ac791n_wifi_story_machine
 
 完整清单见 [`docs/CHANGES.md`](docs/CHANGES.md)。摘要:
 
-- **新增** `apps/common/LLM/tuya_agentic/`:`tuya_agentic_demo.c`(主流程)、`pal_ac791n.c`(PAL)、`le_net_cfg_tuya.c/.h`(BLE 配网)、`tuya_music.c/.h`(音乐技能解析)、`tuya_ota.c/.h`(OTA)、`tuya_opus_enc.c/.h` + `libopus/`(上行 opus 编码,含预编译库)、bool 兼容补丁、引入的 `agentic-kit/`
-- **改动 SDK**(8):`audio_input.c/.h`、`user_cfg.c`(AEC)、`app_music.c`(K6 + 音乐播放导出)、`Makefile`、`app_config.h`、`wifi_app_task.c`、`app_main.c`(btstack 栈 768→2048)
+- **新增** `apps/common/LLM/tuya_agentic/`:`tuya_agentic_demo.c`(主流程)、`pal_ac791n.c`(PAL)、`le_net_cfg_tuya.c/.h`(BLE 配网)、`tuya_music.c/.h`(音乐技能解析)、`tuya_ota.c/.h`(OTA)、`tuya_opus_enc.c/.h` + `libopus/`(上行 opus 编码,含预编译库)、`stm/`(涂鸦 STM OPEN SDK 适配层:UDP 传输可选后端,`tuya_stm_ai.c` + `stm_port_ac79_shim.c` + 预编译库 + 重打补丁脚本)、bool 兼容补丁、引入的 `agentic-kit/`
+- **改动 SDK**(10 个文件):`audio_input.c/.h`、`user_cfg.c`(AEC)、`app_music.c`(K6 + 音乐播放导出)、`Makefile`、`AC791N_WIFI_STORY_MACHINE.cbp`、`app_config.h`、`wifi_app_task.c`、`app_main.c`(btstack 栈 768→2048)
 - **可选调试改动**:`board_7916A.c`(串口波特率,只为看日志)
 
 ---
@@ -209,7 +212,7 @@ tuya-agentic-ac79/
 
 ## License
 
-对接代码遵循 Apache-2.0(与杰理 SDK 一致)。`agentic-kit/` 下引入的涂鸦开源模块、AWS coreHTTP / coreMQTT 遵循各自原始许可;`tuya_agentic/libopus/`(libopus 1.4 子集,含预编译 `libopus_tuya.a`)遵循 BSD-3-Clause(见其 `COPYING`)。
+对接代码遵循 Apache-2.0(与杰理 SDK 一致)。`agentic-kit/` 下引入的涂鸦开源模块、AWS coreHTTP / coreMQTT 遵循各自原始许可;`tuya_agentic/libopus/`(libopus 1.4 子集,含预编译 `libopus_tuya.a`)遵循 BSD-3-Clause(见其 `COPYING`);`tuya_agentic/stm/` 下的 `libstm.a` / `libstm_tuya.a` 为涂鸦团队提供的预编译库,版权归涂鸦所有,随本仓仅为方便适配该 SDK 使用。
 
 ## 致谢
 

@@ -216,3 +216,46 @@ flash 布局改动(为双备份 OTA 腾空间):
 ## 数据流一句话
 
 `mic → audio_input.c(enc+VAD+AEC)→ pcm_cbuff_w → demo.c _device_get_voice_data → 上行发送(TUYA_UPLINK_OPUS_ENABLE 开:tuya_uplink_send_frame 逐帧 libopus 定点编码 ~80B/40ms;关:PCM 1280B/40ms 直发)→ tai_send_audio_chunk`;`云端 opus → demo.c on_audio → _device_write_voice_data(整包直写)→ pcm_cbuff_r → audio_input.c dec(CBR opus_cbr_pktlen=80, sample_rate=0 自动重采样 48k→DAC)→ DAC`。barge-in = AEC + VAD + 3 帧能量确认,触发后 `chat_break` + 清 rbuf + 排 stale mic + 1000ms 冷却 + 补发 onset 帧。停说判定:`TUYA_SERVER_VAD_ENABLE` 时等云端 `TAI_EVT_SERVER_VAD`(本地 2s 静音兜底),否则本地 VAD 直接判停说。OTA = 开机连 AI 前 `tuya_ota_check_and_upgrade`(ATOP 查升级 → 下载烧写 → 自动重启)。音乐 = 云端音乐 SKILL(`tuya_music.c` 并行重组+解析)→ TTS 报幕排空后让出 DAC → `app_music_tuya_play_url`(net_download https → mp3 解码 → DAC)→ 播完或 barge-in(VAD+3 帧能量门)停乐后恢复 TTS 播放器回听音。
+
+---
+
+## 2026-08 ~ 09 增量改动(STM 传输 / 上行 Opus 修正 / 打断确认门拆分)
+
+> 以上 A/B/C 节为 7 月首版清单;本节记录其后到 2026-09-04 的增量。
+
+### D. 新增 `tuya_agentic/stm/` 子目录(可选 UDP 传输后端,默认关)
+
+| 文件 | 作用 |
+|---|---|
+| `libstm.a` | 涂鸦团队用杰理工具链预编译的 STM OPEN SDK(LTO bitcode 归档,725KB)。**原厂库,勿直接链接** |
+| `libstm_tuya.a` | `patch_libstm.sh` 的补丁版(引擎线程栈 1KB→12KB、lwip `O_NONBLOCK` 常量翻译),Makefile/cbp 链接的是它 |
+| `patch_libstm.sh` | 重打补丁脚本,仅换涂鸦新版原厂库时重跑(需 llvm-ar/bcrename/nm) |
+| `stm_port_ac79_shim.c` | 补齐层:`stm_ac79_pthread_create`(设栈)、`stm_ac79_fcntl`(O_NONBLOCK 翻译) |
+| `tuya_stm_ai.c/.h` | 适配层:以 `tstm_*` 实现 `tuya_ai.h` 的整套 `tai_*` 会话 API |
+| `tuya_ai_select.h` | 编译期重定向:`TUYA_TRANSPORT_STM_ENABLE=1` 时 demo 的 `tai_*` 调用转到 `tstm_*`;=0 原样走 TCP |
+| `include/`、`README.md`、`OPEN-SDK接入文档.md` | 原厂公开头文件与接入文档/说明 |
+
+- 开关:`app_config.h` `TUYA_TRANSPORT_STM_ENABLE`(0=TCP 默认,1=UDP 优先)。两个后端同时编译共存,UDP 联调已完成(2026-09-04),默认仍回 TCP。
+- 已知差异:云端 VAD 事件在 STM 通道不可区分(退化为本地静音兜底);MCP 回应走公开 TEXT 通道(`TUYA_STM_MCP_VIA_TEXT`)。详见 `stm/README.md`。
+
+### E. 上行 Opus 在 STM/UDP 通道的 codec 定论(踩坑记录)
+
+- 现象三连:`codec=3` 整轮静默(云端不认);`codec=111` 不带帧参数 → 解码器能跑但切不了帧(ASR 乱码/空);`codec=111 + bitrate=16000/frame_duration=40/frame_size=80` → **中文 ASR/NLG/TTS 全通**(2026-09-04 实测)。
+- 依据:最新官方 agentic-kit 源码 `tuya_ai.h` 定义 `TAI_AUDIO_OPUS=111`;TCP 协议层(`tai_protocol.c`)对 Opus 自动从帧长推导帧参数(80B/帧 → 40ms → 16000bps),STM 通道无此逻辑,由适配层 `tuya_stm_ai.c` 显式补发。
+- 2026-08-31 "codec=3 正确/111 乱码"的旧结论**作废**(当日受 MCP TEXT 污染干扰且缺帧参数)。TCP 通道不受影响(协议层自动推导)。
+
+### F. barge-in 确认门与起轮门拆分(`tuya_agentic_demo.c`)
+
+- 新增 `BARGE_CONFIRM_ENERGY=600000`:仅用于 TTS/音乐**播放中**的 3 帧打断确认;`BARGE_MIN_ENERGY=100000` 保留给**空闲起轮**单帧能量门。
+- 证据(2026-09-04 深圳天气轮日志):TTS 回声 AEC 残留骗过 3/3 确认(各帧 sum <40 万)→ 播报被掐、碎片轮错乱;真人插话确认帧全部 >110 万。60 万居中(误触发余量 1.6×/真人余量 1.9×)。
+
+### G. `audio_input.c` 录音 cbuf 三处修复(治上行丢话/抢丢 onset)
+
+- 取数节拍:无条件 `mdelay(40)` 改为"不足一帧才短轮询等待",消除 STM 发送(~10ms)叠加导致的消费慢于生产、cbuf 涨满丢话。
+- cbuf 满时保新帧:空间不足只丢最旧一帧再完整写入,替代旧逻辑"写 0 就 clear 整仓"(旧逻辑会把用户抢答的 onset 整段清掉)。
+- 新增 TTS underrun 诊断计数(区分网络断流卡顿与解码颤音)。
+
+### H. `app_config.h` 开关变化
+
+- 新增 `TUYA_TRANSPORT_STM_ENABLE`(默认 0)、`TUYA_STM_LOG_PRINT_LEVEL`、`TUYA_STM_MCP_VIA_TEXT=1`/`TUYA_STM_MCP_INSTR_TYPE=1000`(STM 模式 MCP 回应通道,详见 `stm/README.md`)。
+- 上行/下行 Opus、barge-in、云端 VAD、音乐等既有开关语义不变。

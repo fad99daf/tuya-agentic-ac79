@@ -68,7 +68,15 @@ void tai_emit_disconnect(tai_ctx_t *ctx, uint8_t reason,
 static inline int ctx_io_send(tai_ctx_t *ctx, const uint8_t *buf, size_t len)
 {
     if (!ctx->disable_tls) {
+        /* 海外慢链路诊断:测 tls_write 总耗时(含 yield_mutex 等待 + mbedtls 加密 + tcp_send)。
+         * 与 PAL 层 [NET-SND] 日志对比,可分离出 TLS 层开销 vs 纯网络开销。*/
+        uint64_t _t0 = ctx->pal->time_ms();
         int r = tls_write(ctx->tls, buf, len, 10000);
+        uint64_t _dt = ctx->pal->time_ms() - _t0;
+        if (_dt >= 50) {
+            log_emit(LOG_WARN, "[ctx_io_send] tls_write=%lums len=%u ret=%d",
+                     (unsigned long)_dt, (unsigned)len, r);
+        }
         return (r == TLS_OK) ? TAI_OK : TAI_ERR_NET;
     }
 
@@ -397,7 +405,7 @@ int tai_connect(tai_ctx_t *ctx)
         TAI_LOGE(ctx->pal, TAG, "key derivation failed: %d", rc);
         return rc;
     }
-    TAI_LOGD(ctx->pal, TAG, "keys derived (ikm_len=%zu)", ikm_len);
+    TAI_LOGD(ctx->pal, TAG, "keys derived (ikm_len=%u)", ikm_len);
 
     /* 3. TLS connect (or raw TCP in test mode) */
     if (ctx->disable_tls) {
@@ -625,7 +633,7 @@ static int process_app_packet(tai_ctx_t *ctx,
                                 attrs, TAI_MAX_ATTRS, &attr_count,
                                 &payload, &payload_len);
     if (rc != TAI_OK) {
-        TAI_LOGW(ctx->pal, TAG, "packet decode failed: %d (app_len=%zu)", rc, app_len);
+        TAI_LOGW(ctx->pal, TAG, "packet decode failed: %d (app_len=%u)", rc, app_len);
         return TAI_PROTO_ERR_PKT_DECODE;   /* fatal cause, returned to the worker */
     }
 
@@ -701,7 +709,7 @@ static int tai_process_rx(tai_ctx_t *ctx)
          * the server ignores the advertised MAX_FRAGMENT_LEN. */
         if (needed > sizeof(ctx->rx_buf)) {
             TAI_LOGE(ctx->pal, TAG,
-                     "inbound frame %zu B exceeds rx_buf %zu B (server ignored MAX_FRAGMENT_LEN?)",
+                     "inbound frame %u B exceeds rx_buf %u B (server ignored MAX_FRAGMENT_LEN?)",
                      needed, sizeof(ctx->rx_buf));
             return TAI_PROTO_ERR_OVERSIZED;
         }
@@ -711,7 +719,7 @@ static int tai_process_rx(tai_ctx_t *ctx)
         int rc = tai_frame_verify(ctx->rx_buf, needed,
                                    ctx->sig_len, ctx->sign_key, ctx->pal);
         if (rc != TAI_OK) {
-            TAI_LOGW(ctx->pal, TAG, "HMAC verify failed (frame=%zu bytes)", needed);
+            TAI_LOGW(ctx->pal, TAG, "HMAC verify failed (frame=%u bytes)", needed);
             return TAI_PROTO_ERR_HMAC;
         }
 
@@ -843,7 +851,7 @@ static int send_text_locked(tai_ctx_t *ctx, const char *text, size_t len)
 int tai_send_text(tai_ctx_t *ctx, const char *text, size_t len)
 {
     if (!ctx || !ctx->connected || !text) return TAI_ERR_ARGS;
-    TAI_LOGI(ctx->pal, TAG, "send_text: %zu bytes", len);
+    TAI_LOGI(ctx->pal, TAG, "send_text: %u bytes", len);
     ctx_lock(ctx);
     int rc = send_text_locked(ctx, text, len);
     ctx_unlock(ctx);
@@ -1008,7 +1016,7 @@ int tai_send_image(tai_ctx_t *ctx,
                    uint8_t format, uint16_t width, uint16_t height)
 {
     if (!ctx || !ctx->connected || !data) return TAI_ERR_ARGS;
-    TAI_LOGI(ctx->pal, TAG, "send_image: %zu bytes fmt=%u %ux%u",
+    TAI_LOGI(ctx->pal, TAG, "send_image: %u bytes fmt=%u %ux%u",
              len, format, width, height);
     ctx_lock(ctx);
     int rc = send_image_locked(ctx, data, len, format, width, height);
@@ -1080,7 +1088,7 @@ int tai_send_image_with_text(tai_ctx_t *ctx,
                              uint16_t width, uint16_t height)
 {
     if (!ctx || !ctx->connected || !text || !img_data) return TAI_ERR_ARGS;
-    TAI_LOGI(ctx->pal, TAG, "send_image_with_text: text=%zu img=%zu bytes",
+    TAI_LOGI(ctx->pal, TAG, "send_image_with_text: text=%u img=%u bytes",
              text_len, img_len);
     ctx_lock(ctx);
     int rc = send_image_with_text_locked(ctx, text, text_len,

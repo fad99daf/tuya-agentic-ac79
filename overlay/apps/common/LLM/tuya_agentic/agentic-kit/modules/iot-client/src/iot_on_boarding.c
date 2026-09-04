@@ -278,7 +278,7 @@ static int activate_device(const pal_t *pal, on_boarding_config_t *on_boarding, 
     request.cert_bundle_attach = on_boarding->cert_bundle_attach;
 
     log_info("Sending activation request with:");
-    log_info("  - Token: [%zu chars, prefix=%.4s...]",
+    log_info("  - Token: [%u chars, prefix=%.4s...]",
              request.token ? strlen(request.token) : 0,
              (request.token && strlen(request.token) >= 4) ? request.token : "----");
     log_info("  - Software Version: %s", request.sw_ver);
