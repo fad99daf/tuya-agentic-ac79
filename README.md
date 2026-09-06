@@ -9,6 +9,7 @@
 ## 功能特性
 
 - **语音对话** — 实时语音交互(ASR + LLM + TTS)
+- **唤醒词"嘿tuya"** — 涂鸦闭源 KWS 引擎(`kws/audio_subsys.a`)常开识别:命中播"我在"应答并开 15s 唤醒窗,窗内本地 VAD 才起轮;同句双命中拦截、跨句拼装防护;引擎初始化失败自动回退"常听"。引擎标定结论/参数速查/调参指南见 [`docs/WAKEWORD.md`](docs/WAKEWORD.md)
 - **上行 ASR** — opus(默认,本地 libopus 1.4 定点软编码,16k/mono/CBR 16kbps/40ms,~2KB/s 仅为 PCM 的 1/16)/ PCM(可选,32KB/s)。mic 管线保持 PCM(VAD/AEC/能量门/barge-in 全不受影响),仅在发送前逐帧编码;编码器初始化失败自动回退 PCM。TCP / UDP 两种传输下均已实测调通
 - **下行 TTS** — opus(默认,~2KB/s 治拥挤网络卡顿)/ PCM(可选,稳定)。opus 已调通:CBR + `sample_rate=0` 自动重采样
 - **传输层可选(TCP / UDP)** — 默认 TCP(`rtc-tcp-client` 源码直连,行为与历史版本一致);可切涂鸦团队预编译的 STM OPEN SDK(`stm/libstm_tuya.a`,UDP/DTLS 与 TCP 竞速、UDP 优先、不通自动回落),`TUYA_TRANSPORT_STM_ENABLE` 一个开关切换,两个后端同时编译共存。切换细节与已知差异见 `stm/README.md`
@@ -130,6 +131,7 @@ make ac791n_wifi_story_machine
 | `CONFIG_TUYA_AGENTIC_ENABLE` | 涂鸦集成总开关(控制 Makefile 编入 + K6 重置分支 + 自启动) | 开 |
 | `TUYA_TRANSPORT_STM_ENABLE` | 语音传输层:0=TCP(rtc-tcp-client 源码);1=涂鸦 STM 库(UDP 优先,UDP/TCP 竞速自动回落),详见 `stm/README.md` | 0 |
 | `TUYA_BARGE_IN_ENABLE` | 用户打断 TTS(强依赖 AEC,实验性) | 开 |
+| `TUYA_KWS_ENABLE` | 唤醒词"嘿tuya"门控(闭源引擎常开识别,失败自动回退常听),详见 `docs/WAKEWORD.md` | 开 |
 | `TUYA_DOWNLINK_OPUS_ENABLE` | 下行 TTS 用 opus(治卡顿);注释则用 PCM | 开 |
 | `TUYA_UPLINK_OPUS_ENABLE` | 上行 ASR 用本地 libopus 定点软编码(~2KB/s);注释则 PCM(32KB/s) | 开 |
 | `TUYA_SERVER_VAD_ENABLE` | 云端 VAD 停说判定(开口仍本地 VAD;本地 2s 静音兜底) | 开 |
@@ -166,6 +168,7 @@ make ac791n_wifi_story_machine
 | **音乐只播 ~30 秒就停** | 平台试听片段限制;完整歌曲需在涂鸦平台购买音乐高级能力授权 |
 | **音乐放着放着自己停了** | 音乐 barge-in 误触发:音乐回采穿透了能量门。看日志 `[MUSIC-DBG]` 基线 sum,调高 `BARGE_CONFIRM_ENERGY`(`tuya_agentic_demo.c`) |
 | **嘈杂环境 ASR 识别不准** | 看串口 `idle drain avg_sum`(底噪基线)与说话帧 `act%`。DNS 已强制开且 over_drive=3(`user_cfg.c` 覆盖块);若**小声说话被吃/识别反而变差**(过压制),把 `DNS_over_drive` 回调 2.0~2.5。注意 DNS 只压稳态噪声(风扇/嗡嗡),旁边人声/电视等非稳态噪声无解,需离麦近一点 |
+| **说"嘿tuya"没反应** | 看日志 `[KWS-PROBE]` 里 k27/k08 是否成对出现(间隔 ~3 帧):成对=阈值偏高,不成对=发音/前端问题。调参详见 `docs/WAKEWORD.md` |
 | **patch 打不上 / 行号错位** | SDK 版本不对。必须用 `AC79NN_SDK_V1.2.12_2026-03-07`(内容 = 官方 V1.2.0 release 包,patch 基线) |
 
 ---
@@ -186,8 +189,9 @@ make ac791n_wifi_story_machine
 
 完整清单见 [`docs/CHANGES.md`](docs/CHANGES.md)。摘要:
 
-- **新增** `apps/common/LLM/tuya_agentic/`:`tuya_agentic_demo.c`(主流程)、`pal_ac791n.c`(PAL)、`le_net_cfg_tuya.c/.h`(BLE 配网)、`tuya_music.c/.h`(音乐技能解析)、`tuya_ota.c/.h`(OTA)、`tuya_opus_enc.c/.h` + `libopus/`(上行 opus 编码,含预编译库)、`stm/`(涂鸦 STM OPEN SDK 适配层:UDP 传输可选后端,`tuya_stm_ai.c` + `stm_port_ac79_shim.c` + 预编译库 + 重打补丁脚本)、bool 兼容补丁、引入的 `agentic-kit/`
-- **改动 SDK**(10 个文件):`audio_input.c/.h`、`user_cfg.c`(AEC)、`app_music.c`(K6 + 音乐播放导出)、`Makefile`、`AC791N_WIFI_STORY_MACHINE.cbp`、`app_config.h`、`wifi_app_task.c`、`app_main.c`(btstack 栈 768→2048)
+- **新增** `apps/common/LLM/tuya_agentic/`:`tuya_agentic_demo.c`(主流程)、`pal_ac791n.c`(PAL)、`le_net_cfg_tuya.c/.h`(BLE 配网)、`tuya_music.c/.h`(音乐技能解析)、`tuya_ota.c/.h`(OTA)、`tuya_opus_enc.c/.h` + `libopus/`(上行 opus 编码,含预编译库)、`stm/`(涂鸦 STM OPEN SDK 适配层:UDP 传输可选后端,`tuya_stm_ai.c` + `stm_port_ac79_shim.c` + 预编译库 + 重打补丁脚本)、`kws/`(唤醒词"嘿tuya":闭源引擎 `audio_subsys.a` + 逆向 API 头 + C++ 垫片 + 薄封装,见 `docs/WAKEWORD.md`)、bool 兼容补丁、引入的 `agentic-kit/`
+- **改动 SDK**(10 个文件):`audio_input.c/.h`、`user_cfg.c`(AEC)、`app_music.c`(K6 + 音乐播放导出 + 唤醒应答提示音)、`Makefile`、`AC791N_WIFI_STORY_MACHINE.cbp`、`app_config.h`、`wifi_app_task.c`、`app_main.c`(btstack 栈 768→2048)
+- **新增资源** `cpu/wl82/tools/audlogo/WakeHeyTuya.mp3`(唤醒应答提示音,overlay 直拷;不覆盖 audlogo 下其余库存文件)
 - **可选调试改动**:`board_7916A.c`(串口波特率,只为看日志)
 
 ---
@@ -205,6 +209,7 @@ tuya-agentic-ac79/
 │   └── tuya-agentic-v1.2.0.patch   ← 10 个改动文件的 diff
 └── docs/
     ├── INTEGRATION.md   ← 集成架构与原理
+    ├── WAKEWORD.md      ← 唤醒词子系统:引擎标定 / 参数 / 调参 / 日志
     └── CHANGES.md       ← 完整改动清单
 ```
 

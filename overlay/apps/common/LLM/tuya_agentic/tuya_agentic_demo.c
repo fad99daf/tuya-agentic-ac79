@@ -33,6 +33,7 @@
 int  app_music_tuya_play_url(const char *url, void (*on_dec_end)(int));
 void app_music_tuya_music_stop(void);
 int  app_music_tuya_music_busy(void);   /* 网络音乐仍占用(下载/解码中):等待循环感知失败退出 */
+void app_music_tuya_play_wake_prompt(void); /* "嘿tuya"唤醒应答提示音(WakeHeyTuya.mp3) */
 #endif
 #ifdef TUYA_UPLINK_OPUS_ENABLE
 #include "tuya_opus_enc.h"        /* 上行 opus 软编码(libopus 1.4 定点,实现 tuya_opus_enc.c) */
@@ -109,6 +110,18 @@ typedef struct {
 static volatile int g_audio_ready;        /* 音频流已起:on_audio 才允许喂 DAC(否则独立文本 demo 未起流会踩空 cbuf)*/
 static volatile int g_tts_playing;        /* 云端正在播 TTS:期间暂停上行,防麦克风采到自身喇叭 */
 static volatile int g_turn_done;          /* 本轮回复结束(TAI_EVT_END),可重新听音 */
+/* 2026-09-05"第一次放歌没反应"根因:barge-in 打断的旧轮,云端回复流被拖后收尾,
+ * 旧轮的 TAI_EVT_END 在新轮 ④ 等待期到达 → g_turn_done 误置位 → 等待提前退出,
+ * 新轮晚到的音乐 SKILL 无人消费。修复:用轮 id 关联——on_text 持续记录"正在
+ * 应答的轮 id",起轮时快照它(=被打断旧轮的 id);on_event 的 END 命中快照
+ * = 旧轮残留,丢弃不置 g_turn_done。event id 是 SDK 每轮新生成的,不会撞。*/
+static char g_answer_bizid[48];           /* 最近见到的回复轮 id(on_text 回调线程写) */
+static char g_stale_end_bizid[48];        /* 本轮起轮时 g_answer_bizid 的快照(语音循环线程写) */
+/* 作废旧轮的 TTS 残包排空窗:chat_break 只作废"当前轮"(ctx 里最近一次 audio_start
+ * 的 event-id),喇叭里正播的常是更早一轮的回话,云端不会停它——NLG/音频还会再流
+ * 几秒,on_audio 在窗口内全部丢弃。唤醒打断处置位,新轮 audio_start 清零关闭。*/
+static volatile unsigned int g_tts_drop_until; /* 排空窗截止时刻 ms(0=关) */
+static volatile unsigned int g_tts_drop_cnt;   /* 窗口内丢弃的下行帧计数(诊断) */
 static volatile int g_barge_in;           /* barge-in 触发:跳过 TTS 后清缓冲/冷却,直接进新一轮(TUYA_BARGE_IN_ENABLE)*/
 static volatile int g_exit;               /* on_disconnect 置位:令本次会话的语音循环退出(supervisor 稍后重连) */
 static volatile int g_link_broken;        /* 上行发送失败:链路已断,快速报废本次会话交 supervisor 重连(不等 60s 超时) */
@@ -126,11 +139,51 @@ static volatile unsigned s_mcp_text_break_sent;
 static volatile unsigned s_mcp_text_reply_deadline;
 #endif
 static volatile unsigned int g_barge_cooldown_until; /* barge-in 冷却到期 ms 时间戳;此前的 g_tts_playing 视为老轮在途残响,忽略(0=始终过期) */
+/* —— 唤醒词全程在线(TuyaOpen 语义:tdd_audio 驱动层无条件喂 KWS,IDLE/LISTEN/
+ *    UPLOAD/THINK 任何状态不关门)。JL 这边 KWS 帧来自各阶段的 mic 消费点:
+ *    idle 排空 + 上行循环 + TTS 等待/排空循环 + 音乐等待循环,命中即视为
+ *    "万能打断"。
+ *    只在 KWS 的 on_wake 里置位;不加 ifdef:music_handoff/on_wake(MUSIC 路径)
+ *    也要引用,KWS 关闭时恒 0 无副作用。*/
+static volatile int g_wake_hit;             /* 本拍 KWS 命中,由当前所处阶段的循环就地处理 */
+static volatile int g_wake_prompt_pending;  /* 播放中命中:提示音由打断序列停播后再播(不抢 DAC) */
+static volatile int g_wake_break;           /* 唤醒打断了本轮:④ 的 TTS 排空收尾与 pending 音乐跳过 */
+#ifdef TUYA_MUSIC_ENABLE
+static volatile int g_music_handoff;        /* 音乐停乐→TTS 播放器恢复之间的 DAC 交接窗:
+                                             * 此窗口命中唤醒,提示音延后到恢复后再播 */
+/* 音乐被能量抢答停掉后的"哑火"补救:音乐+人声经 AEC 双讲削损后,引擎对唤醒词
+ * 连一个 token 都提不出来(实测探针零命中,安静时 k27=0.886)——抢答停了音乐、
+ * 没提示音没回复,用户只会觉得"第一次喊没反应"。停乐后若 2.5s 内没有命令起轮
+ * 且 VAD 已关(=刚才那声其实是唤醒词),补播提示音并打开 15s 追问窗。*/
+#define TUYA_BARGE_PROMPT_WAIT_MS 2500u
+static volatile int g_barge_prompt_wait;
+static volatile unsigned g_barge_prompt_deadline;
+static volatile unsigned g_last_wake_alert; /* 最近一次播"我在"的时刻(on_wake 与哑火补救
+                                             * 共用去重窗):哑火刚播完、引擎随后把词迟到
+                                             * 补认出来时,on_wake 不再重播第二个提示音 */
+/* 唤醒词在抢答停乐/停TTS 过程中被识别(TuyaOpen wakeup 语义):on_wake 已置
+ * pending/吞咽,但抢答路径已把含唤醒词的历史装进 prefill——那轮上行只会让
+ * 云端听到"嘿tuya"并回一句废话(2026-09-05 实测 ASR"对嗯"→云端回"好的",
+ * 用户听到提示音和云端回复混着来)。置位后主循环作废带 prefill 的抢答轮。
+ * 10s 时限:过期后的抢答轮是全新事件,不受上一次唤醒影响。*/
+#define TUYA_WAKE_SUPPRESS_BARGE_MS 10000u
+static volatile int g_wake_suppress_barge;
+static volatile unsigned g_wake_suppress_barge_until;
+/* 先判后恢复:music_handoff 里要播提示音/判抢答后续的路径,不再先恢复 TTS 播放器
+ * (先恢复、马上又要停它换 mp3,白折腾 ~0.4s——音乐唤醒应答慢的主因),置位把
+ * 恢复推迟到下一次起轮时(主循环 g_turn_done=0 前):回话 TTS 至少 ~1.5s 后才
+ * 到,必定赶得上;提示音播 mp3 期间也不开 opus 抢 DAC。正常播完/下载失败路径
+ * 仍当场恢复。*/
+static volatile int g_player_restore_pending;
+#endif
 #ifdef TUYA_MUSIC_ENABLE
 static volatile int g_music_playing;   /* app_music 网络音乐播放中:期间不上行(音乐回采会假触发 VAD),播完回听音 */
 /* dec_end 回调(app_music 解码事件上下文触发):整首播完/下载解码出错停机。
  * 只清标志——不在此碰播放器(跨线程),TTS 播放器的恢复由语音循环侧做。*/
 static void tuya_music_dec_end_cb(int arg) { (void)arg; g_music_playing = 0; }
+#endif
+#ifdef TUYA_KWS_ENABLE
+#include "tuya_kws.h"   /* 唤醒词("嘿tuya")引擎薄封装: init/feed/唤醒窗门控 */
 #endif
 extern unsigned int timer_get_ms(void);   /* system/timer.h,单调 ms */
 /* barge-in 冷却是否已过:过期=可受理新 g_tts_playing 信号(云端真回话/真打断);
@@ -375,6 +428,12 @@ void on_dp_schema_update(const char *schema_id, const char *new_schema, void *us
 static void on_text(tai_ctx_t *ctx, const tai_text_msg_t *msg, void *ud)
 {
     (void)ctx; (void)ud;
+    /* 记录当前回复轮 id(文本各分片的 event_id 一致 = 本轮 event-id):
+     * on_event 据此识别"被打断旧轮"的残留 END(见 g_stale_end_bizid 注释)。*/
+    if (msg->event_id && msg->event_id[0]) {
+        strncpy(g_answer_bizid, msg->event_id, sizeof(g_answer_bizid) - 1);
+        g_answer_bizid[sizeof(g_answer_bizid) - 1] = '\0';
+    }
     printf("[TUYA-AI] %.*s\r\n", (int)msg->len, msg->text);
 #ifdef TUYA_MUSIC_ENABLE
     /* 并行重组文本流:音乐 SKILL 是一份可跨分片的完整 JSON,拼完才能解析
@@ -403,6 +462,21 @@ static void on_audio(tai_ctx_t *ctx, const tai_audio_msg_t *msg, void *ud)
         return;
     }
 #endif
+    /* 唤醒/打断作废轮的 TTS 残包排空窗(仿上方 MCP 排空窗):2026-09-05 实测,
+     * 故事 TTS 中唤醒成功、播完"我在"后,旧轮回话的尾巴又续播 ~5s("…你平时
+     * 也喜欢涂鸦画画吗?")——chat_break 作废的是刚起的空轮,正在播的那轮云端
+     * 不停。窗口内下行帧全丢,每丢一帧顺延 1.5s,静默 1.5s 自然关窗;新轮
+     * audio_start 处显式清零,新轮回话不受影响。*/
+    if ((int)(timer_get_ms() - g_tts_drop_until) < 0) {
+        if ((g_tts_drop_cnt & 31u) == 0) {
+            printf("[TUYA] drop stale TTS of broken turn (cnt=%u..)\r\n", g_tts_drop_cnt);
+        }
+        g_tts_drop_cnt++;
+        g_tts_drop_until = timer_get_ms() + 1500;   /* 残包还会来:顺延排空窗 */
+        _device_rbuf_clear();
+        g_tts_playing = 0;
+        return;
+    }
     /* 任意下行帧到达即视为 TTS 正在播放;END 显式清(TAI_EVT_END 再兜底清一次) */
     g_tts_playing = (msg->stream_flag == TAI_STREAM_END) ? 0 : 1;
 
@@ -485,19 +559,413 @@ static void mcp_resp_pump(tai_ctx_t *ctx)
            drops ? " (pending overwritten!)" : "");
 }
 
+#define TUYA_OPUS_FRAME_LEN 1280   /* PCM 16k/16bit/mono 40ms = 1280B/帧(原 opus 180B 改 PCM) */
+static void opus_frame_stat(const unsigned char *p, int len,    /* 定义在后,先声明给 music_handoff 用 */
+                            unsigned int *out_sum, unsigned int *out_act);
+
+/* ---- barge-in 话音历史:播放循环滚动缓存最近 ~1.8s 已消费帧 ----
+ * TTS/音乐播放期间循环必须持续读帧防 cbuf 溢出(只喂 KWS/丢弃),而能量
+ * barge-in 确认只要 3 帧(~120ms)——用户从开口到确认之间的命令头部全丢在
+ * 循环里。2026-09-05 实测:音乐中喊"给我放一首周杰伦的歌",云端只收到尾部
+ * "伦的歌。"。barge-in 命中时把历史线性化进 g_barge_prebuf 作上行 prefill
+ * 补发,云端才能听到完整命令。push 每帧 memmove 57KB@25Hz≈1.4MB/s,可承受;
+ * 线性化只在 barge 命中(罕见)时执行一次。*/
+#define BARGE_HIST_FRAMES   45    /* 45*40ms=1.8s 滚动窗口 */
+#define BARGE_PREBUF_FRAMES 60    /* prebuf 容量:hist45+确认3+裕量 */
+static unsigned char g_barge_prebuf[1280 * BARGE_PREBUF_FRAMES] __attribute__((aligned(4)));   /* 转 short* 进 opus 编码,align 1 全局无偶地址保证,同 abuf */
+static unsigned int g_barge_prefill;
+static unsigned char s_barge_hist[1280 * BARGE_HIST_FRAMES] __attribute__((aligned(4)));
+static unsigned int  s_barge_hist_cnt;    /* 有效帧数(≤45, newest 在尾部) */
+
+/* 播放循环每读一帧调一次:进历史环形窗(满则挤掉最旧) */
+static void barge_hist_push(const unsigned char *frame)
+{
+    if (s_barge_hist_cnt < BARGE_HIST_FRAMES) {
+        memcpy(s_barge_hist + s_barge_hist_cnt * 1280, frame, 1280);
+        s_barge_hist_cnt++;
+    } else {
+        memmove(s_barge_hist, s_barge_hist + 1280, (BARGE_HIST_FRAMES - 1) * 1280);
+        memcpy(s_barge_hist + (BARGE_HIST_FRAMES - 1) * 1280, frame, 1280);
+    }
+}
+
+/* 历史整体(旧→新)作为上行 prefill,接在 prebuf 已有帧(确认帧)之后,复位历史。
+ * 调用点:barge-in 确认命中后、停乐排空后——下一轮上行把它们补在最前。*/
+static void barge_hist_to_prefill(void)
+{
+    if (s_barge_hist_cnt == 0) {
+        return;
+    }
+    memmove(g_barge_prebuf + s_barge_hist_cnt * 1280, g_barge_prebuf,
+            g_barge_prefill * 1280);
+    memcpy(g_barge_prebuf, s_barge_hist, s_barge_hist_cnt * 1280);
+    g_barge_prefill += s_barge_hist_cnt;
+    s_barge_hist_cnt = 0;
+    printf("[TUYA] barge history -> prefill %u frames\r\n", g_barge_prefill);
+}
+
+/* TTS barge-in 确认命中收尾:确认帧已在 barge_in_energy_confirmed 读帧时喂 KWS
+ * +入历史(成功/失败都进,保语音流连续),这里只剩历史→prefill 的线性化。*/
+static void barge_in_prefill_arm(void)
+{
+    barge_hist_to_prefill();
+}
+
+/* 抢答停播后判断用户是否还在继续说(命令)还是只说了句短话(多半是没识别出的
+ * 唤醒词):VAD 连续开 ≥300ms=真在说→正常起 prefill 轮;连续关 ≥350ms=说完了
+ * →丢弃该轮交给哑火补救播"我在"(上行只会让云端收到"哎嗯"式残响回"你怎么
+ * 了呀",2026-09-05 22:29 实测)。closed_since 传入进入前"已连续关闭"的起点
+ * (0=刚还开着):停播→判定前的排空/等 DAC 耗时也计入连续关闭时长,无后续
+ * 语音时很快即可判出;1.5s 上限兜底。
+ * ★ VAD 开着不能立刻判"在说"(23:49 实测:词说完后 VAD 挂账 ~250-500ms,
+ * 首拍采样撞上挂账尾→误判"有后续"→起轮等不来下文,既无提示音也无哑火,
+ * 用户喊了没反应)。挂账活不过 300ms 连续开,真命令则一直开——持久性一测
+ * 便知。真命令首拍起 300ms 后放行,多付的延迟命令语音自己就盖过去了。*/
+static int barge_followup_wait(unsigned int closed_since)
+{
+    unsigned int t0 = timer_get_ms();
+    unsigned int open_since = 0;
+    while (!g_exit) {
+        unsigned int now = timer_get_ms();
+        if (get_recoder_state()) {
+            closed_since = 0;
+            if (!open_since) {
+                open_since = now;
+            }
+            if (now - open_since >= 300u) {
+                return 1;
+            }
+        } else {
+            open_since = 0;
+            if (!closed_since) {
+                closed_since = now;
+            }
+            if (now - closed_since >= 350u) {
+                return 0;
+            }
+        }
+        if (now - t0 >= 1500u) {
+            return 0;
+        }
+        msleep(20);
+    }
+    return 0;
+}
+
+#ifdef TUYA_MUSIC_ENABLE
+/* ------------------------------------------------------------------------- */
+/* ⑤ 音乐技能交接:本轮云端回了音乐 SKILL(试听 mp3 URL,解析见 tuya_music.c)。
+ * TTS 排空把"正在为您播放…"播完 → 停我们的 TTS 解码器让出 DAC → 交给
+ * app_music 网络解码(net_download,https 自动 TLS)→ 等整首播完
+ * (dec_end 回调清 g_music_playing)→ 重启 TTS 播放器,回 ① 继续听音。
+ * ★ 播放期间不上行(音乐回采不该进 ASR),但可 barge-in 停乐:照搬 TTS drain
+ *   的"VAD+能量门"双确认(见下面等待循环)。AEC 对连续音乐的效果未验证,
+ *   故开头 1s 不设防、每秒打一次 mic 能量基线([MUSIC-DBG]),实测误触发
+ *   ("音乐自己把自己打断")就调 BARGE_MIN_ENERGY。
+ *   唤醒词同样可停乐(KWS 全程在线,同一循环喂帧,先于 barge-in 判)。
+ * ★ DAC 交接前后各等 300ms:两个解码器共享 DAC,边停边开会踩到
+ *   subdevice_dac 的格式重配断言(2026-08-27 提示音教训)。
+ * 抽成函数有两个调用点:正常=轮末(④ TTS 排空后);兜底=idle 分支——旧轮残留
+ * END 把等待提前骗退/回包晚到时音乐已挂起却无人接管(2026-09-05 修复)。*/
+static void music_handoff(tai_ctx_t *ctx)
+{
+    if (tuya_music_pending() && !g_link_broken) {
+        /* 新一场音乐=全新上下文:清掉上一场遗留的"唤醒作废抢答轮"标记,
+         * 否则它(10s 时限内)会让本场的抢答短句跳过哑火判断(实测时序漏洞:
+         * 上一场的标记可能整个本场前半程都没经过主循环去过期)。*/
+        g_wake_suppress_barge = 0;
+        char murl[512];
+        strncpy(murl, tuya_music_get_url(), sizeof(murl) - 1);
+        murl[sizeof(murl) - 1] = '\0';
+        printf("[TUYA-MUSIC] play: %s - %s\r\n",
+               tuya_music_get_artist(), tuya_music_get_name());
+        tuya_music_clear_pending();          /* 先消费:防下轮误重播 */
+        _device_net_audio_play(0);           /* 停 TTS 解码器:让出 DAC */
+        msleep(300);                         /* 等 audio_server 释放 DAC */
+        g_music_playing = 1;
+        if (app_music_tuya_play_url(murl, tuya_music_dec_end_cb) != 0) {
+            printf("[TUYA-MUSIC] start play fail, restore TTS player\r\n");
+            g_music_playing = 0;
+            msleep(300);
+            _device_net_audio_play(1);       /* 恢复 TTS 播放器 */
+        } else {
+            /* 等播完(试听 ~30s,整首几分钟;600s 兜底防卡死)。
+             * 退出条件:dec_end 回调清 g_music_playing(播完/解码停机);
+             * 或 busy=0——下载失败路径 __net_music_dec_file 的 __err 不走
+             * dec_end 回调,靠 net_file 已被关闭置空感知,别傻等 600s。
+             * _device_get_voice_data 内部按帧节拍(~40ms)阻塞,顺带排空 mic:
+             * 音乐回采不积压,播完立刻干净听音(不会把音乐尾巴当新问题)。
+             * barge-in(TUYA_BARGE_IN_ENABLE,判据照搬 barge_in_energy_confirmed):
+             *   VAD 在线 + 3 帧连续(120ms) sum≥BARGE_MIN_ENERGY 才停乐,断一帧
+             *   就重数——滤掉音乐瞬态拍子。若 AEC 把音乐消得够低,音乐回声到不了
+             *   门槛,只有贴脸的人声能过;实测过不了关就调门槛。
+             *   开头 25 帧(1s)不设防:避开 DAC 交接瞬态和曲首重拍。*/
+            unsigned int mstart = timer_get_ms();
+            s_barge_hist_cnt = 0;   /* 历史从本曲起算:打断补发只含音乐期间的话音 */
+            int mbarge = 0, mwake = 0;           /* 停乐原因: barge-in 抢答打断 / 唤醒词打断 */
+#ifdef TUYA_BARGE_IN_ENABLE
+            unsigned int mframes = 0, mhi = 0;   /* 帧计数 / 连续达标帧数 */
+            unsigned int msums[3] = {0, 0, 0};
+#endif
+            while (!g_exit && !g_link_broken && g_music_playing &&
+                   app_music_tuya_music_busy() &&
+                   timer_get_ms() - mstart < 600000) {
+                unsigned char _mt[TUYA_OPUS_FRAME_LEN];
+                if (_device_get_voice_data(_mt, sizeof(_mt)) != sizeof(_mt)) {
+                    continue;               /* 读不够一帧:等下一拍再来 */
+                }
+                tai_log_flush();            /* 音乐长循环(可达10min)也保持库日志节拍 */
+                mcp_resp_pump(ctx);
+                barge_hist_push(_mt);       /* 音乐期帧进 barge 历史:打断时补发命令头部 */
+#ifdef TUYA_KWS_ENABLE
+                /* KWS 全程在线:音乐播放期也喂唤醒词(帧已到手不浪费)。命中即停乐
+                 * (TuyaOpen wakeup 回调的 player_stop 语义),提示音等恢复 TTS 播放器
+                 * 后再播(on_wake 已置 pending,见循环后)。*/
+                tuya_kws_feed(_mt, sizeof(_mt));
+                if (g_wake_hit) {
+                    g_wake_hit = 0;
+                    printf("[TUYA-MUSIC] wake stops music\r\n");
+                    mwake = 1;
+                    break;
+                }
+#endif
+#ifdef TUYA_BARGE_IN_ENABLE
+                mframes++;
+                unsigned int mes, mea;
+                opus_frame_stat(_mt, sizeof(_mt), &mes, &mea);
+                if ((mframes % 25) == 0) {  /* 每 ~1s 打能量基线:调门槛看这个 */
+                    printf("[MUSIC-DBG] playing, mic post-AEC: sum=%u act=%u%% rec=%d\r\n",
+                           mes, mea, get_recoder_state());
+                }
+                if (mframes > 25 && get_recoder_state() && mes >= BARGE_CONFIRM_ENERGY) {
+                    msums[mhi++] = mes;
+                    if (mhi >= 3) {         /* 3 帧连续达标:确认真话音,停乐 */
+                        printf("[TUYA-MUSIC] barge-in: stop music (sums=%u,%u,%u)\r\n",
+                               msums[0], msums[1], msums[2]);
+                        mbarge = 1;
+                        /* 后续上行轮走 barge-in 路径:跳过起轮能量门(否则门会重读
+                         * 1 帧覆盖 prefill)且豁免唤醒窗(窗可能早已过期)。*/
+                        g_barge_in = 1;
+                        break;
+                    }
+                } else {
+                    mhi = 0;                /* VAD 掉线/能量掉线:重数 */
+                }
+#endif
+            }
+            g_music_handoff = 1;             /* 进入 DAC 交接窗:停乐→恢复期间命中唤醒,提示音延后 */
+            if (g_music_playing) {           /* 超时/失败/打断/退出:强停,防 DAC 被占死 */
+                printf("[TUYA-MUSIC] stop (%s)\r\n",
+#ifdef TUYA_BARGE_IN_ENABLE
+                       mbarge ? "barge-in" :
+#endif
+                       mwake ? "wake" :
+                       app_music_tuya_music_busy() ? "timeout/exit" : "download/decode fail");
+                app_music_tuya_music_stop();
+                g_music_playing = 0;
+            }
+            if (mbarge || mwake) {           /* 停乐后排 ~300ms 残响:打断词/唤醒词与音乐混叠,
+                                               本轮已作废不清会被音乐尾巴当下句触发假轮 */
+                unsigned char _mt[TUYA_OPUS_FRAME_LEN];
+                for (int i = 0; i < 8 && !g_exit; i++) {
+                    if (_device_get_voice_data(_mt, sizeof(_mt)) == sizeof(_mt)) {
+#ifdef TUYA_KWS_ENABLE
+                        /* 残响帧喂引擎不丢弃:能量 barge-in 确认(~120ms)抢在唤醒词
+                         * 识别完成(~600ms)前停乐,词尾正好落在这 8 帧里——丢了它
+                         * KWS 流断一截,词永远补不中(2026-09-05 实测根因)。喂进去,
+                         * 词在此处或后续 idle 排空里补完命中,on_wake 置 pending。*/
+                        tuya_kws_feed(_mt, sizeof(_mt));
+#endif
+                        barge_hist_push(_mt);   /* 残响若是命令尾部,一并进 prefill 补发 */
+                    }
+                }
+            }
+            if (mbarge) {
+                barge_hist_to_prefill();   /* 音乐期间的话音(含残响)整体转上行 prefill:
+                                            * 2026-09-05 实测不补发则云端只听到"伦的歌。"*/
+            }
+#ifdef TUYA_KWS_ENABLE
+            /* mbarge 判"后续话音"的种子(见 barge_followup_wait):此刻 VAD 已关=
+             * 停乐前短句已说完(唤醒词典型);还开着=在继续说(命令)。停乐后的
+             * 排空/等待耗时也计入连续关闭时长。*/
+            unsigned int vclosed_since = get_recoder_state() ? 0 : timer_get_ms();
+#endif
+            /* 等音乐解码器释放 DAC(总时长仍 300ms),切片顺带追 VAD 关闭时刻:
+             * 词尾挂账常在这段里到期(23:49 实测 06.648 关、整段睡完才看到,
+             * 白多等 190ms)。vclosed_since 抓到真关闭点,后面的关闭确认从此起算。*/
+            unsigned int _rwait = timer_get_ms();
+            while (!g_exit && timer_get_ms() - _rwait < 300u) {
+#ifdef TUYA_KWS_ENABLE
+                if (get_recoder_state()) {
+                    vclosed_since = 0;
+                } else if (!vclosed_since) {
+                    vclosed_since = timer_get_ms();
+                }
+#endif
+                msleep(20);
+            }
+            g_player_restore_pending = 0;    /* 先判后恢复:默认下面当场恢复,要走提示音/
+                                             * 抢答路径的分支改为置位推迟(见全局注释) */
+#ifdef TUYA_KWS_ENABLE
+            if (g_wake_prompt_pending) {     /* 唤醒停乐/排空期补中:不先恢复播放器,
+                                             * 直接播应答提示音(mp3 独立开,免一次
+                                             * "恢复 opus→停 opus→开 mp3"的折腾) */
+                g_wake_prompt_pending = 0;
+                printf("[TUYA] wake alert: WakeHeyTuya.mp3\r\n");
+                app_music_tuya_play_wake_prompt();
+                g_player_restore_pending = 1;   /* 播放器恢复推迟到下一轮起轮 */
+            }
+#endif
+            g_music_handoff = 0;             /* 交接完成,退出 DAC 保护窗 */
+#ifdef TUYA_KWS_ENABLE
+            if (mbarge && !g_wake_prompt_pending && !g_wake_hit) {
+                /* 抢答拦下的短句,引擎没认出唤醒词(AEC 双讲削损,同场景实测
+                 * 成功率约一半):判用户是否还在继续说——VAD 连续开 300ms=命令,
+                 * 起 prefill 轮上行;连续关 350ms=短句已说完,多半是没识别出的
+                 * 唤醒词,不起轮——上行只会让云端收到"哎嗯"回"你怎么了呀"
+                 * (2026-09-05 22:29 实测),交给哑火补救补播"我在"。判法见
+                 * barge_followup_wait(vclosed_since 含停乐/排空等待耗时)。
+                 * ★ g_wake_hit:排空期引擎把词补认出来了(on_wake 已置 pending
+                 * 播过提示音+suppress 作废 prefill 轮)——这里必须整个跳过,
+                 * 23:49 实测没跳过→"无后续"分支武装哑火,主循环 20ms 后又播
+                 * 第二个"我在"(反应两次)。
+                 * ★ 判"有后续"也留安全网:持久性判错(噪音/长挂账骗过 300ms)
+                 * 时起轮等不来下文,1.5s 内没起轮且 VAD 关→主循环照样补"我在",
+                 * 不再出现"喊了没反应"式死寂(23:49 42s 实测:挂账尾 6ms 撞上
+                 * 首拍→误判有后续→之后无任何反馈)。真命令起轮当拍即 disarm。*/
+                if (barge_followup_wait(vclosed_since)) {
+                    printf("[TUYA-MUSIC] follow-up speech → uplink barge turn\r\n");
+                    g_barge_prompt_wait = 1;   /* 安全网:1.5s 内没起轮且 VAD 关→补播 */
+                    g_barge_prompt_deadline = timer_get_ms() + 1500u;
+                    g_player_restore_pending = 1;   /* 命令回话要用:起轮时恢复播放器
+                                                     * (距音乐解码器关闭已 >1s,无碰撞) */
+                } else {
+                    printf("[TUYA-MUSIC] no follow-up → drop prefill turn (likely wake)\r\n");
+                    g_barge_prefill = 0;
+                    g_barge_in = 0;
+                    g_barge_prompt_wait = 1;
+                    g_barge_prompt_deadline = timer_get_ms();   /* VAD 已关:主循环下一拍即补播 */
+                    g_player_restore_pending = 1;   /* 哑火播提示音后,恢复同样推迟到起轮 */
+                }
+            }
+#endif
+            if (!g_player_restore_pending) {
+                _device_net_audio_play(1);   /* 正常播完/下载失败(无提示音、无抢答):
+                                              * 当场恢复播放器,原行为 */
+            }
+            printf("[TUYA-MUSIC] done, back to listening\r\n");
+        }
+    }
+}
+#endif /* TUYA_MUSIC_ENABLE */
+
+/* KWS 唤醒命中回调(tuya_kws.c WAKE 分支同线程调用): 播本地应答提示音。
+ * 时机照搬 TuyaOpen __ai_mode_kws_wakeup() 的 ai_audio_player_alert(WAKEUP):
+ * 唤醒即播、不占听音窗——提示音走 app_music 解码器, 与 mic 上行并行,
+ * AEC 会把提示音回采从 mic 消掉(实测 TTS/音乐播放期 VAD 不误触发)。
+ * 同时做 TuyaOpen ai_audio_input_reset()(丢唤醒词尾巴)的 JL 等价动作:
+ * 无 ringbuf reset 钩子,改为开"吞咽窗"——见 g_wake_swallow 与主循环唤醒门。*/
+#ifdef TUYA_KWS_ENABLE
+#define TUYA_WAKE_SWALLOW_MS 900u  /* 兜底:连说"嘿tuya今天星期几"只丢接缝,不吞掉问题 */
+static int      g_wake_swallow;             /* 吞咽窗激活: 只排空不上行 */
+static unsigned g_wake_swallow_deadline;    /* 吞咽兜底截止时刻 */
+#endif
+void tuya_agentic_on_wake(void)
+{
+#ifdef TUYA_MUSIC_ENABLE
+    g_barge_prompt_wait = 0;   /* 引擎真识别出唤醒词(抢答后迟到补中也算):哑火补救撤销,
+                                * 否则 2.5s 到点会再播一遍提示音 */
+    /* 同一句话双命中去重:heytuya2{27,8,22} 前缀窗(~0.3s 处)先中,heytuya
+     * {27,8,22,5} 全词窗(~0.9s 处)后中,两次 WAKE 相隔 0.3~0.6s(2026-09-05
+     * 实测 f=7272..7275 与 f=7272..7299 同起点)。提示音只播一次,1.5s 内的
+     * 后续命中视为同句;窗/吞咽仍照常续期(词尾还在进来)。
+     * 时间戳是全局 g_last_wake_alert:哑火补救播的"我在"也盖章——排空期喂进去
+     * 的词尾常在哑火播完后才补认完,on_wake 迟到命中不会再播第二个(23:49
+     * 实测风险路径)。*/
+    unsigned now = timer_get_ms();
+    if ((unsigned)(now - g_last_wake_alert) >= 1500u) {
+        g_last_wake_alert = now;
+        if (g_tts_playing || g_music_playing || g_music_handoff) {
+            /* TTS/音乐播放中(或停乐→恢复 TTS 播放器的交接窗)命中(TuyaOpen
+             * __ai_mode_kws_wakeup:唤醒词=万能打断):此刻不播提示音——app_music
+             * 的 mp3 解码器和正播着的 TTS/音乐解码器抢 DAC,交接窗里 DAC 也还没
+             * 交接完。置 pending,由打断序列停播/恢复后再播。*/
+            printf("[TUYA] wake during playback, interrupting\r\n");
+            g_wake_prompt_pending = 1;
+            /* 抢答路径已把话音历史(含这句唤醒词)装进 prefill:那轮上行作废,
+             * 否则云端收到裸唤醒词回废话(见 g_wake_suppress_barge 注释)。*/
+            g_wake_suppress_barge = 1;
+            g_wake_suppress_barge_until = timer_get_ms() + TUYA_WAKE_SUPPRESS_BARGE_MS;
+        } else {
+            printf("[TUYA] wake alert: WakeHeyTuya.mp3\r\n");
+            app_music_tuya_play_wake_prompt();
+        }
+    } else {
+        printf("[TUYA] wake dup, alert suppressed\r\n");
+    }
+#endif
+#ifdef TUYA_KWS_ENABLE
+    g_wake_hit = 1;   /* 空闲命中由主循环唤醒门清掉;TTS/音乐循环里由打断分支消费 */
+    /* VAD 随"嘿"就开口了,WAKE 后它还开着的一轮装的是词尾(2026-09-05 实测
+     * ASR 收到"嗯?"就是这个):排空不上行,直到 VAD 关闭(词说完,下一句才是
+     * 问题)或 900ms 兜底(VAD 还开着=连着说,放行起轮只丢接缝处零点几秒)。*/
+    g_wake_swallow = 1;
+    g_wake_swallow_deadline = timer_get_ms() + TUYA_WAKE_SWALLOW_MS;
+#endif
+}
+
+#ifdef TUYA_KWS_ENABLE
+/* 唤醒词在 TTS 等待/播放阶段命中的打断收尾(对应 TuyaOpen wakeup 回调里的
+ * player_stop + CHAT_BREAK):作废本轮 + 清播放 cbuf 立刻停 TTS 喇叭。
+ * 不置 g_barge_in(那走高能量抢答路径)——吞咽窗已开,词尾由 idle 排空吞掉,
+ * 打断后直接回空闲听音,不起新轮。g_wake_break 让 ④ 收尾(TTS 到达/排空等待)
+ * 与 pending 音乐(本轮已作废)一并跳过。提示音此刻才播:TTS 解码器只清空
+ * 不断开,opus 开着播 app_music 的 mp3 与空闲唤醒同构,无 DAC 交接问题。*/
+static void wake_break_tts(tai_ctx_t *ctx)
+{
+    printf("[TUYA] wake breaks TTS → chat_break + stop\r\n");
+    tai_chat_break(ctx);              /* 通知云端中止本轮 TTS */
+    _device_rbuf_clear();             /* 清播放 cbuf,立刻停 TTS 喇叭 */
+    g_tts_playing = 0;
+    g_turn_done = 1;
+    g_wake_break = 1;
+    /* 正在播的旧轮回话(chat_break 够不到它)的残包排空窗:见 on_audio 注释。
+     * 3s 起步,残包每帧顺延 1.5s,来多少丢多少。*/
+    g_tts_drop_until = timer_get_ms() + 3000;
+    g_tts_drop_cnt = 0;
+#ifdef TUYA_MUSIC_ENABLE
+    if (g_wake_prompt_pending) {
+        g_wake_prompt_pending = 0;
+        printf("[TUYA] wake alert: WakeHeyTuya.mp3\r\n");
+        app_music_tuya_play_wake_prompt();
+    }
+#endif
+}
+#endif
+
 static void on_event(tai_ctx_t *ctx, const tai_event_msg_t *msg, void *ud)
 {
     demo_ctx_t *dc = (demo_ctx_t *)ud;
     if (msg->event_type == TAI_EVT_END) {
-        if (dc) {
-            dc->got_done = 1;            /* 兼容独立文本 demo */
-        }
+        /* 旧轮残留 END 判弃:barge-in 打断的上一轮,云端流(文本/TTS)可能拖到
+         * 新轮 ④ 等待期才收尾(实测晚 ~0.2s)。把它当本轮结束会提前骗退等待,
+         * 本轮晚到的音乐 SKILL 等回复无人消费 → "第一次放歌没反应,第二次才播"。
+         * END 的 event_id 命中"起轮时快照的旧轮 id" → 判为旧轮残留,只记日志。*/
+        if (msg->event_id && msg->event_id[0] && g_stale_end_bizid[0] &&
+            strcmp(msg->event_id, g_stale_end_bizid) == 0) {
+            printf("[TUYA-AI] stale END of interrupted turn (%s), ignored\r\n",
+                   msg->event_id);
+        } else {
+            if (dc) {
+                dc->got_done = 1;        /* 兼容独立文本 demo */
+            }
 #ifdef TUYA_MUSIC_ENABLE
-        tuya_music_text_flush();         /* SDK 丢空文本帧:半截流可能等不到显式 END,兜底交付解析 */
+            tuya_music_text_flush();     /* SDK 丢空文本帧:半截流可能等不到显式 END,兜底交付解析 */
 #endif
-        g_turn_done   = 1;
-        g_tts_playing = 0;
-        printf("[TUYA-AI] === 回答结束 ===\r\n");
+            g_turn_done   = 1;
+            g_tts_playing = 0;
+            printf("[TUYA-AI] === 回答结束 ===\r\n");
+        }
     } else if (msg->event_type == TAI_EVT_SERVER_VAD) {
         /* 云端 VAD 检测到用户停说(endpointing)。TUYA_SERVER_VAD_ENABLE 模式下,
          * 置位标志让上行循环退出收尾(发 audio_end → 等回复)。开口仍由本地VAD负责。*/
@@ -797,32 +1265,185 @@ static void opus_frame_stat(const unsigned char *p, int len,
 #ifdef TUYA_BARGE_IN_ENABLE
 /* 能量确认读走的 onset 帧保留进 g_barge_prebuf,barge-in 新上行时补发——否则确认消耗的
  * ~120ms(常是打断 onset,最响那段)丢失,后续上行只收到尾音/静音→ASR 空(实测"明天去哪玩"
- * 被 barge-in 切了却没播报,即此)。g_barge_prefill=有效帧数,仅确认通过时置。
- * 容量 12 帧(480ms):确认帧占前 3 帧；余量保留给后续可能扩展的 onset 缓存。*/
-static unsigned char g_barge_prebuf[1280 * 12] __attribute__((aligned(4)));   /* 转 short* 进 opus 编码,align 1 全局无偶地址保证,同 abuf */
-static unsigned int g_barge_prefill;
+ * 被 barge-in 切了却没播报,即此)。g_barge_prefill=有效帧数:起轮能量门置 1(onset),
+ * 历史转换(barge_hist_to_prefill)累加;barge prefill 的补发点在上行 prefill 循环。
+ * g_barge_prebuf/g_barge_prefill 定义在 music_handoff 前(音乐打断的 hist→prefill 也要用)。*/
 /* barge-in 能量确认:VAD 触发时连读 3 帧(≈120ms),3 帧 sum 均≥BARGE_MIN_ENERGY 才算真话音。
  * 滤掉 AEC 残留回声/噪音的瞬时 spike——TTS 念密集数字(金价等)时某个响音爆破会在 1~2 帧内冲过
  * 阈值(实测 2-of-2 被这种 spike 骗过,误切断金价播报),要求 3 帧持续能量才能把 ≤2 帧的 spike 滤掉。
  * 真话音 onset 通常持续 >120ms,正常通过。代价:确认比 2 帧多 40ms。漏判会下轮询(20ms)重试。
- * 读到的帧存 g_barge_prebuf 供新上行补发,不再丢弃。帧长 1280=PCM 16k/16bit/mono 40ms。*/
+ * ★ 读走的帧一律喂 KWS+入历史,不白吃:VAD 开着时本函数每轮询消耗 3 帧,失败即丢的话
+ *   引擎/历史只见到 1/4 的语音流(每 4 帧一个 3 帧洞)——词匹配不上、prefill 送云端也是
+ *   断的(2026-09-05 21:36 实测:能量 5M+ 的真话音三连空 ASR、KWS 零探针命中)。
+ *   成功时帧已在历史里,由 barge_in_prefill_arm→hist_to_prefill 统一转 prefill。*/
+static unsigned int g_barge_cfm_maxsum;  /* 最近一次确认读到的最大帧能量:tts_barge_poll 的
+                                          * 低门限旁路要用它区分"回声开 VAD"和"压弱的真人声" */
 static int barge_in_energy_confirmed(void)
 {
     unsigned int s, a, hi = 0, k, n = 0;
     unsigned int sums[3] = {0, 0, 0};
+    g_barge_cfm_maxsum = 0;
     for (k = 0; k < 3 && !g_exit; k++) {
         if (_device_get_voice_data(&g_barge_prebuf[k * 1280], 1280) != 1280) break;
         opus_frame_stat(&g_barge_prebuf[k * 1280], 1280, &s, &a);
         sums[k] = s;
+        if (s > g_barge_cfm_maxsum) g_barge_cfm_maxsum = s;
         if (s >= BARGE_CONFIRM_ENERGY) hi++;
         n++;
+#ifdef TUYA_KWS_ENABLE
+        tuya_kws_feed(&g_barge_prebuf[k * 1280], 1280);
+#endif
+        barge_hist_push(&g_barge_prebuf[k * 1280]);
     }
     if (hi >= 3 && n >= 3) {   /* 3-of-3:滤 ≤2 帧 spike;读不够 3 帧也算失败 */
-        g_barge_prefill = n;
         printf("[TUYA] barge-in confirm 3/3 (sums=%u,%u,%u)\r\n", sums[0], sums[1], sums[2]);
         return 1;
     }
-    return 0;   /* 失败不动 prefill;sums 不打(误触发每秒数次,太吵) */
+    return 0;   /* 失败:帧已喂引擎/入历史,不浪费;sums 不打(误触发每秒数次,太吵) */
+}
+#endif
+
+#if defined(TUYA_BARGE_IN_ENABLE) && defined(TUYA_KWS_ENABLE) && defined(TUYA_MUSIC_ENABLE)
+/* TTS 播放期抢答的检测+处置(对齐 music_handoff 的"停播→排空→判后续")。
+ * 2026-09-06 实测故事 TTS 中喊唤醒词 5 次全失败,两种死法:
+ * ① 能量确认过不了——TTS 连续人声下 AEC 双讲抑制把重叠话音整句压到 60 万
+ *   门限下,本地 VAD 明明开着却整句被判"energy low ignored",故事照播、
+ *   毫无反应;② 确认过了(往往词已说完)盲目起 prefill 轮——prefill 全是
+ *   故事回声残响+被削损的词,ASR 空→云端不回,故事白死+死寂。
+ * 修法两层:
+ * ① 触发放宽:能量 3/3 之外,加"VAD 连续开 ≥500ms 且期间帧能量峰值 ≥50万"
+ *   旁路。★ VAD 会被 TTS 回声打开(回声也是人声形状,AEC 削得了平均能量
+ *   削不掉峰值)——2026-09-06 三轮实测:(a)故事前奏纯回声开 VAD 600ms+,
+ *   峰值 25.8万;(b)走完"放歌→唤醒停乐→恢复TTS"流程后 AEC 整体劣化(音频
+ *   设备被切到 48k/src=1 没回去),故事期回声均值 15-25万、尖峰 52-57万,
+ *   恰好过 50万底线,没人说话也把故事假"唤醒"杀掉两次。能量维度上它与
+ *   双讲压弱的真人声重叠,没有可靠分界——ignored/触发都打 peak,靠日志校。
+ * ② 处置分两级。confirm(3×60万,响亮真人声)→ 立即全套:chat_break+停播
+ *   +哑火兜底(原行为)。persistent 旁路 → 先只"本地静音"(清 rbuf 停喇叭,
+ *   不 chat_break,云端 TTS 继续进 rbuf)+排空喂引擎+判后续:引擎认出唤醒词
+ *   (真词必让引擎 WAKE,回声从不——同日实测 4 真全中/2 假全不中,k27+k08
+ *   序列是唯一可靠判别)或有后续话音 → 此刻才 chat_break 按唤醒/命令收尾;
+ *   都没有 → 回声假警报,恢复播放(rbuf 里故事还在,跳过静音 ~1s 接着播),
+ *   冷却加长 5s 压劣化态 ~2s 一簇的回声。
+ * 返回:0=未触发/假警报已恢复播放(调用方继续轮询);非0=已处置完(抢答轮
+ * 已布防 g_barge_in=1,或已按唤醒收尾 g_turn_done/g_wake_break 置位回空闲),
+ * 调用方 break。*/
+#define TUYA_TTS_VAD_PERSIST_MS     500u    /* VAD 连续开旁路的时长门槛:唤醒词 ~0.6s(实测 0.62/0.66s) */
+#define TUYA_TTS_PERSIST_MIN_ENERGY 500000u /* 同一旁路的能量底线:实测 TTS 回声窗口峰值 25.8万
+                                             * (2026-09-06),取 ~2 倍防更响的段落;它与 60万确认门
+                                             * 之间的窄带就是旁路的价值:峰值够高但凑不齐连续 3 帧 */
+#define TUYA_TTS_ECHO_COOLDOWN_MS   5000u   /* 旁路假警报恢复播放后的加长冷却:AEC 劣化态回声 ~2s
+                                             * 一簇(2026-09-06 放歌流程实测),常规 1s 压不住,会连环
+                                             * "静音验证→跳 1s"把故事剪碎 */
+#define TUYA_TTS_VERIFY_MUTE_MS     2000u   /* 旁路静音验证的"真静音"时长:光清 rbuf 喇叭几十 ms 就
+                                             * 复响(云端 TTS 继续推包,2026-09-06 二轮实测 3 次验证
+                                             * 全被复响回声顶成"有后续"误判),必须同时开丢包窗让
+                                             * 验证期喇叭真停。覆盖排空 8 帧(~0.3s)+followup 判定
+                                             * (≤1.5s);假警报恢复 = 跳过这段(~≤2s)接着讲。*/
+static unsigned int g_tts_vad_open_since;   /* TTS 期 VAD 连续开口起点(0=已关);三处轮询点共用 */
+static unsigned int g_tts_vad_peak;         /* 本次 VAD 连开期间确认帧的能量峰值(取自 g_barge_cfm_maxsum) */
+static int tts_barge_poll(tai_ctx_t *ctx, const char *tag)
+{
+    if (!get_recoder_state() || !barge_cooldown_expired()) {
+        g_tts_vad_open_since = 0;   /* VAD 关/冷却中:连续开计时清零 */
+        g_tts_vad_peak = 0;
+        return 0;
+    }
+    if (!g_tts_vad_open_since) {
+        g_tts_vad_open_since = timer_get_ms();
+        g_tts_vad_peak = 0;
+    }
+    int confirmed = barge_in_energy_confirmed();   /* 读走的帧已喂引擎+入历史,不白吃 */
+    if (g_barge_cfm_maxsum > g_tts_vad_peak) {
+        g_tts_vad_peak = g_barge_cfm_maxsum;   /* 连开期间的能量峰值:旁路判"人声"的依据 */
+    }
+    int persistent = (timer_get_ms() - g_tts_vad_open_since) >= TUYA_TTS_VAD_PERSIST_MS &&
+                     g_tts_vad_peak >= TUYA_TTS_PERSIST_MIN_ENERGY;
+    if (!confirmed && !persistent) {
+        printf("[TUYA] barge-in%s: VAD fired but energy low (peak=%u), ignored\r\n", tag, g_tts_vad_peak);
+        return 0;
+    }
+    if (confirmed) {
+        printf("[TUYA] barge-in%s: energy confirm (peak=%u) → chat_break + stop TTS\r\n", tag, g_tts_vad_peak);
+        tai_chat_break(ctx);          /* 通知云端中止本轮 TTS */
+        g_tts_playing = 0;
+        g_tts_drop_until = timer_get_ms() + 3000;   /* 旧轮残包排空窗(同 wake_break_tts):
+                                                     * chat_break 够不到更早的轮,残包还会流 ~1.2s */
+        g_tts_drop_cnt = 0;
+    } else {
+        /* persistent 旁路:可能是双讲压弱的真人声,也可能是 AEC 劣化后的回声
+         * 尖峰(见头注释①b)——先只本地静音验证,不 chat_break、g_tts_playing
+         * 保持 1,验证不过可原样恢复播放。★光清 rbuf 不算静音:云端 TTS 继续
+         * 推包,喇叭几十 ms 就复响,复响回声会被 followup 判成"有后续"(实测),
+         * 必须同时开丢包窗——验证期喇叭真停,此时 VAD 连续开=真人声。*/
+        printf("[TUYA] barge-in%s: VAD persistent (peak=%u) → mute & verify (echo check)\r\n", tag, g_tts_vad_peak);
+        g_tts_drop_until = timer_get_ms() + TUYA_TTS_VERIFY_MUTE_MS;
+        g_tts_drop_cnt = 0;
+    }
+    _device_rbuf_clear();   /* confirm=清 cbuf 停喇叭;verify=清 cbuf+丢包窗真静音(g_tts_playing=1 可恢复) */
+    g_tts_vad_open_since = 0;
+    g_barge_cooldown_until = timer_get_ms() + TUYA_BARGE_COOLDOWN_MS; /* 冷却:压住在途残包二次触发 */
+    /* 静音/停播后排 ~8 帧残响喂引擎+入历史:双讲下被削的词尾落在里面,安静后引擎
+     * 有机会补认(music_handoff 同款);词尾若在此触发 on_wake,提示音已就地播。*/
+    unsigned char _bt[TUYA_OPUS_FRAME_LEN];
+    for (int i = 0; i < 8 && !g_exit; i++) {
+        if (_device_get_voice_data(_bt, sizeof(_bt)) == sizeof(_bt)) {
+            tuya_kws_feed(_bt, sizeof(_bt));
+            barge_hist_push(_bt);    /* 残响若是命令尾部,一并进 prefill 补发 */
+        }
+    }
+    int is_wake = 0, wake_play_prompt = 0, is_followup = 0;
+    if (g_wake_prompt_pending) {      /* 排空期引擎把词认出来了(on_wake 播放态置的
+                                       * pending):提示音还没播,下面补播 */
+        g_wake_prompt_pending = 0;
+        is_wake = 1;
+        wake_play_prompt = 1;
+    } else if (g_wake_hit) {          /* on_wake 已就地播过提示音+开吞咽窗(空闲态命中) */
+        g_wake_hit = 0;
+        is_wake = 1;
+    } else if (barge_followup_wait(get_recoder_state() ? 0 : timer_get_ms())) {
+        /* 判后续(种子=排空末尾 VAD 已关的起点,排空耗时计入关闭时长),判法见
+         * barge_followup_wait:开 300ms=命令,关 350ms=说完了。*/
+        is_followup = 1;
+    } else if (!confirmed) {
+        /* 旁路既没等来引擎认词、也没等来后续话音:回声假警报(见头注释②)。
+         * 恢复播放:丢包窗到期后云端包重新进 rbuf 接着播,只跳过静音验证的
+         * ~2s;冷却加长,压住劣化态 ~2s 一簇的回声连环再触发。*/
+        printf("[TUYA] verify failed: no wake / no follow-up → echo false alarm, resume TTS\r\n");
+        g_barge_cooldown_until = timer_get_ms() + TUYA_TTS_ECHO_COOLDOWN_MS;
+        return 0;                     /* g_tts_playing 未动:调用方继续轮询播放 */
+    }
+    if (!confirmed) {                 /* 旁路验证通过(认出词/有后续):此刻才真正作废本轮 */
+        tai_chat_break(ctx);
+        _device_rbuf_clear();         /* 验证期间(≤1.5s)进了 rbuf 的旧轮音频一并清掉 */
+        g_tts_playing = 0;
+        g_tts_drop_until = timer_get_ms() + 3000;
+        g_tts_drop_cnt = 0;
+    }
+    if (is_wake) {
+        if (wake_play_prompt) {
+            printf("[TUYA] wake alert: WakeHeyTuya.mp3\r\n");
+            app_music_tuya_play_wake_prompt();
+        }
+        g_turn_done = 1;
+        g_wake_break = 1;             /* 本轮已作废:跳过 ④ 收尾/pending 音乐,回空闲 */
+        return 1;
+    }
+    if (is_followup) {
+        printf("[TUYA] follow-up speech → uplink barge turn\r\n");
+        barge_hist_to_prefill();      /* 排空前后的话音整体转 prefill:不补发云端只听到尾部 */
+        g_barge_in = 1;
+        g_barge_prompt_wait = 1;      /* 安全网:起轮失败时 1.5s 内补播,起轮当拍即撤销 */
+        g_barge_prompt_deadline = timer_get_ms() + 1500u;
+        return 1;                     /* 调用方 break → 主循环跳过收尾直接起新轮 */
+    }
+    /* confirm 但无后续:多半是没被引擎认出的唤醒词(说得轻/被压狠),哑火补救 */
+    printf("[TUYA] no follow-up → drop barge turn (likely wake, prompt via safety-net)\r\n");
+    g_barge_prompt_wait = 1;          /* 哑火补救:主循环下一拍播"我在"+开 15s 追问窗 */
+    g_barge_prompt_deadline = timer_get_ms();   /* VAD 已关 ≥350ms,到点即播 */
+    g_turn_done = 1;
+    g_wake_break = 1;
+    return 1;
 }
 #endif
 
@@ -984,7 +1605,6 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
     }
 #endif
 
-#define TUYA_OPUS_FRAME_LEN 1280   /* PCM 16k/16bit/mono 40ms = 1280B/帧(原 opus 180B 改 PCM) */
     /* ★ aligned(4) 不能省:char 数组对齐默认 1,LTO 后 alloca 仍是 align 1,栈布局恰把它放
      *   到奇地址时,转 short* 进 opus 编码器(biquad 做 16bit load)→ pi32v2 misalign_err
      *   崩溃(2026-08-31 UDP 构建实测:寄存器 R0=奇地址 + 最终 IR alloca align 1 双证实;
@@ -1009,6 +1629,7 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
          *   ⚠️ 绝不能在 VAD 触发时再 clear():那会把刚触发到的那句语音一并清掉,
          *      之前正是这样导致云端 ASR 收到静音、回空文本。*/
         int mcp_text_poll = 0;
+        g_wake_break = 0;   /* 唤醒打断标记只在本轮迭代内生效(跳过 ④ 收尾/pending 音乐) */
 #if TUYA_STM_MCP_VIA_TEXT
         /* MCP response 经 TEXT 发出后，必须先等伪回复并 chat_break，再允许 AUDIO。
          * 否则用户恰好开口会让两个事件重叠，复现“只回空内容、语音无 ASR”。 */
@@ -1038,7 +1659,12 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
 #ifdef TUYA_BARGE_IN_ENABLE
         /* barge-in:TTS 期间也听(不再被 g_tts_playing 门控),靠 AEC 去回声保证 VAD 不被喇叭误触发。
          * AEC 不行时这里会让回声触发 VAD→TTS 动辄自断,误触发多就关 TUYA_BARGE_IN_ENABLE 先调 AEC。*/
-        int start_turn = mcp_text_poll ? 0 : get_recoder_state();
+        /* ★ 播放缓冲非空(孤儿 TTS:旧轮 END 把等待骗退/兜底恢复后音频晚到)时不起轮:
+         * 喇叭还在播,AEC 劣化态回声就能把 VAD 顶开→幽灵上行轮把故事回声发给云端
+         * (2026-09-06 实测 [TTS!] 标记)。唤醒词不受影响(idle 排空照喂引擎),缓冲
+         * 排空即恢复起轮;带 g_barge_in 的抢答轮必已清 rbuf,不会被此门误拦。*/
+        int start_turn = mcp_text_poll ? 0 :
+                         (get_recoder_state() && _device_get_play_level() < 640);
         /* 普通轮 turn-start 能量门:无唤醒词+单麦开麦,任何持续声响都触发 VAD→设备自言自语。
          * VAD 触发后再核 1 帧能量(近场话音够响),达标才起轮并把这帧作 onset 补发;否则当噪音丢弃。
          * barge-in 轮(g_barge_in)已在 ④/drain 做过能量确认,这里跳过直接起轮。*/
@@ -1050,6 +1676,10 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                 if (_s >= BARGE_MIN_ENERGY) {
                     memcpy(g_barge_prebuf, _p, TUYA_OPUS_FRAME_LEN);
                     g_barge_prefill = 1;
+#ifdef TUYA_KWS_ENABLE
+                    tuya_kws_feed(_p, TUYA_OPUS_FRAME_LEN);   /* onset 帧在进 prebuf 后
+                                            不再经过任何喂音点,这里补上保 KWS 流连续 */
+#endif
                 } else {
                     start_turn = 0;   /* 噪音/远场,拒起轮(治自言自语) */
                 }
@@ -1057,12 +1687,73 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                 start_turn = 0;
             }
         }
+#ifdef TUYA_KWS_ENABLE
+        /* 唤醒门: 引擎不可用(无 token 回退)时 tuya_kws_awake() 恒真,行为与
+         * 现在完全一致;可用时只在唤醒窗内放行起轮,窗外吞掉——帧照常在下面
+         * 的 idle 分支排空并喂 KWS,唤醒词窗口由引擎命中/起轮/答毕三个点续期。*/
+        if (g_wake_swallow) {   /* 词尾吞咽窗(TuyaOpen input_reset 语义),见 on_wake */
+            int vad_now = get_recoder_state();
+            if (!vad_now || (int)(timer_get_ms() - g_wake_swallow_deadline) >= 0) {
+                g_wake_swallow = 0;
+                printf("[TUYA] wake tail drained (%s)\r\n",
+                       vad_now ? "900ms cap" : "vad closed");
+            }
+        }
+        /* barge-in 轮豁免唤醒窗与吞咽窗:用户已经能量确认在说话,窗过期(长 TTS/
+         * 音乐播超 15s 后窗早已失效)不能把打断后的命令拦回 idle 排空——
+         * 2026-09-05 实测:故事 TTS 中打断,"给我放一首周杰伦的歌"整句被吞。*/
+        if (start_turn && !g_barge_in &&
+            (g_wake_swallow || !tuya_kws_awake())) start_turn = 0;
+        if (start_turn) tuya_kws_window_kick();
+        g_wake_hit = 0;   /* 走到唤醒门=空闲路径,on_wake 已就地处理(提示音已播/吞咽窗已开) */
+        if (g_wake_suppress_barge) {
+            if ((int)(timer_get_ms() - g_wake_suppress_barge_until) >= 0) {
+                g_wake_suppress_barge = 0;   /* 时限已过:之后的抢答轮是全新事件 */
+            } else if (start_turn && g_barge_prefill > 1) {
+                /* 只拦"带历史 prefill 的抢答轮"(prefill>1):里面装的是刚被识别的
+                 * 唤醒词。用户下一句真话音只带 1 帧 onset,不受影响,照常起轮。*/
+                printf("[TUYA] wake cancels barge turn (prefill %u discarded)\r\n",
+                       g_barge_prefill);
+                g_wake_suppress_barge = 0;
+                g_barge_prefill = 0;
+                g_barge_in = 0;
+                start_turn = 0;   /* 回空闲:提示音已播,吞咽窗吃词尾,15s 窗已开 */
+            }
+        }
+#ifdef TUYA_MUSIC_ENABLE
+        if (g_barge_prompt_wait) {   /* 抢答停乐/停TTS 后的哑火补救,见 music_handoff/
+                                        * tts_barge_poll 注释:无后续=多半是唤醒词,补播+开窗 */
+            if (start_turn) {
+                g_barge_prompt_wait = 0;   /* 用户接着下了命令:正常起轮,不补提示音 */
+            } else if ((int)(timer_get_ms() - g_barge_prompt_deadline) >= 0) {
+                g_barge_prompt_wait = 0;
+                if (!get_recoder_state()) {   /* VAD 已关:没有后续话音=刚才那声是唤醒词 */
+                    printf("[TUYA] music barge w/o follow-up → wake prompt\r\n");
+                    printf("[TUYA] wake alert: WakeHeyTuya.mp3\r\n");
+                    app_music_tuya_play_wake_prompt();
+                    g_last_wake_alert = timer_get_ms();   /* 盖章:on_wake 迟到补中不再重播 */
+                    tuya_kws_window_kick();   /* 视作唤醒:打开 15s 追问窗 */
+                }
+            }
+        }
+#endif
+#endif
         if (!start_turn) {
 #else
         if (g_tts_playing || !get_recoder_state()) {
 #endif
 #ifdef TUYA_BARGE_IN_ENABLE
             g_barge_prefill = 0;   /* idle 期间任何 pending barge-in prefill 都已过期,清掉 */
+#endif
+#ifdef TUYA_MUSIC_ENABLE
+            /* 兜底:音乐已挂起但主流程没接住(如旧轮残留 END 把 ④ 等待提前骗退、
+             * SKILL 回包又晚到——2026-09-05"第一次放歌没反应")→ idle 里直接
+             * 接管播放。g_tts_playing=1(TTS 播报中)不抢 DAC,等它排空后的
+             * 正常路径/idle 下一拍再接。*/
+            if (tuya_music_pending() && !g_link_broken && !g_tts_playing) {
+                music_handoff(ctx);
+                continue;   /* 播完/被打断后回循环顶,保持 idle 节奏 */
+            }
 #endif
             unsigned char _trash[TUYA_OPUS_FRAME_LEN];
             int tn = _device_get_voice_data(_trash, sizeof(_trash));   /* 丢弃,保持缓冲新鲜 */
@@ -1077,6 +1768,9 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                            idle_cnt, idle_sum / idle_cnt, idle_act_sum / idle_cnt);
                     idle_cnt = 0; idle_sum = 0; idle_act_sum = 0;
                 }
+#ifdef TUYA_KWS_ENABLE
+                tuya_kws_feed(_trash, tn);   /* 排空的 40ms 帧喂唤醒词引擎 */
+#endif
             }
             tai_log_flush();   /* idle 排空节拍:顺带刷出 stm 库延迟日志(唯一 printf 出口在本任务) */
             mcp_resp_pump(ctx);   /* MCP initialize 多在空闲期到:这里就是回应的实际发送点 */
@@ -1097,7 +1791,23 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
             g_barge_in = 0;
         }
 #endif
+#ifdef TUYA_MUSIC_ENABLE
+        if (g_player_restore_pending) {   /* music_handoff 推迟的播放器恢复在此消费:
+                                           * 起轮时恢复,回话 TTS 前必定就位(~1.5s 后
+                                           * 才到);提示音播 mp3 期间不开 opus,不抢 DAC */
+            g_player_restore_pending = 0;
+            printf("[TUYA-MUSIC] restore tts player at turn start\r\n");
+            _device_net_audio_play(1);
+        }
+#endif
         g_turn_done = 0;
+        /* 快照"起轮前正在应答的轮 id":本轮 ④ 等待期若收到与之匹配的 END,
+         * = 被打断旧轮的残留收尾,on_event 里判弃(见 g_stale_end_bizid 注释)。
+         * 回调线程会读它,拷贝进临界区防撕裂。*/
+        OS_ENTER_CRITICAL();
+        strncpy(g_stale_end_bizid, g_answer_bizid, sizeof(g_stale_end_bizid) - 1);
+        g_stale_end_bizid[sizeof(g_stale_end_bizid) - 1] = '\0';
+        OS_EXIT_CRITICAL();
         uplink_frames = 0; uplink_active = 0;
 #ifdef TUYA_SERVER_VAD_ENABLE
         g_server_vad_stop = 0;   /* 清掉上轮残留的云端VAD标志 */
@@ -1124,12 +1834,15 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
             continue;
         }
         start_fails = 0;
+        g_tts_drop_until = 0;   /* 新轮起:关闭作废轮残包排空窗,本轮回话照常播 */
 #ifdef TUYA_BARGE_IN_ENABLE
         /* barge-in 轮:先补发能量确认时读走的 onset 帧(最响那段),再进实时上行。
          * 否则 onset 丢失、上行只收尾音/静音→ASR 空→打断后无播报。*/
         if (g_barge_prefill) {
             unsigned int k;
             for (k = 0; k < g_barge_prefill; k++) {
+                /* prefill 帧不再补喂 KWS:确认帧已在 barge_in_prefill_arm 喂过,
+                 * 历史/残响帧在各自消费点喂过——重复喂会撕乱引擎的滑窗。*/
 #ifdef TUYA_UPLINK_OPUS_ENABLE
                 if (use_opus_uplink) {
                     tuya_uplink_send_frame(ctx, &g_barge_prebuf[k * 1280]);   /* onset 帧同样走编码 */
@@ -1163,6 +1876,26 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
             if (n == TUYA_OPUS_FRAME_LEN) {
                 unsigned int fsum, fact;
                 opus_frame_stat(abuf, TUYA_OPUS_FRAME_LEN, &fsum, &fact);
+#ifdef TUYA_KWS_ENABLE
+                /* KWS 全程在线(含上行:TuyaOpen 驱动层在 UPLOAD/THINK 状态同样喂)。
+                 * 不喂的后果(2026-09-05 实测):追问窗内(答毕续 15s)用户喊"嘿tuya",
+                 * VAD 直接起轮把整句上行,云端 ASR 收到裸唤醒词→回"你是想说涂鸦吗"。
+                 * 喂引擎后词识别完整即命中→chat_break 作废本轮(词前半已上行,
+                 * 压掉云端回包)+吞咽窗吃词尾+提示音已由 on_wake 播,回空闲。
+                 * 副作用(TuyaOpen 同款):唤醒词+问题连说时本轮作废,问题接缝处
+                 * 丢零点几秒,由 900ms 吞咽兜底后的重听补回。*/
+                tuya_kws_feed(abuf, TUYA_OPUS_FRAME_LEN);
+                if (g_wake_hit) {
+                    g_wake_hit = 0;
+                    printf("[TUYA] wake breaks uplink → chat_break, discard turn (frames=%u)\r\n",
+                           uplink_frames);
+                    tai_chat_break(ctx);   /* 词前半已上行:作废本轮,云端不再回话 */
+                    g_wake_break = 1;      /* 跳过④收尾 mic 排空/pending 音乐丢弃 */
+                    g_tts_drop_until = timer_get_ms() + 3000;   /* 本轮/旧轮回话残包排空,见 on_audio */
+                    g_tts_drop_cnt = 0;
+                    break;
+                }
+#endif
 
 #ifdef TUYA_UPLINK_LATENCY_DEBUG
                 /* 测 发送(+opus编码) 耗时 + 前后 cbuf 水位 + TTS 上下文。
@@ -1264,6 +1997,7 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
         }
 #endif
         int w = 0;
+        s_barge_hist_cnt = 0;   /* 新一轮播放等待:历史从本轮起算,防上一轮尾巴混入打断补发 */
         while (!g_exit && !g_link_broken && !g_turn_done && w < TUYA_WAIT_MS) {
             /* 云端沉默兜底:TTS 一直没来(g_tts_playing 未置位且下行 cbuf 无数据)
              * 就只等 10s 回听音——STM 首轮实测云端无响应,原 60s 干等让设备像死机,
@@ -1273,9 +2007,33 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                 printf("[TUYA] no TTS in 10s (cloud silent?), back to listening\r\n");
                 break;
             }
+#ifdef TUYA_KWS_ENABLE
+            /* KWS 全程在线:等回复期间也喂唤醒词(有整帧才读,不阻塞——保住
+             * 20ms 轮询节拍和 w+=20 计时)。命中即打断本轮,优先于 barge-in:
+             * 唤醒词是明确意图,普通 barge-in 还要 3 帧能量确认。*/
+            if (_device_get_voice_level() >= TUYA_OPUS_FRAME_LEN) {
+                unsigned char _wk[TUYA_OPUS_FRAME_LEN];
+                if (_device_get_voice_data(_wk, sizeof(_wk)) == TUYA_OPUS_FRAME_LEN) {
+                    tuya_kws_feed(_wk, sizeof(_wk));
+                    barge_hist_push(_wk);   /* 播放期帧进 barge 历史:打断时补发命令头部 */
+                }
+            }
+            if (g_wake_hit) {
+                g_wake_hit = 0;
+                wake_break_tts(ctx);
+                break;
+            }
+#endif
 #ifdef TUYA_BARGE_IN_ENABLE
             /* barge-in:TTS 播放期间本地 VAD 检测到说话 → 打断。靠 AEC 保证 VAD 不是被回声触发。*/
             if (g_tts_playing && get_recoder_state() && barge_cooldown_expired()) {
+#if defined(TUYA_KWS_ENABLE) && defined(TUYA_MUSIC_ENABLE)
+                if (tts_barge_poll(ctx, "")) {   /* 停TTS→排空喂引擎→判后续(见其注释):
+                                                  * 有后续=抢答轮已布防;无后续/引擎补中=
+                                                  * 已按唤醒收尾(提示音/哑火补救接手) */
+                    break;
+                }
+#else
                 if (!barge_in_energy_confirmed()) {
                     printf("[TUYA] barge-in: VAD fired but energy low (AEC残留/噪音?), ignored\r\n");
                 } else {
@@ -1284,9 +2042,12 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                     _device_rbuf_clear();         /* 清播放 cbuf,立刻停 TTS 喇叭 */
                     g_tts_playing = 0;
                     g_barge_in = 1;
+                    barge_in_prefill_arm();       /* 打断前的话音(循环里已消费的)从历史补发,
+                                                     否则云端只听到确认点之后的尾部 */
                     g_barge_cooldown_until = timer_get_ms() + TUYA_BARGE_COOLDOWN_MS; /* 冷却:压住老轮在途 TTS 二次触发 */
                     break;
                 }
+#endif
             }
 #endif
             tai_log_flush();   /* 等待期刷库日志:云端回话/出错(WARN+)集中在本阶段 */
@@ -1296,7 +2057,7 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
         /* 回复期间(TTS 播放/等云端)录音 cbuf 积压了环境音/TTS 回采,这里清掉——
            此刻没有要保留的用户语音,清它是安全的(与"VAD触发时清"不同,那才会吞掉话音)。
            barge-in 时用户正在说话,【不能】清缓冲也不能冷却,跳过直接进新一轮上行。*/
-        if (!g_barge_in && !g_link_broken) {   /* 链路断:不等 TTS 到达/排空,直接报废会话 */
+        if (!g_barge_in && !g_link_broken && !g_wake_break) {   /* 链路断:不等 TTS 到达/排空;唤醒打断:本轮已作废 */
             /* 等 DAC 真正播完再听:云端 EVT_END(本轮发完)时,下行 jitter buffer 里可能还压着
              * 几秒 TTS,喇叭仍在播。若这时去听,麦克风采到正在播的 TTS→当新问题→自说自话。
              * 改成等下行 cbuf(pcm_cbuff_r)排空(≈DAC 播完)再听,从根上消除"云端发完≠喇叭播完"。
@@ -1313,30 +2074,74 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                 tai_log_flush();
                 mcp_resp_pump(ctx);
                 msleep(20); wait_start += 20;
+#ifdef TUYA_KWS_ENABLE
+                /* KWS 全程在线:TTS 未到达阶段同样可被唤醒词打断(用户重新唤醒)。*/
+                if (_device_get_voice_level() >= TUYA_OPUS_FRAME_LEN) {
+                    unsigned char _wk[TUYA_OPUS_FRAME_LEN];
+                    if (_device_get_voice_data(_wk, sizeof(_wk)) == TUYA_OPUS_FRAME_LEN) {
+                        tuya_kws_feed(_wk, sizeof(_wk));
+                        barge_hist_push(_wk);   /* 播放期帧进 barge 历史:打断时补发命令头部 */
+                    }
+                }
+                if (g_wake_hit) {
+                    g_wake_hit = 0;
+                    wake_break_tts(ctx);
+                    break;
+                }
+#endif
 #ifdef TUYA_BARGE_IN_ENABLE
                 /* TTS 未到达阶段也检测 barge-in:用户改口不等 TTS,确认话音即打断当前轮。*/
                 if (get_recoder_state() && barge_cooldown_expired()) {
+#if defined(TUYA_KWS_ENABLE) && defined(TUYA_MUSIC_ENABLE)
+                    if (tts_barge_poll(ctx, " (pre-TTS)")) {   /* 处置同 ④:停轮+判后续 */
+                        break;
+                    }
+#else
                     if (barge_in_energy_confirmed()) {
                         printf("[TUYA] barge-in (pre-TTS): cancel before audio arrives\r\n");
                         tai_chat_break(ctx);
                         _device_rbuf_clear();
                         g_tts_playing = 0;
                         g_barge_in = 1;
+                        barge_in_prefill_arm();   /* 同 ④:打断前话音从历史补发 */
                         g_barge_cooldown_until = timer_get_ms() + TUYA_BARGE_COOLDOWN_MS;
                         break;
                     }
+#endif
                 }
 #endif
             }
             unsigned int wait_ms = 0;
-            while (!g_exit && _device_get_play_level() > 640 && wait_ms < 35000) {  /* 等 32s 缓冲排空(≈喇叭真播完);35s 是兜底,正常排完就提前退 */
+            while (!g_exit && !g_wake_break && _device_get_play_level() > 640 && wait_ms < 35000) {  /* 等 32s 缓冲排空(≈喇叭真播完);35s 是兜底,正常排完就提前退 */
                 tai_log_flush();
                 mcp_resp_pump(ctx);
                 msleep(20); wait_ms += 20;
+#ifdef TUYA_KWS_ENABLE
+                /* KWS 全程在线:TTS 实际播放期(喇叭在响)喂唤醒词,命中即打断。
+                 * 2026-09-05 实测:此阶段 KWS 无帧可吃,连喊几声"嘿tuya"全被
+                 * barge-in 当普通抢答上行了,提示音也没播——本块就是修它。*/
+                if (_device_get_voice_level() >= TUYA_OPUS_FRAME_LEN) {
+                    unsigned char _wk[TUYA_OPUS_FRAME_LEN];
+                    if (_device_get_voice_data(_wk, sizeof(_wk)) == TUYA_OPUS_FRAME_LEN) {
+                        tuya_kws_feed(_wk, sizeof(_wk));
+                        barge_hist_push(_wk);   /* 播放期帧进 barge 历史:打断时补发命令头部 */
+                    }
+                }
+                if (g_wake_hit) {
+                    g_wake_hit = 0;
+                    wake_break_tts(ctx);
+                    break;
+                }
+#endif
 #ifdef TUYA_BARGE_IN_ENABLE
                 /* barge-in 也要在 play-drain-wait 里检测!云端 EVT_END 后 ④ 已退出,但喇叭还在放
                  * 缓冲里的 TTS。这段期间用户说话必须能打断(否则大缓冲=大窗口无法打断)。*/
                 if (get_recoder_state() && barge_cooldown_expired()) {
+#if defined(TUYA_KWS_ENABLE) && defined(TUYA_MUSIC_ENABLE)
+                    if (tts_barge_poll(ctx, " (drain)")) {   /* 处置同 ④:停播+判后续 */
+                        break;
+                    }
+#else
                     if (!barge_in_energy_confirmed()) {
                         printf("[TUYA] barge-in (drain): VAD fired but energy low, ignored\r\n");
                     } else {
@@ -1345,9 +2150,11 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                         _device_rbuf_clear();
                         g_tts_playing = 0;
                         g_barge_in = 1;
+                        barge_in_prefill_arm();   /* 同 ④:打断前话音从历史补发 */
                         g_barge_cooldown_until = timer_get_ms() + TUYA_BARGE_COOLDOWN_MS;
                         break;
                     }
+#endif
                 }
 #endif
                 /* AEC 诊断:播放 TTS 时读 mic(post-AEC 输出),看回声消没消掉。
@@ -1374,9 +2181,14 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
 #endif
                 }
             }
-            unsigned char _trash[TUYA_OPUS_FRAME_LEN];
-            for (int i = 0; i < 8 && !g_exit; i++) {  /* 8 × ~40ms ≈ 300ms 排空 mic */
-                _device_get_voice_data(_trash, sizeof(_trash));
+            if (!g_wake_break) {   /* 唤醒打断:词尾由吞咽窗在 idle 排,这里不再白排 300ms */
+                unsigned char _trash[TUYA_OPUS_FRAME_LEN];
+                for (int i = 0; i < 8 && !g_exit; i++) {  /* 8 × ~40ms ≈ 300ms 排空 mic */
+                    _device_get_voice_data(_trash, sizeof(_trash));
+                }
+#ifdef TUYA_KWS_ENABLE
+                tuya_kws_window_kick();   /* 答毕(TTS 播完)续窗:短时间内可直接追问 */
+#endif
             }
         }
 #ifdef TUYA_MUSIC_ENABLE
@@ -1390,103 +2202,17 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
          *   ("音乐自己把自己打断")就调 BARGE_MIN_ENERGY。
          * ★ DAC 交接前后各等 300ms:两个解码器共享 DAC,边停边开会踩到
          *   subdevice_dac 的格式重配断言(2026-08-27 提示音教训)。*/
-        if (tuya_music_pending() && g_barge_in) {
-            /* barge-in 打断了"正在为您播放…":用户已改口,音乐请求过时,丢弃。
-             * 不丢会把用户新话音压在整首歌后面才被听到。*/
-            printf("[TUYA-MUSIC] pending music dropped (barge-in)\r\n");
+        if (tuya_music_pending() && (g_barge_in || g_wake_break)) {
+            /* barge-in/唤醒词 打断了"正在为您播放…":用户已改口/重新唤醒,音乐请求
+             * 过时,丢弃。不丢会把用户新话音压在整首歌后面才被听到。*/
+            printf("[TUYA-MUSIC] pending music dropped (barge-in/wake)\r\n");
             tuya_music_clear_pending();
         }
-        if (tuya_music_pending() && !g_link_broken) {
-            char murl[512];
-            strncpy(murl, tuya_music_get_url(), sizeof(murl) - 1);
-            murl[sizeof(murl) - 1] = '\0';
-            printf("[TUYA-MUSIC] play: %s - %s\r\n",
-                   tuya_music_get_artist(), tuya_music_get_name());
-            tuya_music_clear_pending();          /* 先消费:防下轮误重播 */
-            _device_net_audio_play(0);           /* 停 TTS 解码器:让出 DAC */
-            msleep(300);                         /* 等 audio_server 释放 DAC */
-            g_music_playing = 1;
-            if (app_music_tuya_play_url(murl, tuya_music_dec_end_cb) != 0) {
-                printf("[TUYA-MUSIC] start play fail, restore TTS player\r\n");
-                g_music_playing = 0;
-                msleep(300);
-                _device_net_audio_play(1);       /* 恢复 TTS 播放器 */
-            } else {
-                /* 等播完(试听 ~30s,整首几分钟;600s 兜底防卡死)。
-                 * 退出条件:dec_end 回调清 g_music_playing(播完/解码停机);
-                 * 或 busy=0——下载失败路径 __net_music_dec_file 的 __err 不走
-                 * dec_end 回调,靠 net_file 已被关闭置空感知,别傻等 600s。
-                 * _device_get_voice_data 内部按帧节拍(~40ms)阻塞,顺带排空 mic:
-                 * 音乐回采不积压,播完立刻干净听音(不会把音乐尾巴当新问题)。
-                 * barge-in(TUYA_BARGE_IN_ENABLE,判据照搬 barge_in_energy_confirmed):
-                 *   VAD 在线 + 3 帧连续(120ms) sum≥BARGE_MIN_ENERGY 才停乐,断一帧
-                 *   就重数——滤掉音乐瞬态拍子。若 AEC 把音乐消得够低,音乐回声到不了
-                 *   门槛,只有贴脸的人声能过;实测过不了关就调门槛。
-                 *   开头 25 帧(1s)不设防:避开 DAC 交接瞬态和曲首重拍。*/
-                unsigned int mstart = timer_get_ms();
-#ifdef TUYA_BARGE_IN_ENABLE
-                unsigned int mframes = 0, mhi = 0;   /* 帧计数 / 连续达标帧数 */
-                unsigned int msums[3] = {0, 0, 0};
-                int mbarge = 0;
-#endif
-                while (!g_exit && !g_link_broken && g_music_playing &&
-                       app_music_tuya_music_busy() &&
-                       timer_get_ms() - mstart < 600000) {
-                    unsigned char _mt[TUYA_OPUS_FRAME_LEN];
-                    if (_device_get_voice_data(_mt, sizeof(_mt)) != sizeof(_mt)) {
-                        continue;               /* 读不够一帧:等下一拍再来 */
-                    }
-                    tai_log_flush();            /* 音乐长循环(可达10min)也保持库日志节拍 */
-                    mcp_resp_pump(ctx);
-#ifdef TUYA_BARGE_IN_ENABLE
-                    mframes++;
-                    unsigned int mes, mea;
-                    opus_frame_stat(_mt, sizeof(_mt), &mes, &mea);
-                    if ((mframes % 25) == 0) {  /* 每 ~1s 打能量基线:调门槛看这个 */
-                        printf("[MUSIC-DBG] playing, mic post-AEC: sum=%u act=%u%% rec=%d\r\n",
-                               mes, mea, get_recoder_state());
-                    }
-                    if (mframes > 25 && get_recoder_state() && mes >= BARGE_CONFIRM_ENERGY) {
-                        msums[mhi++] = mes;
-                        if (mhi >= 3) {         /* 3 帧连续达标:确认真话音,停乐 */
-                            printf("[TUYA-MUSIC] barge-in: stop music (sums=%u,%u,%u)\r\n",
-                                   msums[0], msums[1], msums[2]);
-                            mbarge = 1;
-                            break;
-                        }
-                    } else {
-                        mhi = 0;                /* VAD 掉线/能量掉线:重数 */
-                    }
-#endif
-                }
-                if (g_music_playing) {           /* 超时/失败/打断/退出:强停,防 DAC 被占死 */
-                    printf("[TUYA-MUSIC] stop (%s)\r\n",
-#ifdef TUYA_BARGE_IN_ENABLE
-                           mbarge ? "barge-in" :
-#endif
-                           app_music_tuya_music_busy() ? "timeout/exit" : "download/decode fail");
-                    app_music_tuya_music_stop();
-                    g_music_playing = 0;
-                }
-#ifdef TUYA_BARGE_IN_ENABLE
-                if (mbarge) {                   /* 停乐后排 ~300ms 残响:打断词与音乐混叠,
-                                                   本轮已作废不清会被音乐尾巴当下句触发假轮 */
-                    unsigned char _mt[TUYA_OPUS_FRAME_LEN];
-                    for (int i = 0; i < 8 && !g_exit; i++) {
-                        _device_get_voice_data(_mt, sizeof(_mt));
-                    }
-                }
-#endif
-                msleep(300);                     /* 等音乐解码器释放 DAC */
-                _device_net_audio_play(1);       /* 恢复 TTS 播放器:下一轮 TTS 要播 */
-                printf("[TUYA-MUSIC] done, back to listening\r\n");
-            }
-        }
+        music_handoff(ctx);   /* 正常路径:④ TTS 排空后交接;idle 分支另有兜底调用点 */
 #endif
         /* g_barge_in 不在此清:改由 barge-in 新上行起点(循环顶 drain-stale 处)清,让标记贯穿。*/
         if (g_link_broken) break;   /* 链路断:退出语音循环,本会话收尾交 supervisor 重连 */
     }
-#undef TUYA_OPUS_FRAME_LEN
 
     /* 音频流不在此停(supervisor 下次会话复用):tai 已 deinit 不会再有 on_audio
      * 回包,g_audio_ready 留 1 只在有会话时起作用。*/
@@ -1509,6 +2235,10 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
 
     audio_stream_init(16000, 16, 1);
     start_audio_stream();
+
+#ifdef TUYA_KWS_ENABLE
+    tuya_kws_init();   /* 唤醒词引擎(幂等,只初始化一次;失败自动回退常听) */
+#endif
 
     unsigned int backoff_ms = 5000;
     while (1) {

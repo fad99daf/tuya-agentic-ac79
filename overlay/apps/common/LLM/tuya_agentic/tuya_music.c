@@ -378,6 +378,17 @@ int tuya_music_text_accum(int stream_flag, const char *text, unsigned int len)
                s_tb.len);
         s_tb.dropped++;
     }
+    if (starts) {
+        /* 判废状态不得跨流存活:dropping 本该由本流的 END 清,但 END 是空文本帧,
+         * SDK 不派发给 on_text(见 demo tuya_music_text_flush 注释),只能靠新流
+         * START 复位。长故事轮的 NLG 拼流轻松超 4KB 上限,一旦判废又等不到 END,
+         * dropping 卡到会话结束——之后每一轮的 music JSON 全被吞,云端明明回了
+         * URL 也永远不放歌(2026-09-06 实测:放歌→讲故事→再放歌,歌不播)。*/
+        if (s_tb.dropping) {
+            printf("[TUYA-MUSIC] new stream after dropped one: recover\r\n");
+        }
+        s_tb.dropping = 0;
+    }
     if (starts || s_tb.done) {
         s_tb.len  = 0;
         s_tb.done = 0;

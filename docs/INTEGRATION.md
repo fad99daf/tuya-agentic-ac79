@@ -523,3 +523,13 @@ Wi-Fi 一通即自动连涂鸦 AI Agent。
 **rtc-tcp-client**:`tai_ctx_size()` / `tai_ctx_init(mem, &cfg)` / `tai_connect(ctx)` / `tai_disconnect(ctx)` / `tai_send_text(ctx, s, n)` / `tai_send_audio_start(codec, ch, bits, sr)` + `tai_send_audio_chunk(ctx, pkt, n)` + `tai_send_audio_end(ctx)` / `tai_send_image(ctx, ...)`。
 
 **region 枚举**:`AY`=中国、`AZ`=美西、`EU`=欧洲、`IN`=印度、`SG`=新加坡等;`env`:`PROD`/`PRE`/`TEST`。
+
+---
+
+## 增量:唤醒词子系统(2026-09)
+
+唤醒词"嘿tuya"由涂鸦闭源 KWS 引擎(`tuya_agentic/kws/audio_subsys.a`)常开识别,命中后播应答提示音并开 15s 唤醒窗,**窗内本地 VAD 才允许起轮**;引擎初始化失败自动回退"常听"(与未接入时行为一致)。
+
+接入点:Makefile/cbp 增加 kws 目录(include + `tuya_kws.c`/`kws_cxx_shim.cc` + 链接 `audio_subsys.a`)、`app_config.h` 的 `TUYA_KWS_ENABLE`、`app_music.c` 的应答提示音、资源 `cpu/wl82/tools/audlogo/WakeHeyTuya.mp3`。
+
+引擎标定结论(greedy"前缀窗+跳过"触发机制、5 个必改配置、[27,8] token 指纹、跨句拼装防护)、参数速查与调参/日志指南见 [`WAKEWORD.md`](WAKEWORD.md)。

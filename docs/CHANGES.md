@@ -259,3 +259,44 @@ flash 布局改动(为双备份 OTA 腾空间):
 
 - 新增 `TUYA_TRANSPORT_STM_ENABLE`(默认 0)、`TUYA_STM_LOG_PRINT_LEVEL`、`TUYA_STM_MCP_VIA_TEXT=1`/`TUYA_STM_MCP_INSTR_TYPE=1000`(STM 模式 MCP 回应通道,详见 `stm/README.md`)。
 - 上行/下行 Opus、barge-in、云端 VAD、音乐等既有开关语义不变。
+
+---
+
+## 2026-09-05 ~ 09-06 增量改动(唤醒词接入 / 故事期回声治理 / 音乐流重组修复)
+
+### I. 唤醒词"嘿tuya"接入(新增 `tuya_agentic/kws/`)
+
+新增涂鸦闭源 KWS 引擎封装子目录,唤醒后播应答提示音并开 15s 唤醒窗,**窗内本地 VAD 才允许起轮**:
+
+| 文件 | 作用 |
+|---|---|
+| `kws/audio_subsys.a` | 涂鸦闭源 KWS 引擎(pi32v2,内嵌 40 类 CTC heytuya 模型,2.7MB) |
+| `kws/keyword_tflite.h` | 引擎 C API 头(逆向重建 v3:config 14 字段 / result / forward_pcm) |
+| `kws/kws_cxx_shim.cc` | C↔C++ ABI 垫片 |
+| `kws/tuya_kws.c/.h` | 薄封装:init / feed / awake / window_kick + 探针日志 |
+
+- 集成点:`tuya_agentic_demo.c`(唤醒门、900ms 词尾吞咽窗、idle/barge/起轮/音乐四路喂音、唤醒打断 TTS 走 wake_break)、`app_music.c`(应答提示音 `app_music_tuya_play_wake_prompt()` + 音乐打断排空帧喂引擎)、`app_config.h` `TUYA_KWS_ENABLE`、Makefile/cbp 接线、资源 `cpu/wl82/tools/audlogo/WakeHeyTuya.mp3`。
+- 引擎标定结论(greedy"前缀窗+跳过"触发机制、5 个必改配置、[27,8] token 指纹、同句双命中拦截、跨句拼装防护)**全部写在 `docs/WAKEWORD.md`**,勿只看本摘要。
+- 降级:引擎初始化失败自动回退"常听"(`tuya_kws_awake()` 恒真),行为与未接入时一致;`TUYA_KWS_TOKENS_READY=0` 为标定模式。
+
+### J. 故事 TTS 期间的回声误打断治理(`tuya_agentic_demo.c` / `kws/tuya_kws.c`)
+
+音乐交接后 opus 播放器重开会把设备采样率锁 48k,AEC 随之劣化,故事回声尖峰引发三条故障链,对应修复:
+
+- **打断"静音验证"改真静音**:验证期开 2s 丢包窗(云端残包直接丢),喇叭真停,VAD 连续开才算真人;回声假警报走恢复播放(故事跳 ~2s 接着讲),5s 冷却防抖。
+- **KWS `cfg.gap_threshold` 250→100**:默认 2.5s 会把 4.6s 前一句真人"嘿tuya"的 k27 与新话音的 k08/k22 拼成假唤醒(score 0.447);真词 [27,8] 间隔恒 3 帧,100 帧余量足。
+- **空闲起轮加播放缓冲门**:孤儿 TTS 还在播时不起上行轮,堵"设备把自己的回声发给云端"。
+- 2026-09-06 实测:故事期间回声假警报全部正确恢复播放(2 次,各跳 ~2s),4 次唤醒全真,故事讲完不被杀。
+- 残留:48k 锁定根因未修(显式 16k=3 倍慢速、48k=开机崩溃,需"16k 重钉"实验,见 barge-in 文档)。
+
+### K. `tuya_music.c` 文本流判废跨流卡死修复
+
+- 现象:放歌→讲故事→再放歌,第二次起云端明明回了音乐 URL 也不播(前奏 TTS"即将为你播放…"照播)。
+- 根因:每轮回复的完整文本流(ASR+表情+SKILL+NLG 信封拼接)在 4KB 重组缓冲里拼装,故事轮 NLG 轻松超限 → `dropping` 判废等流 END 复位;但 END 是空文本帧(`data:null, len=0`),SDK 不派发给 `on_text` → 判废状态卡到会话结束,之后每一轮的音乐 JSON 全被吞,`[TUYA-MUSIC] >>>` 永不打印。
+- 修复:新流 START(每轮首片 ASR,必达且非空)复位 `dropping`,判废只影响超限的那一轮。修复后故事轮仍会打一条 `stream too large ... drop`(无害)。
+
+### L. patch / 资源同步说明
+
+- `patches/tuya-agentic-v1.2.0.patch` 重生成:Makefile / app_config.h / app_music.c 等带入 KWS 接线(仍是那 10 个文件,顺序不变)。
+- overlay 新增:`kws/` 5 个文件 + `cpu/wl82/tools/audlogo/WakeHeyTuya.mp3`;`tuya_agentic_demo.c` / `tuya_music.c` 整文件更新到 2026-09-06 版(含 I/J/K 全部改动)。
+- 凭据惯例不变:overlay 的 demo.c 仍是 `YOUR_PID_HERE` 占位符(不含任何作者私有凭证)。
