@@ -25,7 +25,7 @@
 | `kws/tuya_kws.h` | 对外接口说明(init / feed / awake / window_kick) |
 | `tuya_agentic_demo.c` | 集成点:各喂音路径 + 唤醒门 + 吞咽窗 + 抑制抢答(见 §5) |
 | `app_music.c` | `app_music_tuya_play_wake_prompt()` 播应答提示音;音乐打断排空帧喂引擎 |
-| `include/app_config.h` | `TUYA_KWS_ENABLE`(默认开) |
+| `include/app_config.h` | `TUYA_KWS_ENABLE`(**默认关=常听**,整行注释;开启见 §6) |
 | `board/wl82/Makefile`(+`.cbp`) | kws 目录 include / 源文件(tuya_kws.c、kws_cxx_shim.cc)/ audio_subsys.a 链接 |
 | `cpu/wl82/tools/audlogo/WakeHeyTuya.mp3` | 唤醒应答提示音(16kHz/mono,取自 TuyaOpen 标准应答"我在"资源;文件名沿用,与唤醒词无绑定) |
 
@@ -115,9 +115,33 @@ idle(帧照常排空喂引擎)。能量确认过的抢答轮(g_barge_in)豁免�
 
 ## 6. 开关与降级
 
+### 如何开启/关闭唤醒词
+
+唤醒词由 `apps/wifi_story_machine/include/app_config.h` 的 `TUYA_KWS_ENABLE` 控制,**本交付版默认关闭(常听模式)**——该行是整行注释:
+
+```c
+/* #define TUYA_KWS_ENABLE               1 */   // ← 默认:常听(不喂引擎、不做门控)
+```
+
+**开启唤醒词**:去掉整行的 `/* */` 注释即可(值随意,只要这个宏被定义):
+
+```c
+#define TUYA_KWS_ENABLE               1          // ← 启用:命中"你好涂鸦"/"嘿涂鸦"才起轮
+```
+
+**关闭唤醒词**:把整行重新注释掉(回到常听)。
+
+> ⚠️ **这是 `#ifdef` 语义,不是取值语义**。`tuya_agentic_demo.c` 里 25 处编译门全部按"**这个宏是否被定义**"来编译,写 `#define TUYA_KWS_ENABLE 0` **不起作用**(0 也算已定义,唤醒门照样编进去)。要关就必须整行注释掉。改完须重新编译整个应用;命令行 `make` 记得带 `LINK_AT=0`,否则会链到旧 obj、行为像没改。
+>
+> 关/开只影响是否喂引擎与门控,**不影响设备联网、配网、语音对话主链路**;`kws/audio_subsys.a` 始终在链接行,关闭时无引用会被 LTO 裁掉,不占固件体积。
+
+### 降级矩阵
+
 | 场景 | 行为 |
 |---|---|
-| `TUYA_KWS_ENABLE=0`(app_config.h) | 整块不编译,回到无唤醒词常听 |
+| `TUYA_KWS_ENABLE` 整行注释(**本版默认**) | 整块不编译,回到无唤醒词常听——张口即上行,行为与未接入唤醒词完全一致 |
+| `TUYA_KWS_ENABLE` 已定义(开启唤醒词) | 空闲/播放期喂引擎,命中唤醒词开 15s 窗,窗内本地 VAD 才起轮 |
+| `#define TUYA_KWS_ENABLE 0`(常见误用) | ⚠️ **仍算已定义 → 唤醒门照样编入 → 等同开启**,不是关闭。要关必须整行注释 |
 | 引擎初始化失败(堆不足/库异常) | 自动回退 `tuya_kws_awake()` 恒真=门控失效,行为同常听;日志 `create fail, fallback always-listen`;只试一次不重试 |
 | `TUYA_KWS_TOKENS_READY=0`(tuya_kws.c) | 标定模式:只注册探针不注册正式词,awake 恒假,话音全走 idle 排空喂引擎(留给以后换词标定用) |
 

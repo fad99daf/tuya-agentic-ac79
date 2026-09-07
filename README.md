@@ -133,7 +133,7 @@ make ac791n_wifi_story_machine
 | `CONFIG_TUYA_AGENTIC_ENABLE` | 涂鸦集成总开关(控制 Makefile 编入 + K6 重置分支 + 自启动) | 开 |
 | `TUYA_TRANSPORT_STM_ENABLE` | 语音传输层:0=TCP(rtc-tcp-client 源码);1=涂鸦 STM 库(UDP 优先,UDP/TCP 竞速自动回落),详见 `stm/README.md` | 0 |
 | `TUYA_BARGE_IN_ENABLE` | 用户打断 TTS(强依赖 AEC,实验性) | 开 |
-| `TUYA_KWS_ENABLE` | 唤醒词"你好涂鸦"(主)+"嘿涂鸦"门控(闭源引擎常开识别,失败自动回退常听),详见 `docs/WAKEWORD.md` | 开 |
+| `TUYA_KWS_ENABLE` | 唤醒词"你好涂鸦"(主)+"嘿涂鸦"门控(闭源引擎常开识别,失败自动回退常听)。**默认关=常听模式**;要启用把 `app_config.h` 里该行整行注释去掉(⚠️`#ifdef` 语义,置 0 无效),详见 `docs/WAKEWORD.md` | **关(常听)** |
 | `TUYA_DOWNLINK_OPUS_ENABLE` | 下行 TTS 用 opus(治卡顿);注释则用 PCM | 开 |
 | `TUYA_UPLINK_OPUS_ENABLE` | 上行 ASR 用本地 libopus 定点软编码(~2KB/s);注释则 PCM(32KB/s) | 开 |
 | `TUYA_SERVER_VAD_ENABLE` | 云端 VAD 停说判定(开口仍本地 VAD;本地 2s 静音兜底) | 开 |

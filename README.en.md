@@ -133,7 +133,7 @@ Edit `apps/wifi_story_machine/include/app_config.h`:
 | `CONFIG_TUYA_AGENTIC_ENABLE` | Tuya integration master switch (controls Makefile sources + K6 reset branch + auto-start) | on |
 | `TUYA_TRANSPORT_STM_ENABLE` | Voice transport: 0 = TCP (rtc-tcp-client sources); 1 = Tuya STM lib (UDP-first, races UDP/TCP with fallback) — see `stm/README.md` | 0 |
 | `TUYA_BARGE_IN_ENABLE` | Interrupt TTS (depends on AEC; experimental) | on |
-| `TUYA_KWS_ENABLE` | Wake word "你好涂鸦" (primary) + "嘿涂鸦" gating (closed-source engine, always-on; falls back to always-listening on engine failure) — see `docs/WAKEWORD.md` | on |
+| `TUYA_KWS_ENABLE` | Wake word "你好涂鸦" (primary) + "嘿涂鸦" gating (closed-source engine, always-on; falls back to always-listening on engine failure). **Off by default = always-listening mode**; to enable, uncomment the whole line in `app_config.h` (⚠️ `#ifdef` semantics — setting it to 0 has no effect) — see `docs/WAKEWORD.md` | **off (always-listening)** |
 | `TUYA_DOWNLINK_OPUS_ENABLE` | Use opus for downlink TTS (fights stutter); commented = PCM | on |
 | `TUYA_UPLINK_OPUS_ENABLE` | Encode uplink ASR with the local libopus fixed-point encoder (~2KB/s); commented = PCM (32KB/s) | on |
 | `TUYA_SERVER_VAD_ENABLE` | Cloud VAD end-of-speech (wake-up stays local VAD; local 2s silence fallback) | on |

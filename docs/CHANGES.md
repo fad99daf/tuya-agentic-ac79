@@ -327,3 +327,15 @@ flash 布局改动(为双备份 OTA 腾空间):
 - 排查发现 09-06 只重新生成了 patch,**overlay 副本没跟上**:overlay 的 Makefile/.cbp 缺 kws 接线(include/源文件/链接行)、app_config.h 缺 `TUYA_KWS_ENABLE` 块、app_music.c 缺 `app_music_tuya_play_wake_prompt()`。本次已全部补齐(直接以开发树文件覆盖)。若曾用 09-06 版 overlay 全新铺 SDK,唤醒词实际是没接上的(patch 方式不受影响)。
 - 本次同步的 overlay 文件(7 个):`kws/audio_subsys.a`、`kws/tuya_kws.c`、`kws/tuya_kws.h`、`include/app_config.h`、`board/wl82/Makefile`、`board/wl82/AC791N_WIFI_STORY_MACHINE.cbp`、`app_music.c`。demo.c 仅凭据差异(占位符惯例),未动。
 - patch 对基线 tag `AC79NN_SDK_V1.2.12_2026-03-07` 重新生成,仍是那 10 个文件。
+
+---
+
+## 2026-09-07 增量改动(默认关闭唤醒词=常听模式)
+
+### Q. 交付默认改为"常听"(`TUYA_KWS_ENABLE` 整行注释)
+
+- 需求:出厂默认无需唤醒词,张口即上行(常听);唤醒词作为可选项保留。
+- 改动:`app_config.h` 把 `#define TUYA_KWS_ENABLE 1` 整行注释掉 → `/* #define TUYA_KWS_ENABLE 1 */`。KWS 整块不编译,行为与未接入唤醒词完全一致;`kws/audio_subsys.a` 仍在链接行,无引用被 LTO 裁掉,不占体积。语音对话/配网/联网主链路不受影响。
+- ⚠️ **`#ifdef` 语义**:`tuya_agentic_demo.c` 25 处编译门全部按"是否定义"编译,`#define TUYA_KWS_ENABLE 0` **无效**(0 也算已定义)。关必须整行注释,开就去掉注释。
+- 如何开启/关闭的完整说明已写入 `docs/WAKEWORD.md` §6(含误用矩阵)、README/README.en 宏表(默认列改为"关(常听)")。
+- 同步范围:overlay `app_config.h`、`patches/tuya-agentic-v1.2.0.patch`(app_config hunk 及后续 hunk 行号已随之校正,对基线 tag `git apply --check` 通过)、README.md、README.en.md、docs/WAKEWORD.md。demo.c 未动(仍凭据占位符)。
