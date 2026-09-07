@@ -1,28 +1,22 @@
 /* ============================================================================
- * tuya_kws.c — AC79 唤醒词("嘿tuya")薄封装实现 v6.1 (正式门控)
+ * tuya_kws.c — AC79 唤醒词("你好涂鸦"+"嘿涂鸦")薄封装实现 v7 (官方 token)
  * 接口与行为说明见 tuya_kws.h；引擎 API 见 keyword_tflite.h(逆向重建 v3)。
  *
- * v5/v5.1 探针标定完成, 三轮根因均已闭环:
+ * v7 (2026-09-07): 换声学团队 v2 算法包(jieli_lib_v2), create(NULL) 默认
+ *  模型 g_fsmn_v8_0515_avg_int8_model_data, 官方提供两词 token 序列+阈值
+ *  0.7, 取代 v5/v6 探针自标定。主唤醒词切"你好涂鸦"{23,4,27,9,22,5,38,1},
+ *  兼容保留"嘿涂鸦"{27,8,22,5,38,1}。引擎侧常量(IR 核实)与 v1 一致:
+ *  arena CHECK≤49152、TFLite 束堆 50336, 5 项标定配置全部继续有效。
+ *
+ * v5/v5.1 探针标定(适用于旧 heytuya 单词模型, 结论已被官方序列取代):
  *  1. forward_pcm 是本引擎唯一的流式推理入口(内部完成 AcceptWaveform→
  *     帧队列→5×80=400 滑窗堆叠→Forward→归一化→解码搜索→命中写 result)。
  *     detect 把 80 宽单帧直接喂 Forward, 撞 CHECK(80≠400)→exit(-1) 杀任务,
- *     对本模型永久弃用。
+ *     对本引擎永久弃用。
  *  2. normalize_skip 必须 0: 默认 1 时 greedy 跳过 log→概率域归一化,
- *     heytuya 输出 log_softmax(全≤0) → 命中得分恒负、正数阈值永不满足
- *     (v2/v3 全天零命中根因)。
+ *     FSMN 模型输出 log_softmax(全≤0) → 命中得分恒负、正数阈值永不满足。
  *  3. frame_threshold 必须 0: 真实 token 段多为单窗(30ms), 默认 3 的
- *     时长门把 v5 首轮 12 段里的 11 段直接拦掉。
- *
- * v6 (2026-09-05 17:24 标定回填, 开正式门控) → v6.1 修正:
- *  v6 实测 [27,8] 后验均值 0.955 仍未唤醒 → 复核 IR 发现 greedy 扫描是
- *  "前缀窗 + 得分不足即跳过"规则(详见下方 token 块注释): 每个起点只从
- *  m=len-容差 的前缀窗开始试, 得分不足直接 start+=m 跳过该起点 → 更长
- *  的整词精确窗基本不可达 → len=2 的 {27,8} 结构性永不命中。
- *  v6.1: heytuya2 改 {27,8,22}(首选窗=稳定对[27,8], 得分(1-1/3)×均值),
- *  阈值 0.6094→0.50(前缀窗得分被 (1-1/len) 缩水, 旧值按整词标定不可达)。
- *  探针 k00-k39 保留: 注册在正式关键词之后, 库按注册序返回每窗首个命中
- *  → 正式关键词优先, 探针只兜走未被正式命中的窗口; 漏唤醒时仍能从日志
- *  看到引擎实际输出的 token 序列和分数。
+ *     时长门会拦掉大部分真实段。
  * ==========================================================================*/
 #include "keyword_tflite.h"
 #include "tuya_kws.h"
@@ -35,24 +29,17 @@ extern unsigned int timer_get_ms(void);   /* system/timer.h, 单调 ms */
 extern void tuya_agentic_on_wake(void);   /* tuya_agentic_demo.c: 唤醒应答提示音 */
 
 /* ---------------------------------------------------------------------------
- * heytuya 唤醒词 token 序列(模型 40 类 CTC id, blank 在折叠时已剔除)。
- * 标定数据(两轮日志, 6 句有效"嘿tuya"):
- *   [27,8] 对 6/6 句稳定出现(间隔恒 30ms), 是核心声学指纹;
- *   尾部多变: [22,5] / [22] / [1] / [38,1], 部分被 blank 吃掉。
- *
- * ★v6 实测教训(greedy 扫描的"前缀窗+跳过"规则, IR %91-%153 核实):
- *   每个起点只从 m=len-容差 的前缀窗开始试, 该窗距离≤容差但得分不足时
- *   直接 start+=m 跳过, 不再试该起点更长的窗 → 整词精确匹配基本不可达,
- *   真正的触发路径就是前缀窗(距离=容差, 得分被 (1-1/len) 缩水)。
- *   因此 len=2 的 {27,8} 首选窗=单 token 模糊窗, 得分≤0.5×后验, 结构性
- *   永不命中(v6 日志实证: [27,8] 均值 0.955 也没醒)。
- *   len=3 的 {27,8,22} 首选窗=稳定对 [27,8] 本身: 得分=(1-1/3)×均值,
- *   阈值 0.50 ⇒ 对均值≥0.75 即醒 —— 标定里 4 句好发音(均值 0.82~0.955)
- *   全中, 1 句弱发音(0.503)正确不中。
- *   heytuya={27,8,22,5} 保留: 尾部齐全时经 [27,8,22] 前缀窗(0.75×均值)
- *   命中, 分数更高、误触更低。 */
-static const int TUYA_KWS_HEYTUYA_TOKENS[] = { 27, 8, 22, 5 };
-static const int TUYA_KWS_HEY2_TOKENS[]    = { 27, 8, 22 };
+ * 官方双唤醒词(声学团队 jieli_lib_v2, 2026-09-07):
+ *   "你好涂鸦" → {23,4,27,9,22,5,38,1} (主唤醒词)
+ *   "嘿涂鸦"   → {27,8,22,5,38,1}     (兼容保留, 同样可唤醒)
+ * token 序列与阈值 0.7 均为随 v2 包官方提供, 取代 v6.1 的探针自标定序列
+ * ({27,8,22}/{27,8,22,5}), 标定探针仅留作调优观测。
+ * v2 包 IR 核实: create(NULL) 默认模型已换为 g_fsmn_v8_0515_avg_int8
+ * _model_data(v1 是 heytuya 专用模型; 包内其余 nhty_hty/anna/tino 等模型
+ * 未被引擎引用, 只是随包带出); 引擎侧常量与 v1 完全一致 —— arena CHECK
+ * 上限 49152、TFLite 束堆分配 50336, 下方 5 项标定配置继续有效。 */
+static const int TUYA_KWS_NIHAOTUYA_TOKENS[] = { 23, 4, 27, 9, 22, 5, 38, 1 };
+static const int TUYA_KWS_HEYTUYA_TOKENS[]  = { 27, 8, 22, 5, 38, 1 };
 #define TUYA_KWS_TOKENS_READY 1
 #define TUYA_KWS_PROBE_LOG    1  /* 正式门控下仍注册 k00-k39 探针(只打印
                                   * 不唤醒): 注册在正式关键词之后, 库按
@@ -60,16 +47,18 @@ static const int TUYA_KWS_HEY2_TOKENS[]    = { 27, 8, 22 };
                                   * 探针只兜没被正式命中的窗; 漏唤醒时
                                   * 仍留有引擎实际输出 token 的调优数据 */
 
-#define TUYA_KWS_NAME        "heytuya"
-#define TUYA_KWS_NAME2       "heytuya2"
+#define TUYA_KWS_NAME        "nihaotuya"   /* 注册名用 ASCII: result.name 走
+                                            * strncpy/strcmp, 串口打印也稳 */
+#define TUYA_KWS_NAME2       "heytuya"
 #define TUYA_KWS_ARENA       49152   /* 构造器 CHECK 上限(1..49152)取满 */
-#define TUYA_KWS_THRESHOLD   0.50f   /* 命中阈值。实际触发路径是"词长-容差"
-                                      * 前缀窗, 得分=(1-1/词长)×段均值被缩水:
-                                      * 0.6094 按整词命中标定, 前缀窗结构上
-                                      * 到不了(v6 实测); 0.50 ⇒ [27,8] 对
-                                      * 均值≥0.75 即醒, 弱句(0.503)不中 */
+#define TUYA_KWS_THRESHOLD   0.70f   /* 命中阈值。v2 官方值(两词同值);
+                                      * greedy 实际触发路径仍是"词长-容差"
+                                      * 前缀窗, 得分被 (1-1/词长) 缩水,
+                                      * 漏唤醒时先看探针日志再考虑下调 */
 #define TUYA_KWS_AWAKE_MS    15000u  /* 唤醒窗: 窗内允许 VAD 起轮 */
-#define TUYA_KWS_CLASSES     40      /* 内嵌模型输出类别数(tflite 逆向) */
+#define TUYA_KWS_CLASSES     40      /* 探针覆盖类别数(v1 模型逆向=40; v2 模型
+                                      * 实际 vocab 以开机引擎日志 "vocab=%d"
+                                      * 为准, 探针只少不多无碍) */
 
 /* 引擎工作内存: search_mode=1 需 30144B。静态块 4 对齐(create 要求)。 */
 static char s_kws_mem[30144] __attribute__((aligned(4)));
@@ -79,7 +68,7 @@ static int                   s_tried;     /* 只初始化一次, 失败不反复
 static volatile unsigned int s_awake_until;
 
 /* 同句双命中拦截窗口:两次正式命中的起点帧差小于此值=同一句话(50 帧=2s)。
- * heytuya2 前缀窗与 heytuya 全词窗对同一句的命中起点相同,只差返回时机。*/
+ * 两词共享"涂鸦"尾段,同句可能先后命中两个关键词,只认第一次。*/
 #define TUYA_KWS_DUP_START_FRAMES 50
 static int s_last_wake_start = -1000000;  /* 上次正式命中的起点帧(很负=尚无) */
 
@@ -147,21 +136,21 @@ int tuya_kws_init(void)
     s_hdl = hdl;
 
 #if TUYA_KWS_TOKENS_READY
-    if (keyword_tflite_add_keyword(hdl, TUYA_KWS_NAME, TUYA_KWS_HEYTUYA_TOKENS,
-                                   (int)(sizeof(TUYA_KWS_HEYTUYA_TOKENS) /
-                                         sizeof(TUYA_KWS_HEYTUYA_TOKENS[0])),
+    if (keyword_tflite_add_keyword(hdl, TUYA_KWS_NAME, TUYA_KWS_NIHAOTUYA_TOKENS,
+                                   (int)(sizeof(TUYA_KWS_NIHAOTUYA_TOKENS) /
+                                         sizeof(TUYA_KWS_NIHAOTUYA_TOKENS[0])),
                                    TUYA_KWS_THRESHOLD) != 0
-        || keyword_tflite_add_keyword(hdl, TUYA_KWS_NAME2, TUYA_KWS_HEY2_TOKENS,
-                                      (int)(sizeof(TUYA_KWS_HEY2_TOKENS) /
-                                            sizeof(TUYA_KWS_HEY2_TOKENS[0])),
+        || keyword_tflite_add_keyword(hdl, TUYA_KWS_NAME2, TUYA_KWS_HEYTUYA_TOKENS,
+                                      (int)(sizeof(TUYA_KWS_HEYTUYA_TOKENS) /
+                                            sizeof(TUYA_KWS_HEYTUYA_TOKENS[0])),
                                       TUYA_KWS_THRESHOLD) != 0) {
         printf("[TUYA-KWS] add_keyword fail, destroy+fallback\r\n");
         keyword_tflite_destroy(hdl);
         s_hdl = NULL;
         return -1;
     }
-    printf("[TUYA-KWS] ready: gating ON heytuya={27,8,22,5} heytuya2={27,8,22} "
-           "(greedy thr=%.3f window=%ums)\r\n",
+    printf("[TUYA-KWS] ready: gating ON nihaotuya={23,4,27,9,22,5,38,1} "
+           "heytuya={27,8,22,5,38,1} (greedy thr=%.3f window=%ums)\r\n",
            TUYA_KWS_THRESHOLD, (unsigned)TUYA_KWS_AWAKE_MS);
 #endif
 #if TUYA_KWS_PROBE_LOG
@@ -232,11 +221,11 @@ static void kws_push(const short *pcm, int samples)
     if (strcmp(r.name, TUYA_KWS_NAME) == 0 ||
         strcmp(r.name, TUYA_KWS_NAME2) == 0) {
         s_awake_until = timer_get_ms() + TUYA_KWS_AWAKE_MS;
-        /* 同一句 utterance 双命中拦截:heytuya2{27,8,22} 前缀窗先中(~0.3s 处),
-         * heytuya{27,8,22,5} 全词窗后中——greedy 容差下全词窗可跨到上百帧外
-         * (实测同一句两次命中起点同为 f=3621,第二次晚 4s 才返回,多播一声
-         * "我在")。按命中起点帧判同句,与时间无关:|Δstart|<50 帧(2s)视为
-         * 同一句,只认第一次;真正的重复唤醒起点至少差整句长度。*/
+        /* 同一句 utterance 双命中拦截:两词共享"涂鸦"尾段({...,22,5,38,1},
+         * 且 greedy 容差下 9/8 可互替),说"你好涂鸦"可能 nihaotuya、heytuya
+         * 相继各中一次,多播一声"我在";同一词的滑窗也可能重复返回(实测
+         * 第二次可晚数秒)。按命中起点帧判同句:|Δstart|<50 帧(2s)视为同一
+         * 句,只认第一次;真正的重复唤醒起点至少差整句长度。*/
         if (s_last_wake_start > -1000000 &&
             abs(r.start_frame - s_last_wake_start) < TUYA_KWS_DUP_START_FRAMES) {
             printf("[TUYA-KWS] WAKE dup '%s' f=%d (last start %d), suppressed\r\n",

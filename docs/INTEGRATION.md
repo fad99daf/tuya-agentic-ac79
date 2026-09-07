@@ -528,8 +528,8 @@ Wi-Fi 一通即自动连涂鸦 AI Agent。
 
 ## 增量:唤醒词子系统(2026-09)
 
-唤醒词"嘿tuya"由涂鸦闭源 KWS 引擎(`tuya_agentic/kws/audio_subsys.a`)常开识别,命中后播应答提示音并开 15s 唤醒窗,**窗内本地 VAD 才允许起轮**;引擎初始化失败自动回退"常听"(与未接入时行为一致)。
+唤醒词**"你好涂鸦"(主)+"嘿涂鸦"(兼容)**由涂鸦闭源 KWS 引擎(`tuya_agentic/kws/audio_subsys.a`,声学团队 v2 算法包,`create(NULL)` 默认模型 fsmn_v8_0515_avg,40 类 CTC 词表)常开识别。两个唤醒词均按官方配置注册、阈值 0.7:你好涂鸦={23,4,27,9,22,5,38,1}、嘿涂鸦={27,8,22,5,38,1}。命中后播应答提示音并开 15s 唤醒窗,**窗内本地 VAD 才允许起轮**;引擎初始化失败自动回退"常听"(与未接入时行为一致)。整机已实测"你好涂鸦"生效(2026-09-07)。
 
 接入点:Makefile/cbp 增加 kws 目录(include + `tuya_kws.c`/`kws_cxx_shim.cc` + 链接 `audio_subsys.a`)、`app_config.h` 的 `TUYA_KWS_ENABLE`、`app_music.c` 的应答提示音、资源 `cpu/wl82/tools/audlogo/WakeHeyTuya.mp3`。
 
-引擎标定结论(greedy"前缀窗+跳过"触发机制、5 个必改配置、[27,8] token 指纹、跨句拼装防护)、参数速查与调参/日志指南见 [`WAKEWORD.md`](WAKEWORD.md)。
+v2 包与默认模型分析、官方 token、greedy"前缀窗+跳过"触发机制、5 个必改配置、同句双命中拦截(两词共用"涂鸦"尾,9/8 易混)、跨句拼装防护、参数速查与调参/日志指南见 [`WAKEWORD.md`](WAKEWORD.md)。

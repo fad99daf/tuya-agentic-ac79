@@ -75,6 +75,7 @@
 <Add directory="../../../../apps/common/LLM/tuya_agentic/tuya_inc" />
 			<Add directory="../../../../apps/common/LLM/tuya_agentic/libopus" />
 <Add directory="../../../../apps/common/LLM/tuya_agentic" />
+<Add directory="../../../../apps/common/LLM/tuya_agentic/kws" />
 <Add directory="../../../../apps/common/LLM/tuya_agentic/stm" />
 <Add directory="../../../../apps/common/LLM/tuya_agentic/stm/include" />
 <Add directory="../../../../apps/common/LLM/tuya_agentic/agentic-kit/pal" />
@@ -226,6 +227,7 @@
 <Add option="../../../../cpu/wl82/liba/lib_opus_dec.a" />
 			<Add option="../../../../apps/common/LLM/tuya_agentic/libopus/libopus_tuya.a" />
 			<Add option="../../../../apps/common/LLM/tuya_agentic/stm/libstm_tuya.a" />
+			<Add option="../../../../apps/common/LLM/tuya_agentic/kws/audio_subsys.a" />
 <Add option="../../../../cpu/wl82/liba/lib_amr_dec.a" />
 <Add option="../../../../cpu/wl82/liba/lib_amr_enc.a" />
 <Add option="../../../../cpu/wl82/liba/lib_amrwb_enc.a" />
@@ -1253,5 +1255,9 @@
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/core_mqtt_state.c"><Option compilerVar="CC" /></Unit>
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya-ble/src/tuya_ble_prov.c"><Option compilerVar="CC" /></Unit>
 		<Unit filename="../../../../apps/common/LLM/tuya_agentic/tuya_opus_enc.c"><Option compilerVar="CC" /></Unit>
+		<Unit filename="../../../../apps/common/LLM/tuya_agentic/kws/tuya_kws.c"><Option compilerVar="CC" /></Unit>
+		<Unit filename="../../../../apps/common/LLM/tuya_agentic/kws/kws_cxx_shim.cc">
+			<Option compiler="pi32v2_r3_empty_compiler" use="1" buildCommand="$compiler $options -std=gnu++14 -fno-exceptions -fno-rtti $includes -c $file -o $object" />
+		</Unit>
 </Project>
 </CodeBlocks_project_file>

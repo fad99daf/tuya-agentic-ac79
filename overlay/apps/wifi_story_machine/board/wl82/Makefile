@@ -225,6 +225,7 @@ INCLUDES := \
 	-I../../../../include_lib/net/web_socket \
 	-I../../../../include_lib/net/network_download \
 	-I../../../../apps/common/LLM/tuya_agentic \
+	-I../../../../apps/common/LLM/tuya_agentic/kws \
 	-I../../../../apps/common/LLM/tuya_agentic/stm \
 	-I../../../../apps/common/LLM/tuya_agentic/stm/include \
 	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/pal \
@@ -238,10 +239,10 @@ INCLUDES := \
 	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/include \
 	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/interface \
 	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya-ble/include \
-    ../../../../apps/common/LLM/tuya_agentic/libopus/include \
-    ../../../../apps/common/LLM/tuya_agentic/libopus/celt \
-    ../../../../apps/common/LLM/tuya_agentic/libopus/silk \
-    ../../../../apps/common/LLM/tuya_agentic/libopus/silk/fixed \
+	-I../../../../apps/common/LLM/tuya_agentic/libopus/include \
+	-I../../../../apps/common/LLM/tuya_agentic/libopus/celt \
+	-I../../../../apps/common/LLM/tuya_agentic/libopus/silk \
+	-I../../../../apps/common/LLM/tuya_agentic/libopus/silk/fixed \
 
 
 # 需要编译的 .c 文件
@@ -481,8 +482,9 @@ c_SRC_FILES := \
 	../../../../apps/common/LLM/tuya_agentic/tuya_music.c \
 	../../../../apps/common/LLM/tuya_agentic/tuya_ota.c \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya-ble/src/tuya_ble_prov.c \
-	../../../../apps/common/LLM/tuya_agentic/le_net_cfg_tuya.c \
+    ../../../../apps/common/LLM/tuya_agentic/le_net_cfg_tuya.c \
     ../../../../apps/common/LLM/tuya_agentic/tuya_opus_enc.c \
+    ../../../../apps/common/LLM/tuya_agentic/kws/tuya_kws.c \
 
 
 # 需要编译的 .S 文件
@@ -511,7 +513,8 @@ cpp_SRC_FILES := \
 
 
 # 需要编译的 .cc 文件
-cc_SRC_FILES :=
+cc_SRC_FILES := \
+	../../../../apps/common/LLM/tuya_agentic/kws/kws_cxx_shim.cc \
 
 
 # 需要编译的 .cxx 文件
@@ -577,6 +580,7 @@ LFLAGS := \
 	../../../../cpu/wl82/liba/lib_opus_dec.a \
 	../../../../apps/common/LLM/tuya_agentic/libopus/libopus_tuya.a \
 	../../../../apps/common/LLM/tuya_agentic/stm/libstm_tuya.a \
+	../../../../apps/common/LLM/tuya_agentic/kws/audio_subsys.a \
 	../../../../cpu/wl82/liba/lib_amr_dec.a \
 	../../../../cpu/wl82/liba/lib_amr_enc.a \
 	../../../../cpu/wl82/liba/lib_amrwb_enc.a \

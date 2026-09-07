@@ -3655,6 +3655,14 @@ void app_music_play_ota_prompt(int type)
     app_music_play_voice_prompt(fname, NULL);
 }
 
+/* 涂鸦唤醒应答播报(供 tuya_agentic 跨文件调用;导出模式同上):
+ * "嘿tuya" 唤醒命中后播 WakeHeyTuya.mp3(取自 TuyaOpen 标准唤醒应答"我在"资源,
+ * 由 cpu/wl82/tools/audlogo/ 经 packres 打入 AUPACKRES 资源包)。*/
+void app_music_tuya_play_wake_prompt(void)
+{
+    app_music_play_voice_prompt("WakeHeyTuya.mp3", NULL);
+}
+
 /*
  * ****************************绘本识别*************************************
  */

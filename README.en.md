@@ -9,7 +9,7 @@ End-side port of **Tuya agentic-kit** (AI Agent cloud voice chat) onto the **Jie
 ## Features
 
 - **Voice chat** — realtime interaction (ASR + LLM + TTS)
-- **Wake word "hey tuya"** — always-on recognition via Tuya's closed-source KWS engine (`kws/audio_subsys.a`): on a hit it plays the "I'm here" alert and opens a 15s awake window in which the local VAD may start a turn; same-utterance double-hit suppression and cross-utterance gluing protection included. Falls back to always-listening automatically if the engine fails to init. Engine calibration, parameters, and tuning guide in [`docs/WAKEWORD.md`](docs/WAKEWORD.md) (Chinese)
+- **Wake word "ni hao tu ya" (你好涂鸦) + "hei tu ya" (嘿涂鸦)** — always-on recognition via Tuya's closed-source KWS engine (`kws/audio_subsys.a` v2 package, default model fsmn_v8_0515_avg). Both words registered with official CTC tokens — 你好涂鸦={23,4,27,9,22,5,38,1} (primary), 嘿涂鸦={27,8,22,5,38,1} — threshold 0.7 each. On a hit it plays the "I'm here" alert and opens a 15s awake window in which the local VAD may start a turn; same-utterance double-hit suppression and cross-utterance gluing protection included. Falls back to always-listening automatically if the engine fails to init. Parameters and tuning guide in [`docs/WAKEWORD.md`](docs/WAKEWORD.md) (Chinese)
 - **Uplink ASR** — opus (default; local libopus 1.4 fixed-point software encoder, 16k/mono/CBR 16kbps/40ms, ~2KB/s — 1/16 of PCM) / PCM (optional, 32KB/s). The mic pipeline stays PCM (VAD/AEC/energy gate/barge-in unaffected); encoding happens per frame only at send time, with automatic PCM fallback if the encoder fails to init. Verified over both TCP and UDP transports
 - **Downlink TTS** — opus (default, ~2KB/s fights stutter on congested networks) / PCM (optional, stable). Opus now works: CBR + `sample_rate=0` auto-resampling
 - **Selectable transport (TCP / UDP)** — TCP by default (source-level `rtc-tcp-client`, behavior unchanged); optionally switches to Tuya's prebuilt STM OPEN SDK (`stm/libstm_tuya.a`: races UDP/DTLS vs TCP, UDP-first with automatic fallback) via the single `TUYA_TRANSPORT_STM_ENABLE` switch — both backends compile side by side. See `stm/README.md`
@@ -87,6 +87,8 @@ bash ../tuya-agentic-ac79/apply.sh .
 make ac791n_wifi_story_machine
 ```
 
+> ⚠ **Command-line make caveat**: JieLi's bundled old GNU make (`C:/JL/mc/bin/make.exe`) does not understand the Makefile's `$(file >...)` and **silently skips the objs.txt rewrite** — the link step then consumes a stale obj list from a previous build (e.g. CodeBlocks'), producing firmware mixed with old code without any error. Command-line builds must pass full overrides: `make -j8 MKDIR="mkdir -p" RM="rm -rf" LINK_AT=0` (MKDIR/RM overridden because `mkdir_win` is not on this machine; delete `sdk.elf` first if in doubt). Building from the JieLi CodeBlocks IDE is unaffected.
+
 After merging, `apps/common/LLM/tuya_agentic/` holds the integration code, and `apps/wifi_story_machine/` auto-starts the Tuya flow on boot.
 
 ---
@@ -131,7 +133,7 @@ Edit `apps/wifi_story_machine/include/app_config.h`:
 | `CONFIG_TUYA_AGENTIC_ENABLE` | Tuya integration master switch (controls Makefile sources + K6 reset branch + auto-start) | on |
 | `TUYA_TRANSPORT_STM_ENABLE` | Voice transport: 0 = TCP (rtc-tcp-client sources); 1 = Tuya STM lib (UDP-first, races UDP/TCP with fallback) — see `stm/README.md` | 0 |
 | `TUYA_BARGE_IN_ENABLE` | Interrupt TTS (depends on AEC; experimental) | on |
-| `TUYA_KWS_ENABLE` | Wake word "hey tuya" gating (closed-source engine, always-on; falls back to always-listening on engine failure) — see `docs/WAKEWORD.md` | on |
+| `TUYA_KWS_ENABLE` | Wake word "你好涂鸦" (primary) + "嘿涂鸦" gating (closed-source engine, always-on; falls back to always-listening on engine failure) — see `docs/WAKEWORD.md` | on |
 | `TUYA_DOWNLINK_OPUS_ENABLE` | Use opus for downlink TTS (fights stutter); commented = PCM | on |
 | `TUYA_UPLINK_OPUS_ENABLE` | Encode uplink ASR with the local libopus fixed-point encoder (~2KB/s); commented = PCM (32KB/s) | on |
 | `TUYA_SERVER_VAD_ENABLE` | Cloud VAD end-of-speech (wake-up stays local VAD; local 2s silence fallback) | on |
@@ -188,7 +190,7 @@ Edit `apps/wifi_story_machine/include/app_config.h`:
 
 Full list in [`docs/CHANGES.md`](docs/CHANGES.md). Summary:
 
-- **New** `apps/common/LLM/tuya_agentic/`: `tuya_agentic_demo.c` (main loop), `pal_ac791n.c` (PAL), `le_net_cfg_tuya.c/.h` (BLE provisioning), `tuya_music.c/.h` (music skill parsing), `tuya_ota.c/.h` (OTA), `tuya_opus_enc.c/.h` + `libopus/` (uplink opus encoding, prebuilt archive included), `stm/` (Tuya STM OPEN SDK adapter for the optional UDP transport: `tuya_stm_ai.c` + `stm_port_ac79_shim.c` + prebuilt libs + repatch script), `kws/` (wake word "hey tuya": closed-source engine `audio_subsys.a` + reverse-engineered API header + C++ shim + thin wrapper — see `docs/WAKEWORD.md`), bool-compat shims, and the pulled-in `agentic-kit/`
+- **New** `apps/common/LLM/tuya_agentic/`: `tuya_agentic_demo.c` (main loop), `pal_ac791n.c` (PAL), `le_net_cfg_tuya.c/.h` (BLE provisioning), `tuya_music.c/.h` (music skill parsing), `tuya_ota.c/.h` (OTA), `tuya_opus_enc.c/.h` + `libopus/` (uplink opus encoding, prebuilt archive included), `stm/` (Tuya STM OPEN SDK adapter for the optional UDP transport: `tuya_stm_ai.c` + `stm_port_ac79_shim.c` + prebuilt libs + repatch script), `kws/` (wake word "你好涂鸦"+"嘿涂鸦": closed-source engine `audio_subsys.a` — acoustics team v2 package — + reverse-engineered API header + C++ shim + thin wrapper — see `docs/WAKEWORD.md`), bool-compat shims, and the pulled-in `agentic-kit/`
 - **Edited SDK files** (10): `audio_input.c/.h`, `user_cfg.c` (AEC), `app_music.c` (K6 + music playback exports + wake alert prompt), `Makefile`, `AC791N_WIFI_STORY_MACHINE.cbp`, `app_config.h`, `wifi_app_task.c`, `app_main.c` (btstack stack 768→2048)
 - **New resource** `cpu/wl82/tools/audlogo/WakeHeyTuya.mp3` (wake alert prompt, copied verbatim by overlay; other stock audlogo files are not touched)
 - **Optional debug change**: `board_7916A.c` (UART baudrate, just for logs)
@@ -208,7 +210,7 @@ tuya-agentic-ac79/
 │   └── tuya-agentic-v1.2.0.patch   ← unified diff of the 10 changed files
 └── docs/
     ├── INTEGRATION.md   ← integration architecture
-    ├── WAKEWORD.md      ← wake-word subsystem: engine calibration / params / tuning / logs (Chinese)
+    ├── WAKEWORD.md      ← wake-word subsystem: v2 engine & official tokens / params / tuning / logs (Chinese)
     └── CHANGES.md       ← full change list
 ```
 

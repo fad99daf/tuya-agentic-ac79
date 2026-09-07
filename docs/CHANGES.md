@@ -300,3 +300,30 @@ flash 布局改动(为双备份 OTA 腾空间):
 - `patches/tuya-agentic-v1.2.0.patch` 重生成:Makefile / app_config.h / app_music.c 等带入 KWS 接线(仍是那 10 个文件,顺序不变)。
 - overlay 新增:`kws/` 5 个文件 + `cpu/wl82/tools/audlogo/WakeHeyTuya.mp3`;`tuya_agentic_demo.c` / `tuya_music.c` 整文件更新到 2026-09-06 版(含 I/J/K 全部改动)。
 - 凭据惯例不变:overlay 的 demo.c 仍是 `YOUR_PID_HERE` 占位符(不含任何作者私有凭证)。
+
+---
+
+## 2026-09-07 增量改动(唤醒词切"你好涂鸦":v2 算法包 + 官方 token)
+
+### M. 声学团队 v2 算法包接入(`kws/audio_subsys.a` 整体替换)
+
+- 包:`jieli_lib_v2.zip`(2026-09-07),`audio_subsys.a` 2.7MB→6.6MB。llvm 工具核实:编入声学团队整套模型库(`*_model_data` 约 30 个),但**引擎对象实际引用的默认模型只有一个 `g_fsmn_v8_0515_avg_int8_model_data`**,其余无人引用、LTO 后全裁,固件体积不变;引擎侧常量与 v1 完全一致(arena CHECK≤49152、TFLite 束堆 50336、C ABI 原样),v1 标定的 5 项配置继续有效。
+- 附带的 `tal_log.h` 与 v1 相同(speexdsp 日志垫片),未换。
+
+### N. 唤醒词切"你好涂鸦"(官方 token 取代自标定)
+
+- `tuya_kws.c` v7:注册 `nihaotuya={23,4,27,9,22,5,38,1}`(主,8 token)+ `heytuya={27,8,22,5,38,1}`(兼容,6 token),阈值均 **0.70**(声学团队官方值);注册名保持 ASCII。
+- 取代 v6.1 探针自标定序列(`{27,8,22}`/`{27,8,22,5}`,thr 0.50);探针 k00-k39 保留仅作观测。同句双命中拦截保留并更新注释(两词共享"涂鸦"尾段且 9/8 容差互替,同句可能双中)。
+- `tuya_kws.h`/`app_config.h` 注释同步;应答音仍用 `WakeHeyTuya.mp3`("我在"应答,与唤醒词无绑定)。
+- **2026-09-07 真机验证:唤醒"你好涂鸦"生效。**
+
+### O. Makefile 修复(libopus include 漏 `-I`,命令行 make 必失败)
+
+- `board/wl82/Makefile` 的 libopus 4 个 include 路径(`libopus/include|celt|silk|silk/fixed`)是裸路径没有 `-I` 前缀——clang 不认,`tuya_opus_enc.c` 必报 `'opus.h' file not found`。此前只被 CodeBlocks 构建掩盖(cbp 自己的 include 列表是对的)。已补 `-I`。
+- **命令行 make 注意**(本机环境结论,README 排障表同步):杰理自带 `C:/JL/mc/bin/make.exe` 是老 GNU make,不认识 `$(file >...)`——会**静默跳过 objs.txt 重写**,链接吃上次构建留下的旧 `sdk.elf.objs.txt`(如昨天 CodeBlocks 的 `obj/Release` 列表),产出旧代码混合固件。命令行构建必须:`make -j8 MKDIR="mkdir -p" RM="rm -rf" LINK_AT=0`(本机无 `mkdir_win`,故同时覆盖 MKDIR/RM)。
+
+### P. 上次(09-06)overlay 同步缺漏补齐
+
+- 排查发现 09-06 只重新生成了 patch,**overlay 副本没跟上**:overlay 的 Makefile/.cbp 缺 kws 接线(include/源文件/链接行)、app_config.h 缺 `TUYA_KWS_ENABLE` 块、app_music.c 缺 `app_music_tuya_play_wake_prompt()`。本次已全部补齐(直接以开发树文件覆盖)。若曾用 09-06 版 overlay 全新铺 SDK,唤醒词实际是没接上的(patch 方式不受影响)。
+- 本次同步的 overlay 文件(7 个):`kws/audio_subsys.a`、`kws/tuya_kws.c`、`kws/tuya_kws.h`、`include/app_config.h`、`board/wl82/Makefile`、`board/wl82/AC791N_WIFI_STORY_MACHINE.cbp`、`app_music.c`。demo.c 仅凭据差异(占位符惯例),未动。
+- patch 对基线 tag `AC79NN_SDK_V1.2.12_2026-03-07` 重新生成,仍是那 10 个文件。

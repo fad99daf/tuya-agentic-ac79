@@ -1,7 +1,7 @@
 #ifndef __TUYA_KWS_H__
 #define __TUYA_KWS_H__
 /* ============================================================================
- * tuya_kws.h — AC79 唤醒词("嘿tuya")薄封装
+ * tuya_kws.h — AC79 唤醒词("你好涂鸦"主 + "嘿涂鸦"兼容)薄封装
  *
  * 对齐 TuyaOpen 的 tkl_kws 流程：初始化 → 喂帧 → 唤醒事件。
  * 引擎 = apps/common/LLM/tuya_agentic/kws/audio_subsys.a(涂鸦闭源)。
