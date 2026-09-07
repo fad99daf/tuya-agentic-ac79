@@ -1657,3 +1657,16 @@ index dc4f1e38..cdfb9d69 100644
  #ifdef CONFIG_TWETALK_ENABLE
          // 联网成功后 初始化twetlak
          extern int start_tc_iot_twetalk(void);
+diff --git a/cpu/wl82/tools/isd_config_rule.c b/cpu/wl82/tools/isd_config_rule.c
+index 8bed33ba..62563750 100644
+--- a/cpu/wl82/tools/isd_config_rule.c
++++ b/cpu/wl82/tools/isd_config_rule.c
+@@ -324,7 +324,7 @@ BTBOX_MIN_VER=1.2.4.f;
+ VM_ADR=0; [设置VM]
+ VM_LEN=32K;
+ #if CONFIG_DOUBLE_BANK_ENABLE
+-VM_OPT=0;
++VM_OPT=1;//双备份OTA升级时保留VM数据(涂鸦三元组/WiFi凭据存在VM里,擦了要重新配网)。版本号持久化也依赖此。
+ #else
+ VM_OPT=0;//单备份升级VM在升级时候默认VM不需要擦除,选择擦除会在ota_loader第二阶段擦除比较长，而且可能会造成VM丢失
+ #endif

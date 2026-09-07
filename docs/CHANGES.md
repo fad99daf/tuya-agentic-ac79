@@ -13,7 +13,7 @@
 | 类别 | 说明 |
 |---|---|
 | **A. 新建集成模块** | `apps/common/LLM/tuya_agentic/` 下手写的胶水代码(PAL / 配网 / 对话主流程 / bool 补丁 / **OTA 编排** / **音乐技能**) |
-| **B. 改动的 SDK 原有文件** | 10 个:Makefile、user_cfg.c、app_music.c、app_main.c、app_config.h、wifi_app_task.c、audio_input.c/.h、board_7916A.c、AC791N_...cbp |
+| **B. 改动的 SDK 原有文件** | 11 个:Makefile、user_cfg.c、app_music.c、app_main.c、app_config.h、wifi_app_task.c、audio_input.c/.h、board_7916A.c、AC791N_...cbp、isd_config_rule.c |
 | **C. 引入的依赖(原样,未改)** | 涂鸦开源 `rtc-tcp-client`/`iot-client`/`tuya-ble`/`common` + AWS `coreHTTP`/`coreMQTT` |
 
 ---
@@ -87,9 +87,9 @@ AC79 上手写的涂鸦 BLE GATT 配网传输层(SDK 原版无):
 把涂鸦的云协议(ATOP over HTTPS)和杰理的下载烧写链路(`get_update_data`)串起来。`TUYA_OTA_ENABLE` 门控。
 - **`tuya_ota_check_and_upgrade(client)`**:开机连 AI 之前调(此时 iot_client 活着,无并发冲突)。独立线程 `tuya_ota_chk` 跑 `tuya_iot_ota_check_upgrade`,主线程信号量限时等待 `TUYA_OTA_CHECK_TIMEOUT_MS=7000`——防 ATOP HTTPS 握手失败时卡满 SDK 内部 5s 超时拖慢开机。
 - **流程**:无升级返回 0;有升级→`report_status(UPGRADING)`→播"正在升级"→`get_update_data(url)` 下载烧写(成功则内部 `net_fclose` 自动 `system_reset`)。成功抢在 2s reset 窗口内上报 FINI。
-- **版本号管理(手动方案)**:`tuya_get_effective_sw_ver()` 直接返回 `TUYA_FIRMWARE_VERSION`。跨 OTA 自动持久化版本号(VM/USER/BTIF/RTC)经实测**全部不可靠**(均会被擦除/覆盖),故采用手动方案——每次发版前在 `app_config.h` 改 `TUYA_FIRMWARE_VERSION` 与涂鸦平台一致。`tuya_save_upgraded_sw_ver`/`tuya_clear_upgraded_sw_ver` 保留为空实现(调用方仍调用,不报错)。
+- **版本号管理(手动方案)**:`tuya_get_effective_sw_ver()` 直接返回 `TUYA_FIRMWARE_VERSION`。即便 `VM_OPT=1`(B7)保住了配网数据,跨 OTA 自动持久化版本号(VM/USER/BTIF/RTC)经实测**仍全部不可靠**(均会被擦除/覆盖),故采用手动方案——每次发版前在 `app_config.h` 改 `TUYA_FIRMWARE_VERSION` 与涂鸦平台一致。`tuya_save_upgraded_sw_ver`/`tuya_clear_upgraded_sw_ver` 保留为空实现(调用方仍调用,不报错)。
 - **`TUYA_OTA_ENABLE=0` 时**提供空实现,调用方无需 `#ifdef` 包裹。
-- **双备份**:配合 `CONFIG_DOUBLE_BANK_ENABLE=1`(两份固件并存 ~4.6MB),`CONFIG_AUDIO_PACKRES_LEN` 缩到 512KB 腾空间。OTA 提示音(OtaInUpdate/OtaSuccess/OtaFailed.mp3)是杰理官方 SDK 自带的,overlay 不含。
+- **双备份**:配合 `CONFIG_DOUBLE_BANK_ENABLE=1`(两份固件并存 ~4.6MB),`CONFIG_AUDIO_PACKRES_LEN` 缩到 512KB 腾空间。OTA 提示音(OtaInUpdate/OtaSuccess/OtaFailed.mp3)是杰理官方 SDK 自带的,overlay 不含。**依赖 `isd_config_rule.c` 的 `VM_OPT=1`(见 B7)**——否则 OTA 会擦掉 VM 里的三元组/WiFi 凭据,升级后需重新配网。
 
 ### A7. `tuya_music.c` + `.h` — 涂鸦音乐技能(解析)⭐新增
 "播放XXX的歌"时云端回音乐 SKILL JSON(带试听 mp3 URL)。本文件并行重组文本流并解析出 URL/歌名/歌手,播放交给 `app_music` 网络解码链(demo.c ⑤ 交接块编排):
@@ -175,6 +175,22 @@ flash 布局改动(为双备份 OTA 腾空间):
 - PCM 下行缓冲满时**不再 `cbuf_clear`**(会瞬间丢整缓冲→截断),改丢本次新数据 + 计数 `dl_full_cnt` 诊断。
 - 下行播放缓冲 TUYA 分支开到 **64×=1MB(≈32s)**,吸收长答案突发下发,配合 demo.c play-drain-wait(35s > 32s)。
 - `AUDIO_PLAY_VOICE_VOLUME=50`(原 80 太大)。
+
+### B7. `cpu/wl82/tools/isd_config_rule.c` — 双备份 OTA 时保留 VM 分区
+
+`[设置VM]` 段(L324~）`CONFIG_DOUBLE_BANK_ENABLE` 分支下 `VM_OPT` 由 `0` 改为 **`1`**:
+
+```
+#if CONFIG_DOUBLE_BANK_ENABLE
+VM_OPT=1;//双备份OTA升级时保留VM数据(涂鸦三元组/WiFi凭据存在VM里,擦了要重新配网)。版本号持久化也依赖此。
+#else
+VM_OPT=0;//单备份...(原样不动)
+#endif
+```
+
+- **为什么**:涂鸦三元组 / WiFi 凭据存在 VM 176~183(见 A1②)。OTA 走双备份(B4 开的 `CONFIG_DOUBLE_BANK_ENABLE=1`),若 `VM_OPT=0`,升级过程会擦除 VM → 设备重启后读不到 devid → 被迫重新配网。`VM_OPT=1` 让升级时保留 VM 数据。
+- 仅改 `CONFIG_DOUBLE_BANK_ENABLE` 为真的分支;`#else`(单备份)分支保持 SDK 原样。
+- 与 A6 OTA、B4 flash 布局是同一功能链的必要一环。
 
 ---
 
