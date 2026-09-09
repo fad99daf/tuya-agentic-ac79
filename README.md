@@ -211,10 +211,16 @@ tuya-agentic-ac79/
 ├── patches/
 │   └── tuya-agentic-v1.2.0.patch   ← 10 个改动文件的 diff
 └── docs/
+    ├── README.md        ← 文档索引
     ├── INTEGRATION.md   ← 集成架构与原理
     ├── WAKEWORD.md      ← 唤醒词子系统:v2 引擎与官方 token / 参数 / 调参 / 日志
-    └── CHANGES.md       ← 完整改动清单
+    ├── CHANGES.md       ← 完整改动清单
+    ├── WEATHER.md       ← (参考)天气获取功能集成说明(ATOP thing.weather.get)
+    ├── FACTORY-RESET.md ← (参考)恢复出厂设置说明(reset_callback / tuya.device.reset)
+    └── TIME-SYNC.md     ← (参考)设备时间校正方案(ATOP 校时,无 RTC)
 ```
+
+> `WEATHER.md` / `FACTORY-RESET.md` / `TIME-SYNC.md` 是**参考实现说明**,对应功能尚未合入本仓代码;需要的开发者可照文档自行落地。
 
 ---
 
