@@ -55,6 +55,16 @@ static struct {
 
 #define __this	(&wifi_app_hdl)
 
+#ifdef CONFIG_TUYA_AGENTIC_ENABLE
+/* Tuya 首次配网必须等待本次 DHCP/MAC 前置流程结束，不能复用旧连接的状态。 */
+static volatile u32 s_tuya_network_ready_generation;
+
+u32 wifi_get_tuya_network_ready_generation(void)
+{
+    return s_tuya_network_ready_generation;
+}
+#endif
+
 extern void airkiss_ssid_check(void);
 
 int __attribute__((weak)) wifi_force_set_lan_setting_info(void)
@@ -672,6 +682,10 @@ static int wifi_event_callback(void *network_ctx, enum WIFI_EVENT event)
 
         net.arg = "net";
         net.event = NET_EVENT_CONNECTED;
+#ifdef CONFIG_TUYA_AGENTIC_ENABLE
+        /* 必须在可能阻塞的应用事件前发布，唤醒 Tuya onboarding 等待线程。 */
+        s_tuya_network_ready_generation++;
+#endif
         net_event_notify(NET_EVENT_FROM_USER, &net);
         break;
 

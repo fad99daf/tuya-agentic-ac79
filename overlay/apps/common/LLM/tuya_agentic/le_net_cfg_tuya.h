@@ -75,8 +75,9 @@ int tuya_ble_netcfg_start(const char *device_name,
                           const char *auth_key,
                           tuya_prov_result_cb_t cb);
 
-/* 停止 BLE、释放蓝牙内存(配网成功、连上 WiFi 后调,腾出 RAM 给 TLS/AI)*/
-void tuya_ble_netcfg_stop(void);
+/* 停止本配网 profile 的广播和连接。
+ * 注意：本模块没有调用官方 bt_ble_init()，因此不能调用 bt_ble_exit()。*/
+int tuya_ble_netcfg_stop(void);
 
 #ifdef __cplusplus
 }
