@@ -26,7 +26,7 @@
 extern void le_device_db_init(void);
 extern void hci_event_callback_set(void (*cb)(u8, u16, u8 *, u16));
 extern void le_l2cap_register_packet_handler(void (*cb)(u8, u16, u8 *, u16));
-extern void bt_ble_adv_enable(u8 enable);
+extern void bt_ble_exit(void);
 /* ble_user_cmd_prepare / att_get_ccc_config / sm_* 用头里(ble_api.h/att.h/sm.h)的声明 */
 
 /* tuya-ble 需要的 HAL:随机数 */
@@ -46,8 +46,19 @@ static tuya_ble_prov_state_t s_prov;          /* tuya-ble 协议状态(含收发
 static volatile u16 s_con_handle = 0;
 static volatile u8  s_notify_enabled = 0;
 static volatile u8  s_prov_done = 0;           /* 已拿到 {ssid,password,token} */
+static volatile u8  s_stop_requested = 0;      /* 主动退出期间禁止断链回调重开广播 */
+static volatile u8  s_ble_started = 0;
+static volatile u8  s_ble_exited = 0;          /* 使 stop 可重复调用 */
+static volatile u16 s_disconnect_requested_handle = 0;
+static volatile int s_prov_error = 0;
 static tuya_prov_result_cb_t s_user_cb = NULL;
 static OS_SEM s_prov_sem;                      /* 配网完成信号(阻塞 tuya_ble_netcfg_start)*/
+static OS_MUTEX s_ble_stop_mutex;              /* 串行化主流程与 K6 的 stop 调用 */
+
+#define TUYA_BLE_STOP_TIMEOUT_MS       2000u
+#define TUYA_BLE_STOP_POLL_MS            20u
+#define TUYA_BLE_STOP_QUIET_MS          100u
+#define TUYA_BLE_CMD_RETRY_MS           200u
 
 /* ---------------- notify 回传(send_fn)---------------- */
 static int tuya_hal_send(const uint8_t *buf, uint16_t len, void *ctx)
@@ -132,13 +143,29 @@ static int tuya_att_write(u16 con, u16 handle, u16 transaction, u16 offset, u8 *
 }
 
 /* ---------------- 广播数据(用 tuya_ble_prov_get_adv_data 给的字节)---------------- */
-static void tuya_make_adv(void)
+static int tuya_make_adv(void)
 {
     const u8 *adv = NULL, *rsp = NULL; u8 al = 0, rl = 0;
+    ble_cmd_ret_e ret;
+
     tuya_ble_prov_get_adv_data(&s_prov, &adv, &al, &rsp, &rl);
-    ble_user_cmd_prepare(BLE_CMD_ADV_DATA, 2, al, (void *)adv);
-    ble_user_cmd_prepare(BLE_CMD_RSP_DATA, 2, rl, (void *)rsp);
-    ble_user_cmd_prepare(BLE_CMD_ADV_PARAM, 3, 0x30 /* interval*0.625ms */, 0 /*ADV_IND*/, 0x07 /*3 channels*/);
+    ret = ble_user_cmd_prepare(BLE_CMD_ADV_DATA, 2, al, (void *)adv);
+    if (ret != BLE_CMD_RET_SUCESS) {
+        printf("[tuya_ble] set adv data failed: ret=%d\r\n", ret);
+        return -1;
+    }
+    ret = ble_user_cmd_prepare(BLE_CMD_RSP_DATA, 2, rl, (void *)rsp);
+    if (ret != BLE_CMD_RET_SUCESS) {
+        printf("[tuya_ble] set rsp data failed: ret=%d\r\n", ret);
+        return -2;
+    }
+    ret = ble_user_cmd_prepare(BLE_CMD_ADV_PARAM, 3,
+                               0x30 /* interval*0.625ms */, 0 /*ADV_IND*/, 0x07 /*3 channels*/);
+    if (ret != BLE_CMD_RET_SUCESS) {
+        printf("[tuya_ble] set adv params failed: ret=%d\r\n", ret);
+        return -3;
+    }
+    return 0;
 }
 
 /* ---------------- HCI/ATT 事件回调 ---------------- */
@@ -155,6 +182,14 @@ static void tuya_pkt_handler(u8 packet_type, u16 channel, u8 *packet, u16 size)
         case HCI_SUBEVENT_LE_ENHANCED_CONNECTION_COMPLETE:
             s_con_handle = hci_subevent_le_connection_complete_get_connection_handle(packet);
             printf("[tuya_ble] connected, handle=%d\r\n", s_con_handle);
+            if (s_stop_requested) {
+                ble_cmd_ret_e ret = ble_user_cmd_prepare(BLE_CMD_DISCONNECT, 1, s_con_handle);
+                if (ret == BLE_CMD_RET_SUCESS) {
+                    s_disconnect_requested_handle = s_con_handle;
+                }
+                printf("[tuya_ble] late connection during stop, disconnect ret=%d\r\n", ret);
+                break;
+            }
             tuya_ble_prov_reset_conn(&s_prov);
             break;
         default:
@@ -162,13 +197,25 @@ static void tuya_pkt_handler(u8 packet_type, u16 channel, u8 *packet, u16 size)
         }
         break;
     case HCI_EVENT_DISCONNECTION_COMPLETE:
-        printf("[tuya_ble] disconnect, restart adv\r\n");
+        printf("[tuya_ble] disconnected, stop_requested=%d prov_done=%d\r\n",
+               s_stop_requested, s_prov_done);
         s_con_handle = 0;
+        s_disconnect_requested_handle = 0;
         s_notify_enabled = 0;
         tuya_ble_prov_set_paired(&s_prov, false);
-        if (!s_prov_done) {
-            tuya_make_adv();
-            bt_ble_adv_enable(1);
+        if (!s_stop_requested && s_ble_started && !s_prov_done) {
+            ble_cmd_ret_e ret;
+            if (tuya_make_adv() != 0) {
+                s_prov_error = -5;
+                os_sem_post(&s_prov_sem);
+                break;
+            }
+            ret = ble_user_cmd_prepare(BLE_CMD_ADV_ENABLE, 1, 1);
+            printf("[tuya_ble] restart advertising ret=%d\r\n", ret);
+            if (ret != BLE_CMD_RET_SUCESS) {
+                s_prov_error = -6;
+                os_sem_post(&s_prov_sem);
+            }
         }
         break;
     case ATT_EVENT_MTU_EXCHANGE_COMPLETE:
@@ -203,7 +250,12 @@ int tuya_ble_netcfg_start(const char *device_name,
     printf("[tuya_ble] netcfg start: name=%s pid=%s uuid=%s\r\n", device_name, product_key, uuid);
     s_user_cb = cb;
     s_prov_done = 0;
+    s_prov_error = 0;
+    s_stop_requested = 0;
+    s_ble_started = 0;
+    s_ble_exited = 0;
     s_con_handle = 0;
+    s_disconnect_requested_handle = 0;
     s_notify_enabled = 0;
     os_sem_create(&s_prov_sem, 0);
 
@@ -224,25 +276,118 @@ int tuya_ble_netcfg_start(const char *device_name,
     printf("[tuya_ble] prov_init ok\r\n");
 
     tuya_ble_profile_init();
+    s_ble_started = 1;
     printf("[tuya_ble] profile_init done\r\n");
 
-    tuya_make_adv();
+    if (tuya_make_adv() != 0) {
+        printf("[tuya_ble] advertising setup failed\r\n");
+        tuya_ble_netcfg_stop();
+        return -3;
+    }
     printf("[tuya_ble] make_adv done\r\n");
 
     /* 直接用底层 BLE 命令开广播,绕过 set_adv_enable 的 adv_ctrl_en 检查 */
-    ble_user_cmd_prepare(BLE_CMD_ADV_ENABLE, 1, 1);
-    printf("[tuya_ble] adv_enable(1) done, BLE broadcasting now\r\n");
+    ble_cmd_ret_e adv_ret = ble_user_cmd_prepare(BLE_CMD_ADV_ENABLE, 1, 1);
+    if (adv_ret != BLE_CMD_RET_SUCESS) {
+        printf("[tuya_ble] adv_enable(1) failed: ret=%d\r\n", adv_ret);
+        tuya_ble_netcfg_stop();
+        return -4;
+    }
+    printf("[tuya_ble] adv_enable(1) ret=%d, BLE broadcasting now\r\n", adv_ret);
 
     /* 阻塞等配网完成(prov_complete_cb 里 post 信号量)*/
     /* TODO: 加超时(如 60s),超时返回 -3。os_sem_pend 第 2 参为 tick,0=无限 */
     os_sem_pend(&s_prov_sem, 0);
-    return s_prov_done ? 0 : -3;
+    return s_prov_done ? 0 : (s_prov_error ? s_prov_error : -7);
 }
 
-void tuya_ble_netcfg_stop(void)
+static ble_cmd_ret_e tuya_ble_cmd_retry(ble_cmd_type_e cmd, int arg)
 {
-    ble_user_cmd_prepare(BLE_CMD_ADV_ENABLE, 1, 0);
-    printf("[tuya_ble] stopped\r\n");
+    ble_cmd_ret_e ret;
+    unsigned int waited_ms = 0;
+
+    do {
+        ret = ble_user_cmd_prepare(cmd, 1, arg);
+        if (ret != BLE_CMD_RET_BUSY) {
+            return ret;
+        }
+        os_time_dly(2);
+        waited_ms += TUYA_BLE_STOP_POLL_MS;
+    } while (waited_ms < TUYA_BLE_CMD_RETRY_MS);
+    return ret;
+}
+
+int tuya_ble_netcfg_stop(void)
+{
+    ble_cmd_ret_e ret;
+    unsigned int waited_ms = 0;
+    unsigned int quiet_ms = 0;
+    u16 disconnect_failed_handle = 0;
+    int result = 0;
+
+    os_mutex_pend(&s_ble_stop_mutex, 0);
+    if (s_ble_exited) {
+        os_mutex_post(&s_ble_stop_mutex);
+        return 0;
+    }
+
+    /* 必须先置位，封住 connection/disconnection 回调重开广播的竞态窗口。*/
+    s_stop_requested = 1;
+    ret = tuya_ble_cmd_retry(BLE_CMD_ADV_ENABLE, 0);
+    printf("[tuya_ble] stop advertising ret=%d\r\n", ret);
+    if (ret != BLE_CMD_RET_SUCESS && ret != BLE_CMD_STACK_NOT_RUN) {
+        result = -1;
+    }
+
+    /* 官方 le_net_cfg 的 HCI 断链回调会尝试恢复广播。先走一次模块退出入口，
+     * 将其 adv_ctrl_en 关闭；若官方层也持有连接 handle，它会同时发起断链。*/
+    bt_ble_exit();
+    printf("[tuya_ble] SDK advertising restart guard armed\r\n");
+
+    /* 连续 100ms 无连接才认为安静，覆盖 ADV disable 与 connection-complete 交错。*/
+    while (waited_ms < TUYA_BLE_STOP_TIMEOUT_MS && quiet_ms < TUYA_BLE_STOP_QUIET_MS) {
+        u16 handle = s_con_handle;
+
+        if (!handle) {
+            quiet_ms += TUYA_BLE_STOP_POLL_MS;
+        } else {
+            quiet_ms = 0;
+            if (s_disconnect_requested_handle != handle && disconnect_failed_handle != handle) {
+                ret = ble_user_cmd_prepare(BLE_CMD_DISCONNECT, 1, handle);
+                printf("[tuya_ble] disconnect request: handle=%d ret=%d\r\n", handle, ret);
+                if (ret == BLE_CMD_RET_SUCESS) {
+                    s_disconnect_requested_handle = handle;
+                } else if (ret != BLE_CMD_RET_BUSY) {
+                    disconnect_failed_handle = handle;
+                    if (result == 0) {
+                        result = -2;
+                    }
+                }
+            }
+        }
+
+        os_time_dly(2);
+        waited_ms += TUYA_BLE_STOP_POLL_MS;
+    }
+
+    if (s_con_handle) {
+        printf("[tuya_ble] disconnect timeout: handle=%d waited=%ums\r\n",
+               s_con_handle, waited_ms);
+        result = -3;
+    } else {
+        printf("[tuya_ble] link idle: waited=%ums\r\n", waited_ms);
+    }
+
+    /* 无论命令结果如何，退出模块都确保软复位前不保留 BLE 控制器活动态。*/
+    bt_ble_exit();
+    s_ble_started = 0;
+    s_ble_exited = 1;
+    s_con_handle = 0;
+    s_disconnect_requested_handle = 0;
+    s_notify_enabled = 0;
+    printf("[tuya_ble] module exited, result=%d\r\n", result);
+    os_mutex_post(&s_ble_stop_mutex);
+    return result;
 }
 
 /* ---- worker 任务:替 btstack 任务(栈只有 4KB)跑 mbedTLS 加密 ---- */
@@ -273,6 +418,7 @@ void tuya_ble_prov_worker(const u8 *data, u16 len)
 
 static int tuya_ble_worker_init(void)
 {
+    os_mutex_create(&s_ble_stop_mutex);
     return thread_fork("tuya_prov_w", 5, 2 * 1024, 8, 0, tuya_ble_prov_worker_task, NULL);
 }
 early_initcall(tuya_ble_worker_init);

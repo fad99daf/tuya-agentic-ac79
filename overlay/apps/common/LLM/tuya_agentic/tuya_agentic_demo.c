@@ -2376,7 +2376,13 @@ static int tuya_save_required_provision_data(iot_client_t *iot)
 
 static void tuya_provisioning_fail_and_reset(const char *stage, iot_client_t *iot)
 {
+    int ble_stop_ret;
+
     printf("[TUYA] provisioning failed at %s, reset to BLE provisioning\r\n", stage);
+    ble_stop_ret = tuya_ble_netcfg_stop();
+    if (ble_stop_ret != 0) {
+        printf("[TUYA] BLE stop failed during recovery: ret=%d\r\n", ble_stop_ret);
+    }
     if (iot) {
         iot_client_deinit(iot);
     }
@@ -2568,7 +2574,12 @@ void tuya_agentic_main(void *arg)
         tuya_provisioning_fail_and_reset("ble", NULL);
         return;
     }
-    tuya_ble_netcfg_stop();   /* 配网完停 BLE,释放内存给 WiFi/TLS */
+    int ble_stop_ret = tuya_ble_netcfg_stop();
+    if (ble_stop_ret != 0) {
+        printf("[TUYA] BLE stop failed after provisioning: ret=%d\r\n", ble_stop_ret);
+        tuya_provisioning_fail_and_reset("ble-stop", NULL);
+        return;
+    }
     printf("[TUYA] BLE done: ssid_len=%u token_len=%u\r\n",
            (unsigned int)strlen(s_main_creds.ssid),
            (unsigned int)strlen(s_main_creds.token));
@@ -2679,7 +2690,13 @@ void tuya_agentic_main(void *arg)
 void tuya_clear_provision_and_reset(void)
 {
     char zero[65] = {0};   /* 65 覆盖 ssid/pwd(65),也够 devid/secret/localkey(32)*/
+    int ble_stop_ret = tuya_ble_netcfg_stop();
+
     printf("[TUYA] >>> clear provision & reboot (re-enter BLE provisioning) <<<\r\n");
+    if (ble_stop_ret != 0) {
+        printf("[TUYA] BLE stop before reset returned %d; module exit already forced\r\n",
+               ble_stop_ret);
+    }
     syscfg_write(VM_TUYA_DEVID_IDX,    zero, 32);
     syscfg_write(VM_TUYA_SECRET_IDX,   zero, 32);
     syscfg_write(VM_TUYA_LOCALKEY_IDX, zero, 32);
@@ -2690,12 +2707,11 @@ void tuya_clear_provision_and_reset(void)
      * 否则 wifi_app_task 开机读到旧 STA_MODE ssid 自动连网→播"网络连接成功"→
      * 然后才进配网,用户听到两条提示音("网络连接成功"+"请配置网络"),迷惑。*/
     wifi_store_mode_info(SMP_CFG_MODE, zero, zero);
-    /* ★复位前先停 BT 广播,让蓝牙控制器进入 idle 再软复位。
+    /* ★复位前已完成 BLE 断链与模块退出,再留出 VM 落盘时间。
      *   软复位(P33_SYSTEM_RESET)不像掉电/reset 键那样完全重置 BT 控制器,带活跃
      *   射频状态复位会导致重启后 BLE 链路异常(conn nack → supervision timeout),
      *   配网必失败(实测:长按 K6 走软复位后配网失败,按 reset 键冷启动则成功)。*/
-    tuya_ble_netcfg_stop();
-    os_time_dly(300);   /* 3s:BT 控制器 idle + VM 落盘 */
+    os_time_dly(300);   /* 3s:VM 落盘 + BLE 控制器退出余量 */
     extern void cpu_reset(void);
     cpu_reset();
     while (1) { ; }   /* 复位路径,不返回 */

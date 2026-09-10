@@ -58,7 +58,7 @@ static struct {
 #ifdef CONFIG_TUYA_AGENTIC_ENABLE
 /* Tuya 首次配网等待的是“本次连接真正可用于激活”的网络就绪点，不能只看
  * WIFI_STA_CONNECT_SUCC 或复用 app_music 的 0/1 DHCP 状态。该代次仅在服务端
- * MAC 分配等前置流程完成、NET_EVENT_CONNECTED 已发布后推进；调用方在发起
+ * MAC 分配等前置流程完成后推进，再发布 NET_EVENT_CONNECTED；调用方在发起
  * wifi_enter_sta_mode 前取快照，再等待代次变化，避免旧连接状态误放行。*/
 static volatile u32 s_tuya_network_ready_generation;
 
@@ -685,10 +685,10 @@ static int wifi_event_callback(void *network_ctx, enum WIFI_EVENT event)
 
         net.arg = "net";
         net.event = NET_EVENT_CONNECTED;
-        net_event_notify(NET_EVENT_FROM_USER, &net);
 #ifdef CONFIG_TUYA_AGENTIC_ENABLE
         s_tuya_network_ready_generation++;
 #endif
+        net_event_notify(NET_EVENT_FROM_USER, &net);
         break;
 
     case WIFI_EVENT_STA_DISCONNECT:

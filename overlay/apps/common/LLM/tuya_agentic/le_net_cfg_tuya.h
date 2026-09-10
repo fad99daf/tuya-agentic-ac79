@@ -75,8 +75,9 @@ int tuya_ble_netcfg_start(const char *device_name,
                           const char *auth_key,
                           tuya_prov_result_cb_t cb);
 
-/* 停止 BLE、释放蓝牙内存(配网成功、连上 WiFi 后调,腾出 RAM 给 TLS/AI)*/
-void tuya_ble_netcfg_stop(void);
+/* 确定性停止 BLE:先停广播,有连接时主动断开并限时等待,最后关闭 BLE 模块。
+ * 可重复调用。返回 0=已安全停止,<0=命令失败或断链超时。*/
+int tuya_ble_netcfg_stop(void);
 
 #ifdef __cplusplus
 }

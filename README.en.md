@@ -155,7 +155,7 @@ Edit `apps/wifi_story_machine/include/app_config.h`:
 ### Reset provisioning
 
 - **Long-press K6** → clears the VM triple → soft reset → re-enters provisioning on reboot
-- (BT advertising is stopped before the reset to avoid a dirty BT-controller state after soft reset causing provisioning failure — see FAQ)
+- (Before reset, firmware stops BLE advertising, disconnects any active link, and exits the BLE module so a dirty controller state cannot make the device undiscoverable — see FAQ)
 
 ---
 
@@ -164,7 +164,7 @@ Edit `apps/wifi_story_machine/include/app_config.h`:
 | Symptom | Cause / Fix |
 |---|---|
 | **Tuya App can't find the Bluetooth device** | You flashed the placeholder build; `demo.c` still says `YOUR_PID_HERE`. Fill in real PID/uuid/authkey and rebuild |
-| **Provisioning fails after long-press K6** (but works after the reset key) | Soft reset (P33) doesn't fully reset the BT controller like a power cycle. Fixed by stopping BT + delay before reset; if it still happens occasionally, use the reset key (cold boot) or retry |
+| **App cannot rediscover the device after K6 reset or failed provisioning** (but reset-key boot works) | Soft reset (P33) does not fully reset the BT controller like a power cycle. Firmware now stops advertising, disconnects the active link, waits for HCI completion, and exits BLE before reset; use a cold power cycle as a temporary recovery until device validation is complete |
 | **Downlink TTS has squeal/noise** | If opus behaves abnormally, fall back to PCM (comment out `TUYA_DOWNLINK_OPUS_ENABLE`). Opus is now working (CBR + sample_rate=0 auto-resampling) |
 | **Connects then drops (conn nack → timeout) during provisioning** | Usually 2.4G RF interference. Turn off phone WiFi, move closer, retry a few times |
 | **Music stops after ~30 seconds** | Platform trial-clip limit; full songs require the paid music capability on the Tuya platform |

@@ -55,9 +55,9 @@
 - **turn-start 能量门**(非 barge 轮):无唤醒词+单麦开麦易自言自语,VAD 触发后再核 1 帧能量才起轮。
 - **idle 持续排空**:空闲不断丢 mic,保证 VAD 触发时无积压;**绝不**在 VAD 触发时 clear(会吞刚触发的话音)。
 
-**⑥ `tuya_clear_provision_and_reset()`(L944)** — K6 长按入口:把 VM 176~180 全写 0 → **`tuya_ble_netcfg_stop()` 先停 BT 广播** → `os_time_dly(300)`(BT 控制器 idle + VM 落盘)→ `cpu_reset()` → 重启后读不到 devid 自动重新配网。
+**⑥ `tuya_clear_provision_and_reset()`(L944)** — K6 长按入口:**`tuya_ble_netcfg_stop()` 先停广播、主动断开活动连接并退出 BLE 模块** → 把 VM 176~180 全写 0 → `os_time_dly(300)`(BLE 退出余量 + VM 落盘)→ `cpu_reset()` → 重启后读不到 devid 自动重新配网。
 
-   > **修复(软复位后 BT 脏状态 → 配网失败)**:`cpu_reset()` 内部走 `P33_SYSTEM_RESET`,虽是整机软复位,但**不像掉电 / reset 键那样彻底重置 BT 控制器**。若复位前 BT 处于广播/连接活跃态,带脏射频状态复位会导致重启后 BLE 链路异常(`conn nack` 雪崩 → 5s supervision timeout 断开,reason 0x08),配网必失败。**实测复现**:长按 K6(走软复位)后配网失败,紧接着按 reset 键(冷启动)则配网成功。**解法**:复位前先 `tuya_ble_netcfg_stop()` 停广播 + 延迟 3s 让 BT 控制器进 idle,再软复位。已验证修复。
+   > **修复(软复位后 BT 脏状态 → 配网失败)**:`cpu_reset()` 内部走 `P33_SYSTEM_RESET`,虽是整机软复位,但**不像掉电 / reset 键那样彻底重置 BT 控制器**。若复位前 BT 处于广播/连接活跃态,带脏射频状态复位会导致重启后 BLE 链路异常(`conn nack` 雪崩 → 5s supervision timeout 断开,reason 0x08),配网必失败。**实测复现**:长按 K6(走软复位)后配网失败,紧接着按 reset 键(冷启动)则成功。原“只停广播 + 延迟”的修复仍会遗留活动连接；MT-88 进一步改为停广播、主动断链、限时等待 HCI 断链完成并执行 `bt_ble_exit()` 后再软复位。
 
 **⑦ 产品三件套**(L46-48,构建期硬编码):`TUYA_PRODUCT_KEY` / `TUYA_UUID` / `TUYA_AUTH_KEY`。
 
@@ -391,7 +391,8 @@ VM_OPT=0;//单备份...(原样不动)
 ### T. 当前网络真正就绪后再激活，成功音延后到云端激活完成
 
 - **根因**:BLE 下发凭据后原流程只等待 STA 关联成功，再固定延时 1.5s 就发起云端激活；DHCP、服务端 MAC 分配或联网事件仍未完成时会导致激活失败。同时通用 `NET_EVENT_CONNECTED` 处理过早播放“配网成功”，造成设备提示成功但实际未激活。
-- **网络门控**:以单调递增的网络就绪 generation 标识本次连接；只有 DHCP 成功、可选的服务端 MAC 分配完成且 `NET_EVENT_CONNECTED` 已发布后才推进 generation。配网流程快照旧值，并在 30s 总预算内等待新 generation 和 STA 在线后再激活，避免沿用历史连接状态。
+- **网络门控**:以单调递增的网络就绪 generation 标识本次连接；只有 DHCP 成功、可选的服务端 MAC 分配完成后才推进 generation，并在其后派发 `NET_EVENT_CONNECTED`，避免事件处理链阻塞 generation 更新。配网流程快照旧值，并在 30s 总预算内等待新 generation 和 STA 在线后再激活，避免沿用历史连接状态。
+- **BLE 确定性退出**:关闭广播后先经 `bt_ble_exit()` 关闭杰理原配网层的广播恢复开关，再对活动 handle 下发 `BLE_CMD_DISCONNECT`，最多等待 2s 的 `HCI_EVENT_DISCONNECTION_COMPLETE`，结束时再次收敛模块状态；主动退出期间禁止 Tuya/杰理两层断链回调重开广播，广播命令失败会唤醒主流程进入失败恢复，避免“语音提示配网但 App 扫不到”的假活状态。
 - **失败恢复**:BLE 配网、网络就绪、云端激活或关键凭据持久化任一阶段失败时播放失败提示，清理配网信息并受控重启，重新进入 BLE 配网；不对激活接口做盲目重试，避免 token 一次性语义和半初始化客户端带来的副作用。
 - **成功语义**:通用联网事件仍完整执行 BLE 通知、DHCP 标志、profile 初始化和网络状态更新，仅在 Tuya 配网事务活动期间抑制通用成功音；云端激活、关键凭据精确写入以及 MQTT 稳定观察完成后才播放成功音。
 - **日志安全**:BLE WiFi JSON、SSID、密码、token 及解密帧不再明文打印，仅保留长度与协议阶段信息。

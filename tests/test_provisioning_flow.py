@@ -15,6 +15,7 @@ DEMO = ROOT / "overlay/apps/common/LLM/tuya_agentic/tuya_agentic_demo.c"
 WIFI = ROOT / "overlay/apps/wifi_story_machine/wifi_app_task.c"
 MUSIC = ROOT / "overlay/apps/wifi_story_machine/app_music.c"
 BLE_PORT = ROOT / "overlay/apps/common/LLM/tuya_agentic/le_net_cfg_tuya.c"
+BLE_HEADER = ROOT / "overlay/apps/common/LLM/tuya_agentic/le_net_cfg_tuya.h"
 BLE_PROTO = (
     ROOT
     / "overlay/apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya-ble/src/tuya_ble_prov.c"
@@ -50,8 +51,74 @@ class ProvisioningFlowGuards(unittest.TestCase):
         mac_assignment = block.index("server_assign_macaddr(wifi_return_sta_mode)")
         ready_event = block.index("net_event_notify(NET_EVENT_FROM_USER, &net)")
         generation = block.index("s_tuya_network_ready_generation++")
-        self.assertLess(mac_assignment, ready_event)
-        self.assertLess(ready_event, generation)
+        self.assertLess(mac_assignment, generation)
+        self.assertLess(generation, ready_event)
+
+    def test_ble_start_checks_advertising_command_results(self) -> None:
+        source = read(BLE_PORT)
+        make_adv = source[
+            source.index("static int tuya_make_adv(void)") : source.index(
+                "/* ---------------- HCI/ATT", source.index("static int tuya_make_adv(void)")
+            )
+        ]
+        for command in ("BLE_CMD_ADV_DATA", "BLE_CMD_RSP_DATA", "BLE_CMD_ADV_PARAM"):
+            self.assertIn(command, make_adv)
+        self.assertGreaterEqual(make_adv.count("BLE_CMD_RET_SUCESS"), 3)
+
+        start = source[
+            source.index("int tuya_ble_netcfg_start") : source.index(
+                "int tuya_ble_netcfg_stop", source.index("int tuya_ble_netcfg_start")
+            )
+        ]
+        self.assertIn("if (tuya_make_adv() != 0)", start)
+        self.assertIn("BLE_CMD_ADV_ENABLE", start)
+        self.assertIn("BLE_CMD_RET_SUCESS", start)
+
+    def test_ble_stop_disconnects_and_exits_with_a_bounded_wait(self) -> None:
+        source = read(BLE_PORT)
+        header = read(BLE_HEADER)
+        self.assertIn("int tuya_ble_netcfg_stop(void);", header)
+
+        stop = source[
+            source.index("int tuya_ble_netcfg_stop(void)") : source.index(
+                "/* ---- worker", source.index("int tuya_ble_netcfg_stop(void)")
+            )
+        ]
+        stop_requested = stop.index("s_stop_requested = 1")
+        idempotent = stop.index("if (s_ble_exited)")
+        adv_disable = stop.index("BLE_CMD_ADV_ENABLE")
+        disconnect = stop.index("BLE_CMD_DISCONNECT")
+        sdk_restart_guard = stop.index("bt_ble_exit()")
+        module_exit = stop.rindex("bt_ble_exit()")
+        self.assertLess(idempotent, stop_requested)
+        self.assertLess(stop_requested, adv_disable)
+        self.assertLess(adv_disable, sdk_restart_guard)
+        self.assertLess(sdk_restart_guard, disconnect)
+        self.assertLess(adv_disable, disconnect)
+        self.assertLess(disconnect, module_exit)
+        self.assertGreaterEqual(stop.count("bt_ble_exit()"), 2)
+        self.assertIn("TUYA_BLE_STOP_TIMEOUT_MS", stop)
+
+    def test_active_ble_stop_cannot_restart_advertising(self) -> None:
+        source = read(BLE_PORT)
+        handler = source[
+            source.index("static void tuya_pkt_handler") : source.index(
+                "/* ---------------- 初始化 + 启动", source.index("static void tuya_pkt_handler")
+            )
+        ]
+        connection = handler[
+            handler.index("HCI_SUBEVENT_LE_CONNECTION_COMPLETE") : handler.index(
+                "default:", handler.index("HCI_SUBEVENT_LE_CONNECTION_COMPLETE")
+            )
+        ]
+        disconnect = handler[
+            handler.index("case HCI_EVENT_DISCONNECTION_COMPLETE:") : handler.index(
+                "case ATT_EVENT_MTU_EXCHANGE_COMPLETE:"
+            )
+        ]
+        self.assertIn("if (s_stop_requested)", connection)
+        self.assertIn("BLE_CMD_DISCONNECT", connection)
+        self.assertIn("if (!s_stop_requested && s_ble_started && !s_prov_done)", disconnect)
 
     def test_only_success_prompt_is_suppressed_until_activation(self) -> None:
         source = read(MUSIC)
@@ -78,9 +145,25 @@ class ProvisioningFlowGuards(unittest.TestCase):
 
         helper = source[source.index("static void tuya_provisioning_fail_and_reset") :]
         self.assertLess(
+            helper.index("tuya_ble_netcfg_stop()"),
+            helper.index("app_music_play_tuya_netcfg_result(0)"),
+        )
+        self.assertLess(
             helper.index("app_music_play_tuya_netcfg_result(0)"),
             helper.index("tuya_clear_provision_and_reset()"),
         )
+
+    def test_main_aborts_if_ble_cannot_stop_cleanly(self) -> None:
+        source = read(DEMO)
+        first_time = source.index("/* ---- 首次:BLE 配网 ---- */")
+        connect = source.index("wifi_enter_sta_mode(s_main_creds.ssid", first_time)
+        block = source[first_time:connect]
+
+        stop = block.index("ble_stop_ret = tuya_ble_netcfg_stop()")
+        check = block.index("if (ble_stop_ret != 0)", stop)
+        reset = block.index('tuya_provisioning_fail_and_reset("ble-stop", NULL)', check)
+        self.assertLess(stop, check)
+        self.assertLess(check, reset)
 
     def test_success_prompt_follows_activation_persistence_and_app_hold(self) -> None:
         source = read(DEMO)
