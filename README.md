@@ -17,7 +17,7 @@
 - **打断 (barge-in)** — AEC + VAD + 多帧能量确认,用户可随时打断 TTS(依赖 AEC)。空闲起轮与播报中打断用两道独立能量门(`BARGE_MIN_ENERGY` 10 万 / `BARGE_CONFIRM_ENERGY` 60 万),后者专门抗 TTS 回声的 AEC 残留误触发(实测残留确认帧 <40 万、真人插话 >110 万,取 60 万居中)
 - **音乐播放** — "播放XXX的歌":云端音乐 SKILL 回试听 mp3 URL,设备解析后走杰理网络解码链播放(https 自动 TLS);TTS 报幕后让出 DAC、播完自动恢复,播放中说话可打断停乐(VAD+3 帧能量门)。⚠️ 试听片段 ~30s,完整歌曲需在涂鸦平台购买音乐高级能力授权
 - **云端 VAD 停说判定** — 开口永远本地 VAD;停说由云端事件决定(TAI 2.1 协议经 ChatBreak 通知停说,代码兼容处理 ServerVad),带本地 2s 静音超时兜底(TCP 通道)。STM/UDP 通道下该事件暂不可区分,自动退化为本地静音兜底,见 `stm/README.md`
-- **MQTT 常驻 + DP 下行** — MQTT 与 AI 的 TLS 各自独立连接并存,`tuya_mqtt_ka` 线程维持心跳收 DP 下行;App 里设备保持在线,云端下发的 DP/MCP 命令实时可收(`on_dp_downlink` / `on_event`)
+- **MQTT 常驻 + DP 下行** — MQTT 与 AI 的 TLS 各自独立连接并存,`tuya_mqtt_ka` 线程维持心跳收 DP 下行(10ms 轮询,下发延迟毫秒级);App 里设备保持在线,云端下发的 DP/MCP 命令实时可收(`on_dp_downlink` / `on_event`)
 - **TTS 首字预蓄水** — 每轮 TTS 开头先攒 ~160ms 音频再喂解码器,治首帧短包 underrun 卡顿
 - **涂鸦云 OTA** — 开机连 AI 前检查升级,有新固件则下载烧写自动重启(双备份方式)
 - **涂鸦 BLE 一键配网** — 用「涂鸦智能 App」蓝牙配网,速度快

@@ -349,23 +349,32 @@ static void on_mqtt_message(const char *topic, size_t topic_len,
 }
 
 /* MQTT 心跳维持线程(MQTT 常驻模式)。
- * 断线自愈:iot_client_process 连续 2 轮(≈10s)失败判定连接死亡,销毁旧句柄
- * (防泄漏,try_connect 直接覆盖指针不 free)后重连;重连退避 5s→10s→…→60s
- * 封顶,成功后自然复位(重新从连续失败计数开始)。WiFi 掉线由 SDK 层自动重连
+ * 断线自愈:iot_client_process 失败持续超过 TUYA_MQTT_DEAD_WINDOW_MS 才判定连接
+ * 死亡,销毁旧句柄(防泄漏,try_connect 直接覆盖指针不 free)后重连;重连退避
+ * 5s→10s→…→60s 封顶,成功后自然复位。WiFi 掉线由 SDK 层自动重连
  * (WIFI_EVENT_STA_DISCONNECT → NET_EVENT_DISCONNECTED_AND_REQ_CONNECT →
- * wifi_return_sta_mode),这里只管 MQTT 层。*/
+ * wifi_return_sta_mode),这里只管 MQTT 层。
+ * 轮询周期 1 tick(100Hz tick 即 10ms):云端 DP(音量等控制指令)只由本线程收,
+ * 休眠过长会把下发延迟拉到秒级(如音量 DP 晚到 TTS 播完之后)。空闲时
+ * transport_recv 本就阻塞在 recv(超时 MQTT_RECV_TIMEOUT_MS=1s),缩短休眠只是
+ * 每 ~1s 多醒一次,CPU 基本不变。*/
+#define TUYA_MQTT_DEAD_WINDOW_MS 10000u  /* 失败持续超该时长才判死:滤掉毫秒级瞬断(原按"连续2轮"计数,轮询提速后两轮仅隔20ms会误杀) */
 static void tuya_mqtt_keepalive_task(void *arg)
 {
     extern int  iot_client_message_connect(iot_client_t *client);    /* src/iot_client_message.h 未进公共头 */
     extern void iot_client_message_disconnect(iot_client_t *client);
     iot_client_t *iot = (iot_client_t *)arg;
     if (!iot) return;
-    int fail_cnt = 0;
+    int failing = 0;              /* 连续失败中标记(成功清零),配合 fail_since_ms 计失败持续时长 */
+    unsigned int fail_since_ms = 0;
     while (g_mqtt_ka_run) {
         int ret = iot_client_process(iot, 0);
         if (ret == 0) {
-            fail_cnt = 0;
-        } else if (++fail_cnt >= 2) {   /* 单次失败可能是瞬断,连续 2 轮才判死 */
+            failing = 0;
+        } else if (!failing) {
+            failing = 1;         /* 单次失败可能只是瞬断,先记起点等下一轮确认 */
+            fail_since_ms = sys_timer_get_ms();
+        } else if (sys_timer_get_ms() - fail_since_ms >= TUYA_MQTT_DEAD_WINDOW_MS) {
             printf("[TUYA] mqtt dead (ret=%d), reconnect...\r\n", ret);
             iot_client_message_disconnect(iot);
             unsigned int backoff = 5000;
@@ -375,9 +384,9 @@ static void tuya_mqtt_keepalive_task(void *arg)
                 if (backoff < 60000) backoff *= 2;
             }
             if (g_mqtt_ka_run) printf("[TUYA] mqtt reconnected\r\n");
-            fail_cnt = 0;
+            failing = 0;
         }
-        os_time_dly(500);
+        os_time_dly(1);
     }
 }
 

@@ -37,7 +37,7 @@
 
 **③ `tuya_agentic_main()` 启动流程**
 - **直连路径**(VM176 有 devid):读三元组 + ssid/pwd + region(VM183,无效兜底 AY)→ `wifi_enter_sta_mode` → 等 DHCP → `iot_client_init` → `tuya_ai_run`
-- **首次配网路径**(无 devid):播"请配置网络"语音 → `tuya_ble_netcfg_start`(BLE 阻塞等 App 下发 ssid/pwd/token)→ 停 BLE 释放 RAM → 连 WiFi → `iot_client_init_on_boarding_with_token` 激活(region 由 token 前 2 字符自动解析,激活响应再回 `region` 字段确认)→ **写 176~183**(三元组+WiFi 凭据+DP schema_id+region)→ hold MQTT ~3s 让 App 确认配网成功 → 注册 DP 下行回调 → `tuya_ai_run`(**MQTT 常驻**:与 AI 的 TLS 是各自独立 TCP 连接可并存;`tuya_mqtt_ka` 线程每 5s `iot_client_process` 维持心跳并收 DP 下行,App 里设备保持在线可控制)
+- **首次配网路径**(无 devid):播"请配置网络"语音 → `tuya_ble_netcfg_start`(BLE 阻塞等 App 下发 ssid/pwd/token)→ 停 BLE 释放 RAM → 连 WiFi → `iot_client_init_on_boarding_with_token` 激活(region 由 token 前 2 字符自动解析,激活响应再回 `region` 字段确认)→ **写 176~183**(三元组+WiFi 凭据+DP schema_id+region)→ hold MQTT ~3s 让 App 确认配网成功 → 注册 DP 下行回调 → `tuya_ai_run`(**MQTT 常驻**:与 AI 的 TLS 是各自独立 TCP 连接可并存;`tuya_mqtt_ka` 线程 10ms 轮询 `iot_client_process` 维持心跳并收 DP 下行(原每 5s,见 2026-09-10 增量),App 里设备保持在线可控制)
 - **历史 bug 修复**:`syscfg_read` 返回值判断从 `==0`(误判每次重配)改为 `>0`
 
 **④ `tuya_ai_run()` 对话循环**
@@ -355,3 +355,18 @@ VM_OPT=0;//单备份...(原样不动)
 - ⚠️ **`#ifdef` 语义**:`tuya_agentic_demo.c` 25 处编译门全部按"是否定义"编译,`#define TUYA_KWS_ENABLE 0` **无效**(0 也算已定义)。关必须整行注释,开就去掉注释。
 - 如何开启/关闭的完整说明已写入 `docs/WAKEWORD.md` §6(含误用矩阵)、README/README.en 宏表(默认列改为"关(常听)")。
 - 同步范围:overlay `app_config.h`、`patches/tuya-agentic-v1.2.0.patch`(app_config hunk 及后续 hunk 行号已随之校正,对基线 tag `git apply --check` 通过)、README.md、README.en.md、docs/WAKEWORD.md。demo.c 未动(仍凭据占位符)。
+
+---
+
+## 2026-09-10 增量改动(MQTT 心跳线程提速:DP 下行延迟 ~5s→~10ms)
+
+### R. `tuya_mqtt_keepalive_task` 轮询 500 tick→1 tick,死亡判定"连续 2 轮"→10s 时间窗
+
+- **现象(客户反馈)**:语音"调音量"后云端下发的音量 DP 到得很晚——TTS 回复都播完了,对应 DP 指令才到设备。
+- **根因**:DP 下行只由 `tuya_mqtt_ka` 线程收取,原循环每轮 `iot_client_process` 后 `os_time_dly(500)`(100Hz tick = 5s),而底层 `mqtt_client_process` 是纯轮询模型(`timeout_ms` 参数被忽略,`iot-client/src/mqtt.c`),两轮之间无人读 socket,DP 滞留最长 5s。
+- **改动**(`tuya_agentic_demo.c` 的 `tuya_mqtt_keepalive_task`):
+  - 正常态休眠 `os_time_dly(500)`→`os_time_dly(1)`,DP 下发延迟从最长约 5s 降到约 10ms。
+  - 死亡判定由"连续 2 轮失败(≈10s)"计数改为失败持续 ≥ `TUYA_MQTT_DEAD_WINDOW_MS`(10s,`sys_timer_get_ms` 时间窗)。**必须配套改**:轮询提速后"两轮"仅隔 ~20ms,原计数法会把毫秒级瞬断误判为断线,销毁健康连接并进 5s→60s 重连退避,把瞬断放大成真断线。
+- **开销与心跳**:空闲时 `transport_recv` 本就阻塞在 recv(超时 `MQTT_RECV_TIMEOUT_MS`=1s),缩短外层休眠每 ~1s 仅多醒一次,CPU 基本不变;DP 到达若落在 recv 阻塞窗内立即唤醒,最坏(落在 10ms 休眠窗)延迟 ~10ms。keepalive PINGREQ 由 coreMQTT 按时间戳驱动(连接时 keepAlive=60s),不受轮询频率影响。
+- **验证**:SDK 开发树全量 make 编译通过、固件正常生成、无告警。真机复测建议:说"音量调到 20",对比串口 `[TUYA-DP]` 打印与 TTS 播报结束时刻(待真机验证)。
+- **同步范围**:SDK 开发树与 overlay 两份 `tuya_agentic_demo.c` 已同步(diff 仅凭据占位符,惯例不变);`patches/` 不涉及(该文件属 overlay 整文件覆盖,patch 只含 SDK 原有文件);`apply.sh`/`apply.bat` 是纯目录拷贝、无文件清单,无需改;README.md / README.en.md 特性条目已同步;正文 A1③ 的"每 5s"描述已更新。
