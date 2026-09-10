@@ -1,6 +1,6 @@
 /* 配网诊断:点亮 HAL 日志宏(默认是空操作,编译后什么都看不到)。
- * 目的:抓 App 经 BLE 下发的完整 WiFi 配置 JSON(看有没有 timezone 等额外字段)、
- * 以及 App 发的其它命令(Unhandled CMD/subcmd 若出现,说明有我们没处理的数据)。
+ * WiFi 配置只记录协议阶段、长度和错误，不打印解密后的 JSON、密码或 token；
+ * 其它协议帧仍保留原有诊断，App 未处理命令通过 Unhandled CMD/subcmd 定位。
  * BLE 只在配网期间运行,日志量可控;诊断完可注释掉这 4 个 define 恢复安静。*/
 #include <stdio.h>
 static void ble_prov_hexdump(const uint8_t *buf, size_t len)
@@ -415,8 +415,7 @@ static void handle_pair_req(tuya_ble_prov_state_t *state, const uint8_t *data, u
 
 static void handle_wifi_config(tuya_ble_prov_state_t *state, const uint8_t *data, uint16_t data_len)
 {
-    TUYA_BLE_HAL_LOGI("[PROTO] FRM_DOWNLINK_TRANSPARENT_REQ (%d bytes):", data_len);
-    TUYA_BLE_HAL_HEXDUMP(data, data_len);
+    TUYA_BLE_HAL_LOGI("[PROTO] FRM_DOWNLINK_TRANSPARENT_REQ (%d bytes)", data_len);
 
     if (data_len < 4) {
         TUYA_BLE_HAL_LOGW("[PROTO] Transparent data too short");
@@ -447,7 +446,7 @@ static void handle_wifi_config(tuya_ble_prov_state_t *state, const uint8_t *data
     memcpy(json_str, &data[offset], json_len);
     json_str[json_len] = '\0';
 
-    TUYA_BLE_HAL_LOGI("[PROTO] WiFi JSON: %s", json_str);
+    TUYA_BLE_HAL_LOGI("[PROTO] WiFi config JSON received (%d bytes)", json_len);
 
     cJSON *root = cJSON_Parse(json_str);
     if (root == NULL) {
@@ -460,19 +459,19 @@ static void handle_wifi_config(tuya_ble_prov_state_t *state, const uint8_t *data
     cJSON *ssid = cJSON_GetObjectItem(root, "ssid");
     if (cJSON_IsString(ssid) && ssid->valuestring) {
         strncpy(state->creds.ssid, ssid->valuestring, TUYA_BLE_SSID_MAX_LEN);
-        TUYA_BLE_HAL_LOGI("[PROTO] SSID: %s", state->creds.ssid);
+        TUYA_BLE_HAL_LOGI("[PROTO] SSID received (len=%d)", (int)strlen(state->creds.ssid));
     }
 
     cJSON *pwd = cJSON_GetObjectItem(root, "pwd");
     if (cJSON_IsString(pwd) && pwd->valuestring) {
         strncpy(state->creds.password, pwd->valuestring, TUYA_BLE_PASSWORD_MAX_LEN);
-        TUYA_BLE_HAL_LOGI("[PROTO] Password: %s", state->creds.password);
+        TUYA_BLE_HAL_LOGI("[PROTO] Password received (len=%d)", (int)strlen(state->creds.password));
     }
 
     cJSON *token = cJSON_GetObjectItem(root, "token");
     if (cJSON_IsString(token) && token->valuestring) {
         strncpy(state->creds.token, token->valuestring, TUYA_BLE_TOKEN_MAX_LEN);
-        TUYA_BLE_HAL_LOGI("[PROTO] Token: %s", state->creds.token);
+        TUYA_BLE_HAL_LOGI("[PROTO] Token received (len=%d)", (int)strlen(state->creds.token));
     }
 
     cJSON_Delete(root);
@@ -535,8 +534,7 @@ static void tuya_ble_recv(tuya_ble_prov_state_t *state, const uint8_t *packet, u
             TUYA_BLE_HAL_LOGE("[RX] Decryption failed, ret=%d", ret);
             return;
         }
-        TUYA_BLE_HAL_LOGI("[RX] Decrypted frame (%d bytes):", frame_len);
-        TUYA_BLE_HAL_HEXDUMP(frame, frame_len > 64 ? 64 : frame_len);
+        TUYA_BLE_HAL_LOGI("[RX] Decrypted frame (%d bytes)", frame_len);
     }
 
     if (frame_len < BLE_FRAME_MIN_LEN) {

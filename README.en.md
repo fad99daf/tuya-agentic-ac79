@@ -149,7 +149,7 @@ Edit `apps/wifi_story_machine/include/app_config.h`:
 1. On boot, with no triple stored, the device auto-enters BLE advertising and periodically announces "please configure the network"
 2. Open the **Tuya Smart App** (or an OEM app) → add device
 3. The App finds the device → sends WiFi credentials + provisioning token over BLE
-4. The device connects to WiFi → cloud activation → triple written to VM → connects to AI
+4. The device waits for this WiFi/DHCP/MAC-assignment attempt to become ready → cloud activation → triple written to VM → provisioning-success prompt → connects to AI
 5. Later boots read the VM and connect directly, no re-provisioning needed
 
 ### Reset provisioning

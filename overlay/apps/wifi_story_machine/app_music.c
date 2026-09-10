@@ -108,6 +108,9 @@ static struct app_music_hdl music_handler;
 static void app_music_play_mode_switch_notify(void);
 static int app_music_switch_local_device(const char *path);
 static int app_music_play_voice_prompt(const char *fname, void *dec_end_handler);
+#ifdef CONFIG_TUYA_AGENTIC_ENABLE
+extern int tuya_agentic_provisioning_active(void);
+#endif
 extern int fs_update_check(const char *path);
 #if TCFG_USER_VIRTUAL_PLAY_ENABLE
 extern void set_user_virtual_play_hdl(void *virtual);
@@ -3641,6 +3644,13 @@ void app_music_play_netcfg_prompt(void)
     app_music_play_voice_prompt("NetCfgEnter.mp3", NULL);
 }
 
+/* Tuya 首次配网结果提示。NET_EVENT_CONNECTED 只代表网络层就绪，成功音由
+ * tuya_agentic_main 在云端激活并持久化凭据后显式触发；失败路径同样从这里播报。*/
+void app_music_play_tuya_netcfg_result(int success)
+{
+    app_music_play_voice_prompt(success ? "NetCfgSucc.mp3" : "NetCfgFail.mp3", NULL);
+}
+
 /* 涂鸦 OTA 提示音播报(供 tuya_ota.c 跨文件调用;照搬 app_music_play_netcfg_prompt
  * 的导出模式——app_music_play_voice_prompt 是 static,需在 app_music.c 内包一层导出)。
  * type: 0=正在升级(OtaInUpdate.mp3) 1=升级成功(OtaSuccess.mp3) 2=升级失败(OtaFailed.mp3) */
@@ -4924,7 +4934,15 @@ static int app_music_net_event_handler(struct net_event *event)
 #if BT_NET_CFG_EN || BT_NET_CFG_QYAI_EN
                 ble_cfg_net_result_notify(event->event);
 #endif
+#ifdef CONFIG_TUYA_AGENTIC_ENABLE
+                /* Tuya 首次配网尚需完成云端激活；此处仅网络就绪，不能提前播成功。
+                 * 只门控提示音，其余联网状态/profile/AI 初始化逻辑全部保留。*/
+                if (!tuya_agentic_provisioning_active()) {
+                    app_music_play_voice_prompt("NetCfgSucc.mp3", __this->dec_ops->dec_breakpoint);
+                }
+#else
                 app_music_play_voice_prompt("NetCfgSucc.mp3", __this->dec_ops->dec_breakpoint);
+#endif
                 __this->reconnecting = 0;
 #ifdef CONFIG_SERVER_ASSIGN_PROFILE
                 dev_profile_init();
@@ -5213,4 +5231,3 @@ REGISTER_APPLICATION(app_music) = {
 };
 
 #endif
-

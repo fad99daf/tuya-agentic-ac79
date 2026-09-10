@@ -149,7 +149,7 @@ make ac791n_wifi_story_machine
 1. 设备开机,无三元组 → 自动进入 BLE 广播,周期播报「请配置网络」
 2. 手机打开 **涂鸦智能 App**(或 OEM app)→ 添加设备
 3. App 搜到设备 → 通过 BLE 下发 WiFi 凭据 + 配网 token
-4. 设备连 WiFi → 云端激活 → 三元组写入 VM → 连 AI
+4. 设备等待本次 WiFi/DHCP/MAC 分配流程真正就绪 → 云端激活 → 三元组写入 VM → 播报配网成功 → 连 AI
 5. 后续开机读 VM 直接连 AI,无需重复配网
 
 ### 重置配网

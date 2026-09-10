@@ -65,7 +65,8 @@ static int tuya_hal_send(const uint8_t *buf, uint16_t len, void *ctx)
 /* ---------------- tuya-ble 解出凭据的回调 ---------------- */
 static void prov_complete_cb(const tuya_ble_wifi_creds_t *creds)
 {
-    printf("[tuya_ble] prov done: ssid=%s token=%s\r\n", creds->ssid, creds->token);
+    printf("[tuya_ble] prov done: ssid_len=%u token_len=%u\r\n",
+           (unsigned int)strlen(creds->ssid), (unsigned int)strlen(creds->token));
     s_prov_done = 1;
     if (s_user_cb) {
         s_user_cb(creds);

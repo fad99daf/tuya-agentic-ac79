@@ -369,10 +369,20 @@ index b4a30136..459ffeaf 100644
  #endif
      {"wl80_test",            1,     2048,   64    },
 diff --git a/apps/wifi_story_machine/app_music.c b/apps/wifi_story_machine/app_music.c
-index acba599d..883f89f1 100644
+index acba599d..62cdc59c 100644
 --- a/apps/wifi_story_machine/app_music.c
 +++ b/apps/wifi_story_machine/app_music.c
-@@ -2800,6 +2800,73 @@ static int app_music_play_net_music(void *url)
+@@ -108,6 +108,9 @@ static struct app_music_hdl music_handler;
+ static void app_music_play_mode_switch_notify(void);
+ static int app_music_switch_local_device(const char *path);
+ static int app_music_play_voice_prompt(const char *fname, void *dec_end_handler);
++#ifdef CONFIG_TUYA_AGENTIC_ENABLE
++extern int tuya_agentic_provisioning_active(void);
++#endif
+ extern int fs_update_check(const char *path);
+ #if TCFG_USER_VIRTUAL_PLAY_ENABLE
+ extern void set_user_virtual_play_hdl(void *virtual);
+@@ -2800,6 +2803,73 @@ static int app_music_play_net_music(void *url)
      return net_music_dec_file(url, 0, net_music_dec_end, 0);
  }
  
@@ -446,7 +456,7 @@ index acba599d..883f89f1 100644
  static int app_music_ai_listen_start(u8 voice_mode, u8 enable_vad);
  
  //第三方平台的事件通知回调
-@@ -3567,6 +3634,35 @@ static int app_music_play_voice_prompt(const char *fname, void *dec_end_handler)
+@@ -3567,6 +3637,42 @@ static int app_music_play_voice_prompt(const char *fname, void *dec_end_handler)
      return __play_voice_prompt(fname, dec_end_handler, 1);
  }
  
@@ -455,6 +465,13 @@ index acba599d..883f89f1 100644
 +void app_music_play_netcfg_prompt(void)
 +{
 +    app_music_play_voice_prompt("NetCfgEnter.mp3", NULL);
++}
++
++/* Tuya 首次配网结果提示。NET_EVENT_CONNECTED 只代表网络层就绪，成功音由
++ * tuya_agentic_main 在云端激活并持久化凭据后显式触发；失败路径同样从这里播报。*/
++void app_music_play_tuya_netcfg_result(int success)
++{
++    app_music_play_voice_prompt(success ? "NetCfgSucc.mp3" : "NetCfgFail.mp3", NULL);
 +}
 +
 +/* 涂鸦 OTA 提示音播报(供 tuya_ota.c 跨文件调用;照搬 app_music_play_netcfg_prompt
@@ -482,7 +499,7 @@ index acba599d..883f89f1 100644
  /*
   * ****************************绘本识别*************************************
   */
-@@ -4387,6 +4483,8 @@ static int app_music_key_long(struct key_event *key)
+@@ -4387,6 +4493,8 @@ static int app_music_key_long(struct key_event *key)
  #endif
          break;
      case KEY_POWER:
@@ -491,7 +508,7 @@ index acba599d..883f89f1 100644
          app_music_shutdown(0);
          break;
      case KEY_MENU:
-@@ -4436,6 +4534,15 @@ static int app_music_key_long(struct key_event *key)
+@@ -4436,6 +4544,15 @@ static int app_music_key_long(struct key_event *key)
  #endif
          break;
      case KEY_PHOTO:
@@ -507,7 +524,7 @@ index acba599d..883f89f1 100644
          break;
      case KEY_ENC:
  #ifdef CONFIG_BT_ENABLE
-@@ -4503,6 +4610,9 @@ static int app_music_key_long(struct key_event *key)
+@@ -4503,6 +4620,9 @@ static int app_music_key_long(struct key_event *key)
  static int app_music_key_event_handler(struct key_event *key)
  {
      int ret = false;
@@ -517,8 +534,29 @@ index acba599d..883f89f1 100644
  
      if (__this->call_flag && (key->value != KEY_UP && key->value != KEY_DOWN && key->value != KEY_VOLUME_DEC && key->value != KEY_VOLUME_INC && key->value != KEY_OK && key->value != KEY_ENC)) {
          return true;	//通话模式下只有音量键和暂停键能起作用
+@@ -4814,7 +4934,15 @@ static int app_music_net_event_handler(struct net_event *event)
+ #if BT_NET_CFG_EN || BT_NET_CFG_QYAI_EN
+                 ble_cfg_net_result_notify(event->event);
+ #endif
++#ifdef CONFIG_TUYA_AGENTIC_ENABLE
++                /* Tuya 首次配网尚需完成云端激活；此处仅网络就绪，不能提前播成功。
++                 * 只门控提示音，其余联网状态/profile/AI 初始化逻辑全部保留。*/
++                if (!tuya_agentic_provisioning_active()) {
++                    app_music_play_voice_prompt("NetCfgSucc.mp3", __this->dec_ops->dec_breakpoint);
++                }
++#else
+                 app_music_play_voice_prompt("NetCfgSucc.mp3", __this->dec_ops->dec_breakpoint);
++#endif
+                 __this->reconnecting = 0;
+ #ifdef CONFIG_SERVER_ASSIGN_PROFILE
+                 dev_profile_init();
+@@ -5103,4 +5231,3 @@ REGISTER_APPLICATION(app_music) = {
+ };
+ 
+ #endif
+-
 diff --git a/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp b/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp
-index 53b90818..4ff5155b 100644
+index 0eaac985..0d57e976 100644
 --- a/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp
 +++ b/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp
 @@ -72,6 +72,23 @@
@@ -1011,7 +1049,7 @@ index 53b90818..4ff5155b 100644
  <Unit filename="../../../../apps/common/ble/le_trans_data.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/common/ble/mesh/examples/AliGenie_fan.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/common/ble/mesh/examples/AliGenie_light.c"><Option compilerVer="CC"/></Unit>
-@@ -938,8 +589,6 @@
+@@ -939,8 +590,6 @@
  <Unit filename="../../../../apps/common/usb/usb_std_class_def.h" />
  <Unit filename="../../../../apps/wifi_story_machine/app_main.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/wifi_story_machine/app_music.c"><Option compilerVer="CC"/></Unit>
@@ -1020,7 +1058,7 @@ index 53b90818..4ff5155b 100644
  <Unit filename="../../../../apps/wifi_story_machine/board/wl82/board_7911B.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/wifi_story_machine/board/wl82/board_7911B0_cfg.h" />
  <Unit filename="../../../../apps/wifi_story_machine/board/wl82/board_7911B8_cfg.h" />
-@@ -1456,7 +1105,6 @@
+@@ -1457,7 +1106,6 @@
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/FreeRTOS.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/FreeRTOSConfig.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/deprecated_definitions.h" />
@@ -1028,7 +1066,7 @@ index 53b90818..4ff5155b 100644
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/list.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/mpu_wrappers.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/pi32v2/portmacro.h" />
-@@ -1465,7 +1113,6 @@
+@@ -1466,7 +1114,6 @@
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/queue.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/semphr.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/task.h" />
@@ -1036,7 +1074,7 @@ index 53b90818..4ff5155b 100644
  <Unit filename="../../../../include_lib/system/os/os_api.h" />
  <Unit filename="../../../../include_lib/system/os/os_cpu.h" />
  <Unit filename="../../../../include_lib/system/os/os_error.h" />
-@@ -1571,5 +1218,46 @@
+@@ -1572,5 +1219,46 @@
  <Unit filename="../../../../lib/net/version.z.S" />
  <Unit filename="../../../../lib/server/version.z.S" />
  <Unit filename="../../../../lib/utils/version.z.S" />
@@ -1084,7 +1122,7 @@ index 53b90818..4ff5155b 100644
  </Project>
  </CodeBlocks_project_file>
 diff --git a/apps/wifi_story_machine/board/wl82/Makefile b/apps/wifi_story_machine/board/wl82/Makefile
-index 2012bf8a..65859337 100644
+index efe81564..9b98f005 100644
 --- a/apps/wifi_story_machine/board/wl82/Makefile
 +++ b/apps/wifi_story_machine/board/wl82/Makefile
 @@ -148,9 +148,12 @@ DEFINES := \
@@ -1339,7 +1377,7 @@ index 2012bf8a..65859337 100644
  	../../../../apps/common/ble/le_trans_data.c \
  	../../../../apps/common/ble/mesh/examples/AliGenie_fan.c \
  	../../../../apps/common/ble/mesh/examples/AliGenie_light.c \
-@@ -585,8 +416,6 @@ c_SRC_FILES := \
+@@ -586,8 +417,6 @@ c_SRC_FILES := \
  	../../../../apps/common/usb/usb_host_config.c \
  	../../../../apps/wifi_story_machine/app_main.c \
  	../../../../apps/wifi_story_machine/app_music.c \
@@ -1348,7 +1386,7 @@ index 2012bf8a..65859337 100644
  	../../../../apps/wifi_story_machine/board/wl82/board_7911B.c \
  	../../../../apps/wifi_story_machine/board/wl82/board_7911D.c \
  	../../../../apps/wifi_story_machine/board/wl82/board_7912D.c \
-@@ -618,6 +447,44 @@ c_SRC_FILES := \
+@@ -619,6 +448,44 @@ c_SRC_FILES := \
  	../../../../cpu/wl82/key/rdec.c \
  	../../../../cpu/wl82/port_waked_up.c \
  	../../../../cpu/wl82/setup.c \
@@ -1393,7 +1431,7 @@ index 2012bf8a..65859337 100644
  
  
  # 需要编译的 .S 文件
-@@ -646,7 +513,8 @@ cpp_SRC_FILES := \
+@@ -647,7 +514,8 @@ cpp_SRC_FILES := \
  
  
  # 需要编译的 .cc 文件
@@ -1403,7 +1441,7 @@ index 2012bf8a..65859337 100644
  
  
  # 需要编译的 .cxx 文件
-@@ -710,6 +578,9 @@ LFLAGS := \
+@@ -711,6 +579,9 @@ LFLAGS := \
  	../../../../cpu/wl82/liba/lib_wav_dec.a \
  	../../../../cpu/wl82/liba/lib_dts_dec.a \
  	../../../../cpu/wl82/liba/lib_opus_dec.a \
@@ -1413,7 +1451,7 @@ index 2012bf8a..65859337 100644
  	../../../../cpu/wl82/liba/lib_amr_dec.a \
  	../../../../cpu/wl82/liba/lib_amr_enc.a \
  	../../../../cpu/wl82/liba/lib_amrwb_enc.a \
-@@ -760,25 +631,18 @@ LFLAGS := \
+@@ -761,25 +632,18 @@ LFLAGS := \
  	../../../../cpu/wl82/liba/https_cli.a \
  	../../../../cpu/wl82/liba/http_server.a \
  	../../../../cpu/wl82/liba/json.a \
@@ -1439,7 +1477,7 @@ index 2012bf8a..65859337 100644
  	../../../../cpu/wl82/liba/cJSON.a \
  	../../../../cpu/wl82/liba/ftpserver_new.a \
  	../../../../cpu/wl82/liba/http_server.a  \
-@@ -795,18 +659,13 @@ LFLAGS := \
+@@ -796,18 +660,13 @@ LFLAGS := \
  	../../../../cpu/wl82/liba/res.a \
  	../../../../cpu/wl82/liba/font.a \
  	../../../../cpu/wl82/liba/ui_draw.a \
@@ -1481,7 +1519,7 @@ index 2b69d8d3..196777e8 100644
  #if CONFIG_AUDIO_ENC_SAMPLE_SOURCE == AUDIO_ENC_SAMPLE_SOURCE_PLNK0
      .output_channel = OUTPUT_CHANNEL3,
 diff --git a/apps/wifi_story_machine/include/app_config.h b/apps/wifi_story_machine/include/app_config.h
-index f3cd60cb..4bd3a84c 100644
+index d5deea01..4f21e207 100644
 --- a/apps/wifi_story_machine/include/app_config.h
 +++ b/apps/wifi_story_machine/include/app_config.h
 @@ -115,10 +115,10 @@
@@ -1644,10 +1682,30 @@ index f3cd60cb..4bd3a84c 100644
  #define CONFIG_UPGRADE_FILE_NAME            "update.ufw"
  #define CONFIG_UPGRADE_PATH                 CONFIG_ROOT_PATH\
 diff --git a/apps/wifi_story_machine/wifi_app_task.c b/apps/wifi_story_machine/wifi_app_task.c
-index dc4f1e38..cdfb9d69 100644
+index dc4f1e38..9437ab55 100644
 --- a/apps/wifi_story_machine/wifi_app_task.c
 +++ b/apps/wifi_story_machine/wifi_app_task.c
-@@ -658,6 +658,9 @@ static int wifi_event_callback(void *network_ctx, enum WIFI_EVENT event)
+@@ -55,6 +55,19 @@ static struct {
+ 
+ #define __this	(&wifi_app_hdl)
+ 
++#ifdef CONFIG_TUYA_AGENTIC_ENABLE
++/* Tuya 首次配网等待的是“本次连接真正可用于激活”的网络就绪点，不能只看
++ * WIFI_STA_CONNECT_SUCC 或复用 app_music 的 0/1 DHCP 状态。该代次仅在服务端
++ * MAC 分配等前置流程完成、NET_EVENT_CONNECTED 已发布后推进；调用方在发起
++ * wifi_enter_sta_mode 前取快照，再等待代次变化，避免旧连接状态误放行。*/
++static volatile u32 s_tuya_network_ready_generation;
++
++u32 wifi_get_tuya_network_ready_generation(void)
++{
++    return s_tuya_network_ready_generation;
++}
++#endif
++
+ extern void airkiss_ssid_check(void);
+ 
+ int __attribute__((weak)) wifi_force_set_lan_setting_info(void)
+@@ -658,6 +671,9 @@ static int wifi_event_callback(void *network_ctx, enum WIFI_EVENT event)
          thread_fork("realtime_demo", 4, 5 * 1024, 0, 0, realtime_demo, NULL);
  #endif
  
@@ -1657,6 +1715,16 @@ index dc4f1e38..cdfb9d69 100644
  #ifdef CONFIG_TWETALK_ENABLE
          // 联网成功后 初始化twetlak
          extern int start_tc_iot_twetalk(void);
+@@ -670,6 +686,9 @@ static int wifi_event_callback(void *network_ctx, enum WIFI_EVENT event)
+         net.arg = "net";
+         net.event = NET_EVENT_CONNECTED;
+         net_event_notify(NET_EVENT_FROM_USER, &net);
++#ifdef CONFIG_TUYA_AGENTIC_ENABLE
++        s_tuya_network_ready_generation++;
++#endif
+         break;
+ 
+     case WIFI_EVENT_STA_DISCONNECT:
 diff --git a/cpu/wl82/tools/isd_config_rule.c b/cpu/wl82/tools/isd_config_rule.c
 index 8bed33ba..62563750 100644
 --- a/cpu/wl82/tools/isd_config_rule.c

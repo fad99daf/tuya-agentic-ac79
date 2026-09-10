@@ -37,7 +37,7 @@
 
 **③ `tuya_agentic_main()` 启动流程**
 - **直连路径**(VM176 有 devid):读三元组 + ssid/pwd + region(VM183,无效兜底 AY)→ `wifi_enter_sta_mode` → 等 DHCP → `iot_client_init` → `tuya_ai_run`
-- **首次配网路径**(无 devid):播"请配置网络"语音 → `tuya_ble_netcfg_start`(BLE 阻塞等 App 下发 ssid/pwd/token)→ 停 BLE 释放 RAM → 连 WiFi → `iot_client_init_on_boarding_with_token` 激活(region 由 token 前 2 字符自动解析,激活响应再回 `region` 字段确认)→ **写 176~183**(三元组+WiFi 凭据+DP schema_id+region)→ hold MQTT ~3s 让 App 确认配网成功 → 注册 DP 下行回调 → `tuya_ai_run`(**MQTT 常驻**:与 AI 的 TLS 是各自独立 TCP 连接可并存;`tuya_mqtt_ka` 线程 10ms 轮询 `iot_client_process` 维持心跳并收 DP 下行(原每 5s,见 2026-09-10 增量),App 里设备保持在线可控制)
+- **首次配网路径**(无 devid):播"请配置网络"语音 → `tuya_ble_netcfg_start`(BLE 阻塞等 App 下发 ssid/pwd/token)→ 停 BLE 释放 RAM → 连 WiFi并等待**本次**网络就绪代次(STA/DHCP/首次 MAC 分配完成,30s 总预算)→ `iot_client_init_on_boarding_with_token` 激活(region 由 token 前 2 字符自动解析,激活响应再回 `region` 字段确认)→ **校验并写关键凭据**(三元组+WiFi 凭据+region,DP schema 仍按可选数据保存)→ hold MQTT ~3s 让 App 确认配网成功 → 播"配网成功"→ 注册 DP 下行回调 → `tuya_ai_run`(**MQTT 常驻**:与 AI 的 TLS 是各自独立 TCP 连接可并存;`tuya_mqtt_ka` 线程 10ms 轮询 `iot_client_process` 维持心跳并收 DP 下行(原每 5s,见 2026-09-10 增量),App 里设备保持在线可控制)。网络/激活/关键凭据落盘失败会播失败音并受控复位回 BLE 配网,不会在网络层刚连通时误报成功。
 - **历史 bug 修复**:`syscfg_read` 返回值判断从 `==0`(误判每次重配)改为 `>0`
 
 **④ `tuya_ai_run()` 对话循环**
@@ -383,3 +383,16 @@ VM_OPT=0;//单备份...(原样不动)
 - **范围限定**:只作用于默认 TCP 后端;`TUYA_TRANSPORT_STM_ENABLE=1` 走预编译 `libstm_tuya.a`,此补丁不生效。
 - **验证**:SDK 开发树全量 make 编译通过、无告警、固件正常生成。真机复测建议:联网静置 ≥2 小时,串口每 30 分钟应出现 `worker: conn-refresh sent` 与 `CONNECTION_REFRESH_RESP: code=... latest_expire_ts=...`,且 1 小时处不再触发 `on_disconnect`(待真机验证)。
 - **同步范围**:SDK 开发树与 overlay 两份 `rtc-tcp-client/src/{tai_client.c,tai_internal.h,tai_protocol.c}` 已同步(覆盖前 diff 确认 overlay 即改动前版本);`patches/`/`apply` 脚本不涉及(同 R 条目惯例)。
+
+---
+
+## 2026-09-10 增量改动(MT-88 配网激活时序与成功提示语义修复)
+
+### T. 当前网络真正就绪后再激活，成功音延后到云端激活完成
+
+- **根因**:BLE 下发凭据后原流程只等待 STA 关联成功，再固定延时 1.5s 就发起云端激活；DHCP、服务端 MAC 分配或联网事件仍未完成时会导致激活失败。同时通用 `NET_EVENT_CONNECTED` 处理过早播放“配网成功”，造成设备提示成功但实际未激活。
+- **网络门控**:以单调递增的网络就绪 generation 标识本次连接；只有 DHCP 成功、可选的服务端 MAC 分配完成且 `NET_EVENT_CONNECTED` 已发布后才推进 generation。配网流程快照旧值，并在 30s 总预算内等待新 generation 和 STA 在线后再激活，避免沿用历史连接状态。
+- **失败恢复**:BLE 配网、网络就绪、云端激活或关键凭据持久化任一阶段失败时播放失败提示，清理配网信息并受控重启，重新进入 BLE 配网；不对激活接口做盲目重试，避免 token 一次性语义和半初始化客户端带来的副作用。
+- **成功语义**:通用联网事件仍完整执行 BLE 通知、DHCP 标志、profile 初始化和网络状态更新，仅在 Tuya 配网事务活动期间抑制通用成功音；云端激活、关键凭据精确写入以及 MQTT 稳定观察完成后才播放成功音。
+- **日志安全**:BLE WiFi JSON、SSID、密码、token 及解密帧不再明文打印，仅保留长度与协议阶段信息。
+- **验证**:`tests/test_provisioning_flow.py` 覆盖时序、generation 推进位置、成功提示门控、失败复位和敏感日志静态守卫；目标板 Windows 官方工具链编译与真机配网回归仍需执行。
