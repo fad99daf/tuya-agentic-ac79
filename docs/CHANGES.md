@@ -370,3 +370,16 @@ VM_OPT=0;//单备份...(原样不动)
 - **开销与心跳**:空闲时 `transport_recv` 本就阻塞在 recv(超时 `MQTT_RECV_TIMEOUT_MS`=1s),缩短外层休眠每 ~1s 仅多醒一次,CPU 基本不变;DP 到达若落在 recv 阻塞窗内立即唤醒,最坏(落在 10ms 休眠窗)延迟 ~10ms。keepalive PINGREQ 由 coreMQTT 按时间戳驱动(连接时 keepAlive=60s),不受轮询频率影响。
 - **验证**:SDK 开发树全量 make 编译通过、固件正常生成、无告警。真机复测建议:说"音量调到 20",对比串口 `[TUYA-DP]` 打印与 TTS 播报结束时刻(待真机验证)。
 - **同步范围**:SDK 开发树与 overlay 两份 `tuya_agentic_demo.c` 已同步(diff 仅凭据占位符,惯例不变);`patches/` 不涉及(该文件属 overlay 整文件覆盖,patch 只含 SDK 原有文件);`apply.sh`/`apply.bat` 是纯目录拷贝、无文件清单,无需改;README.md / README.en.md 特性条目已同步;正文 A1③ 的"每 5s"描述已更新。
+
+---
+
+## 2026-09-10 增量改动(合入上游 connection-refresh:治 TAI 链路 ~1 小时被服务端回收断链)
+
+### S. 移植 agentic-kit `feature/connection-refresh-temp`(提交 9ba5b4e)到 rtc-tcp-client
+
+- **现象**:设备与云端的 AI 语音链路(TAI/TLS TCP)静置约 1 小时被服务端回收断开。
+- **上游方案**(涂鸦研发,`tuya/agentic-kit` 分支 `feature/connection-refresh-temp`,标记为临时特性、不合 master):TAI worker 每 `TAI_CONN_REFRESH_INTERVAL_MS`(默认 30 分钟,`#ifndef` 保护可覆盖)发一次 `ConnectionRefreshRequest`(携带 AuthenticateResponse 里服务端分配的 connection-id,attr 23)延长链路服务端寿命;响应(ConnectionRefreshResponse,attr 24 状态码 + attr 25 最新过期时间戳)仅记日志;刷新发送失败不致命,ping 仍为上行健康探测权威。服务端未分配 connection-id 时不发刷新。
+- **移植方式**:本地 vendored 的 rtc-tcp-client 基线比该分支父提交**更旧**(上游已有小帧合并等本地没有的机制)且含本地定制,不能整文件覆盖;将特性手工移植到 3 个源文件,代码与上游逐行一致——`tai_internal.h`(间隔宏 + `ctx->connection_id[64]`/`last_conn_refresh_ms` 字段 + builder 声明)、`tai_protocol.c`(`tai_proto_build_conn_refresh()`;AuthenticateResponse 分支存 connection-id;新增 CONNECTION_REFRESH_RESP 分支)、`tai_client.c`(`tai_connect` 初始化计时;`tai_conn_refresh()`;worker ping 块后加周期刷新块)。上游依赖的定义(`TAI_PKT_CONNECTION_REFRESH_REQ/RESP`=9/10、attr 23/24/25、`tai_attr_strv/u16/u64`)本地基线均已具备。上游附带的 posix `long_connection_demo` 长连测试程序与单元测试未合入(设备固件无关)。
+- **范围限定**:只作用于默认 TCP 后端;`TUYA_TRANSPORT_STM_ENABLE=1` 走预编译 `libstm_tuya.a`,此补丁不生效。
+- **验证**:SDK 开发树全量 make 编译通过、无告警、固件正常生成。真机复测建议:联网静置 ≥2 小时,串口每 30 分钟应出现 `worker: conn-refresh sent` 与 `CONNECTION_REFRESH_RESP: code=... latest_expire_ts=...`,且 1 小时处不再触发 `on_disconnect`(待真机验证)。
+- **同步范围**:SDK 开发树与 overlay 两份 `rtc-tcp-client/src/{tai_client.c,tai_internal.h,tai_protocol.c}` 已同步(覆盖前 diff 确认 overlay 即改动前版本);`patches/`/`apply` 脚本不涉及(同 R 条目惯例)。
