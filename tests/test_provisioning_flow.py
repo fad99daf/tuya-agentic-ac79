@@ -45,14 +45,38 @@ class ProvisioningFlowTests(unittest.TestCase):
         source = read(BLE)
         stop = source[source.index("int tuya_ble_netcfg_stop(void)"):]
         self.assertNotIn("bt_ble_exit();", stop)
-        self.assertIn("tuya_ble_disconnect_with_retry", stop)
+        self.assertIn("tuya_ble_request_disconnect", stop)
+        self.assertIn("while (s_ble_connected", stop)
+        self.assertNotIn("ble_op_disconnect", stop)
         self.assertIn("TUYA_BLE_STOP_TIMEOUT_MS", stop)
 
-    def test_disconnect_during_stop_cannot_restart_advertising(self) -> None:
+    def test_official_ble_state_callback_is_the_connection_source_of_truth(self) -> None:
         source = read(BLE)
-        handler = source[source.index("static void tuya_pkt_handler"):source.index("/* ---------------- 初始化 + 启动")]
-        disconnected = handler[handler.index("case HCI_EVENT_DISCONNECTION_COMPLETE:"):]
-        self.assertIn("!s_stop_requested && !s_prov_done", disconnected)
+        callback = source[source.index("static void tuya_ble_state_cb"):source.index("static void tuya_pkt_handler")]
+        profile = source[source.index("static int tuya_ble_profile_init"):source.index("int tuya_ble_netcfg_start")]
+        self.assertIn("case BLE_ST_CONNECT:", callback)
+        self.assertIn("case BLE_ST_DISCONN:", callback)
+        self.assertIn("s_ble_connected = 0", callback)
+        self.assertIn("regist_state_cbk(NULL, tuya_ble_state_cb)", profile)
+
+    def test_disconnect_is_official_and_idempotent(self) -> None:
+        source = read(BLE)
+        request = source[source.index("static int tuya_ble_request_disconnect"):source.index("/* ---------------- notify")]
+        self.assertIn("if (!s_ble_connected || s_disconnect_pending)", request)
+        self.assertIn("s_disconnect_pending = 1", request)
+        self.assertIn("s_ble_ops->disconnect(NULL)", request)
+        self.assertNotIn("ble_op_disconnect", source)
+
+    def test_unexpected_disconnect_restores_tuya_advertising_outside_callback(self) -> None:
+        source = read(BLE)
+        callback = source[source.index("static void tuya_ble_state_cb"):source.index("static void tuya_pkt_handler")]
+        worker_start = source.index("static void tuya_ble_prov_worker_task")
+        worker = source[worker_start:source.index("\nvoid tuya_ble_prov_worker(", worker_start)]
+        self.assertIn("!s_stop_requested && !s_prov_done", callback)
+        self.assertIn("s_adv_restart_pending = 1", callback)
+        self.assertNotIn("msleep(", callback)
+        self.assertIn("tuya_make_adv();", worker)
+        self.assertIn("tuya_ble_adv_enable_with_retry(1)", worker)
 
     def test_provisioning_wait_is_bounded_and_failure_resets_to_advertising(self) -> None:
         ble = read(BLE)
