@@ -3641,6 +3641,12 @@ void app_music_play_netcfg_prompt(void)
     app_music_play_voice_prompt("NetCfgEnter.mp3", NULL);
 }
 
+/* Tuya 配网必须在云端激活、关键凭据保存和 MQTT 保持后才报成功。 */
+void app_music_play_netcfg_success(void)
+{
+    app_music_play_voice_prompt("NetCfgSucc.mp3", NULL);
+}
+
 /* 涂鸦 OTA 提示音播报(供 tuya_ota.c 跨文件调用;照搬 app_music_play_netcfg_prompt
  * 的导出模式——app_music_play_voice_prompt 是 static,需在 app_music.c 内包一层导出)。
  * type: 0=正在升级(OtaInUpdate.mp3) 1=升级成功(OtaSuccess.mp3) 2=升级失败(OtaFailed.mp3) */
@@ -4924,7 +4930,15 @@ static int app_music_net_event_handler(struct net_event *event)
 #if BT_NET_CFG_EN || BT_NET_CFG_QYAI_EN
                 ble_cfg_net_result_notify(event->event);
 #endif
+#ifdef CONFIG_TUYA_AGENTIC_ENABLE
+                /* DHCP 成功不等于 Tuya 云端激活/绑定成功；其余联网处理必须保留。 */
+                extern int tuya_agentic_provisioning_active(void);
+                if (!tuya_agentic_provisioning_active()) {
+                    app_music_play_voice_prompt("NetCfgSucc.mp3", __this->dec_ops->dec_breakpoint);
+                }
+#else
                 app_music_play_voice_prompt("NetCfgSucc.mp3", __this->dec_ops->dec_breakpoint);
+#endif
                 __this->reconnecting = 0;
 #ifdef CONFIG_SERVER_ASSIGN_PROFILE
                 dev_profile_init();
@@ -5213,4 +5227,3 @@ REGISTER_APPLICATION(app_music) = {
 };
 
 #endif
-

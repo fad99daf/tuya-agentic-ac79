@@ -2273,6 +2273,50 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
  * tuya_ble_netcfg_start 阻塞,故用独立线程周期播报;配网完成/失败/超时置
  * s_prov_prompt_run=0,线程在 ~0.1s 内退出。NetCfgEnter.mp3 是 app_music 现有提示音。*/
 static volatile int s_prov_prompt_run;
+
+#define TUYA_NETWORK_READY_TIMEOUT_MS  30000u
+#define TUYA_NETWORK_READY_POLL_MS       100u
+
+static volatile int s_tuya_provisioning_active;
+
+int tuya_agentic_provisioning_active(void)
+{
+    return s_tuya_provisioning_active;
+}
+
+extern u32 wifi_get_tuya_network_ready_generation(void);
+
+static int tuya_wait_for_network_ready(u32 start_generation)
+{
+    u32 waited_ms = 0;
+
+    while (waited_ms < TUYA_NETWORK_READY_TIMEOUT_MS) {
+        if (wifi_get_tuya_network_ready_generation() != start_generation) {
+            printf("[TUYA] network ready: generation %u -> %u\r\n",
+                   start_generation, wifi_get_tuya_network_ready_generation());
+            return 0;
+        }
+        msleep(TUYA_NETWORK_READY_POLL_MS);
+        waited_ms += TUYA_NETWORK_READY_POLL_MS;
+    }
+    printf("[TUYA] network ready timeout\r\n");
+    return -1;
+}
+
+static void tuya_provisioning_fail_and_reset(const char *stage)
+{
+    char zero[65] = {0};
+
+    printf("[TUYA] provisioning failed at %s, reset to BLE provisioning\r\n", stage);
+    s_prov_prompt_run = 0;
+    /* 清除未成功激活时暂存的 Wi-Fi 模式，避免下次启动回连本次失败网络。 */
+    wifi_store_mode_info(SMP_CFG_MODE, zero, zero);
+    tuya_ble_netcfg_stop();
+    os_time_dly(300); /* 给断链和 VM 写入最多 3s，再进入一轮干净广播。 */
+    extern void cpu_reset(void);
+    cpu_reset();
+    while (1) { ; }
+}
 static void tuya_prov_prompt_task(void *arg)
 {
     extern void app_music_play_netcfg_prompt(void);
@@ -2467,6 +2511,7 @@ void tuya_agentic_main(void *arg)
     }
 
     /* ---- 首次:BLE 配网 ---- */
+    s_tuya_provisioning_active = 1;
     printf("[TUYA] no devid, start BLE provisioning...\r\n");
     s_prov_prompt_run = 1;   /* 启动"请配置网络"循环播报(每 30s),配网完成会停 */
     thread_fork("tuya_prov_prompt", 6, 4 * 1024, 0, 0, tuya_prov_prompt_task, NULL);
@@ -2474,22 +2519,24 @@ void tuya_agentic_main(void *arg)
     s_prov_prompt_run = 0;   /* 配网完成/失败/超时,停循环播报 */
     os_time_dly(15);         /* ~150ms:让 prompt 线程看到标志退出,别让它播报到连 WiFi/激活阶段 */
     if (prov_ret != 0) {
-        printf("[TUYA] BLE provisioning failed/timeout\r\n"); return;
+        printf("[TUYA] BLE provisioning failed/timeout\r\n");
+        tuya_provisioning_fail_and_reset("ble");
+        return;
     }
-    tuya_ble_netcfg_stop();   /* 配网完停 BLE,释放内存给 WiFi/TLS */
-    printf("[TUYA] BLE done: ssid=%s token=%s\r\n", s_main_creds.ssid, s_main_creds.token);
+    if (tuya_ble_netcfg_stop() != 0) {
+        tuya_provisioning_fail_and_reset("ble-stop");
+        return;
+    }
+    printf("[TUYA] BLE done: ssid_len=%u token_len=%u\r\n",
+           (unsigned int)strlen(s_main_creds.ssid), (unsigned int)strlen(s_main_creds.token));
 
     /* ---- 连 WiFi(配网给的 ssid/密码)---- */
+    u32 network_generation = wifi_get_tuya_network_ready_generation();
     wifi_enter_sta_mode(s_main_creds.ssid, s_main_creds.password);
-    /* 等 WiFi 关联成功:原死等满 20s 太慢,改成轮询真实状态,一连上就继续。 */
-    for (int i = 0; i < 100; i++) {   /* 最多等 ~20s */
-        if (wifi_get_sta_connect_state() == WIFI_STA_CONNECT_SUCC) {
-            printf("[TUYA] wifi STA connected, wait DHCP...\r\n");
-            break;
-        }
-        msleep(200);
+    if (tuya_wait_for_network_ready(network_generation) != 0) {
+        tuya_provisioning_fail_and_reset("network-ready");
+        return;
     }
-    msleep(1500);   /* 关联成功后给 DHCP ~1.5s 拿 IP(实测 DHCP 在 SUCC 后 ~0.4s 完成) */
 
     /* 同步到杰理 wifi 存储:防 app_music 的 wifi_return_sta_mode 读到旧 ssid 覆盖。
      * 之前换网络后,杰理 VM 里残留旧 ssid(GJ1)覆盖了涂鸦配的 ssid,导致断网连不上 AI。*/
@@ -2506,7 +2553,11 @@ void tuya_agentic_main(void *arg)
     extern const char *tuya_get_effective_sw_ver(void);
     ob.sw_ver = tuya_get_effective_sw_ver();   /* 上报生效版本:VM>源码基线 */
     iot_client_t *iot = iot_client_init_on_boarding_with_token(&ob, s_main_creds.token);
-    if (!iot) { printf("[TUYA] on_boarding_with_token fail\r\n"); return; }
+    if (!iot) {
+        printf("[TUYA] on_boarding_with_token fail\r\n");
+        tuya_provisioning_fail_and_reset("activation");
+        return;
+    }
     printf("[TUYA] activated, devid=%s\r\n", iot->devid);
 
     /* ---- 持久化三元组 + WiFi 凭据(下次开机直连)----
@@ -2551,6 +2602,9 @@ void tuya_agentic_main(void *arg)
      *   改 3s 足够,缩短开机到可对话的延迟。*/
     printf("[TUYA] hold MQTT ~3s for app to confirm provisioning...\r\n");
     msleep(3000);
+    s_tuya_provisioning_active = 0;
+    extern void app_music_play_netcfg_success(void);
+    app_music_play_netcfg_success();
 
     /* ---- 连 AI 之前先检查涂鸦云 OTA(与直连路径保持一致)----
      * 配网首次激活后云端一般无待升级固件,但保持检查可应对"激活即升级"场景。

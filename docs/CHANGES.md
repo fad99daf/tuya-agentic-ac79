@@ -75,7 +75,8 @@
 ### A4. `le_net_cfg_tuya.c`(10 KB)+ `.h` — 涂鸦 BLE 配网传输层(全新)
 AC79 上手写的涂鸦 BLE GATT 配网传输层(SDK 原版无):
 - `.h`:涂鸦 3 个 128-bit 特征 UUID(write/notify/read)、手写 `profile_data[]` GATT 服务表、handle 宏(`WRITE_VAL=0x0006`/`NOTIFY_VAL=0x0008`/`NOTIFY_CCC=0x0009`/`READ_VAL=0x000b`)、对外 API `tuya_ble_netcfg_start/stop`。
-- `.c`:`tuya_ble_hal_random`(协议随机数 HAL,简易 LCG,注释提正式应用 AC79 TRNG)、`tuya_hal_send`(`att_server_notify` 回传)、`prov_complete_cb`(解出凭据→post 信号量)、ATT read/write 回调(write 数据转发到大栈 worker 任务,**不在 btstack 4KB 栈里跑 mbedTLS**)、`tuya_pkt_handler`(HCI 连接/断开/MTU,断开重启广播)、`tuya_ble_netcfg_start`(init→换 profile→开广播→阻塞等配网)、worker 任务 `tuya_prov_w`(2KB 栈,`early_initcall`)。
+- `.c`:`tuya_ble_hal_random`(协议随机数 HAL,简易 LCG,注释提正式应用 AC79 TRNG)、`tuya_hal_send`(`att_server_notify` 回传)、`prov_complete_cb`(解出凭据→post 信号量)、ATT read/write 回调(write 数据转发到大栈 worker 任务,**不在 btstack 4KB 栈里跑 mbedTLS**)、`tuya_ble_state_cb`(通过杰理 `regist_state_cbk` 接收真实连接/断链状态)、`tuya_pkt_handler`(只处理 ATT 事件)、`tuya_ble_netcfg_start`(init→换 profile→开广播→阻塞等配网)、worker 任务 `tuya_prov_w`(2KB 栈,`early_initcall`)。
+- **BLE stop 闭环修复**:连接状态以官方 `BLE_ST_*` 回调为准；stop 通过 `ble_get_server_operation_table()` 的 `disconnect(NULL)` 使用官方私有连接句柄，并等待 `BLE_ST_DISCONN`，不再等待仅在 ATT write 时赋值的本地 handle。`disconnect_pending` 保证失败清理重复调用 stop 时不重复断链；意外断链后的 Tuya 广播数据由 worker 延后恢复，主动 stop 完成后再次幂等关闭官方自动重开的广播。
 
 ### A5. `tuya_bool_compat.h` + `tuya_inc/stdbool.h` — bool 冲突兼容补丁
 解决 **JL clang 4.0.1 的 `stdbool.h` `#define bool _Bool`** 与 **AC79 `cpu.h` `typedef unsigned char bool`** 在同一翻译单元冲突("cannot combine with previous 'char'")。两套机制:
