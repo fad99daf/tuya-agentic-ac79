@@ -116,6 +116,9 @@ class ProvisioningFlowTests(unittest.TestCase):
         self.assertIn("syscfg_read(VM_TUYA_SECRET_IDX", reset)
         self.assertIn("syscfg_read(VM_TUYA_LOCALKEY_IDX", reset)
         self.assertIn("wifi_and_network_off()", cloud_reset)
+        self.assertIn("wifi_and_network_on()", cloud_reset)
+        self.assertLess(cloud_reset.index("wifi_and_network_off()"),
+                        cloud_reset.index("wifi_and_network_on()"))
         self.assertIn("s_cloud_reset_ready = 1", cloud_reset)
         self.assertIn("goto start_ble_provisioning", source)
         self.assertNotIn("tuya_clear_provision_and_reset();", cloud_reset)

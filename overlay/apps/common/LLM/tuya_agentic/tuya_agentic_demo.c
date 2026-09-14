@@ -2335,10 +2335,14 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
         iot_client_deinit(iot);
         if (tuya_clear_provision_credentials() == 0) {
             extern void wifi_and_network_off(void);
+            extern void wifi_and_network_on(void);
             wifi_and_network_off();
+            /* 前一轮移除会卸载 Wi-Fi 驱动和网络栈；不重新启动它，BLE 首轮虽能
+             * 收到凭据，但 DHCP_SUCC 不会产生，只能在失败后的软复位再成功。 */
+            wifi_and_network_on();
             s_cloud_reset_pending = 0;
             s_cloud_reset_ready = 1;
-            printf("[TUYA] credentials erased; re-enter BLE provisioning without reboot\r\n");
+            printf("[TUYA] credentials erased; Wi-Fi restarted; re-enter BLE provisioning\r\n");
         } else {
             /* 身份凭据未能确认擦除时绝不进入配网，避免旧设备身份残留。 */
             s_cloud_reset_ready = 0;
