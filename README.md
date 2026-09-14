@@ -215,12 +215,13 @@ tuya-agentic-ac79/
     ├── INTEGRATION.md   ← 集成架构与原理
     ├── WAKEWORD.md      ← 唤醒词子系统:v2 引擎与官方 token / 参数 / 调参 / 日志
     ├── CHANGES.md       ← 完整改动清单
+    ├── AI-AGENT-API.md  ← (接口参考)C端智能体业务开放能力-设备侧接口(thing.ai.* 14 个)
     ├── WEATHER.md       ← (参考)天气获取功能集成说明(ATOP thing.weather.get)
     ├── FACTORY-RESET.md ← (参考)恢复出厂设置说明(reset_callback / tuya.device.reset)
     └── TIME-SYNC.md     ← (参考)设备时间校正方案(ATOP 校时,无 RTC)
 ```
 
-> `WEATHER.md` / `FACTORY-RESET.md` / `TIME-SYNC.md` 是**参考实现说明**,对应功能尚未合入本仓代码;需要的开发者可照文档自行落地。
+> `AI-AGENT-API.md` 是涂鸦官方 `thing.ai.*` 设备侧接口规格(智能体配置/角色/聊天/音色),供需要对应云端能力的开发者参考;`WEATHER.md` / `FACTORY-RESET.md` / `TIME-SYNC.md` 是**参考实现说明**,对应功能尚未合入本仓代码,需要的开发者可照文档自行落地。
 
 ---
 
