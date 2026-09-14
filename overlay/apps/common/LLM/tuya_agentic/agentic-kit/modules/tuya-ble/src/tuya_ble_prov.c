@@ -186,12 +186,12 @@ static int aes_cbc_decrypt(const uint8_t *key, const uint8_t *iv,
     mbedtls_aes_free(&aes);
     if (ret != 0) return ret;
 
-    uint8_t pad = out[in_len - 1];
-    if (pad == 0 || pad > 16) {
-        *out_len = in_len;
-    } else {
-        *out_len = in_len - pad;
-    }
+    /* The mobile clients may use AES-CBC without padding when the inner
+     * Tuya frame happens to end on a block boundary.  Its final byte is then
+     * the CRC byte, which can coincidentally be in the PKCS#7 range 1..16.
+     * Keep the full decrypted block here; the frame parser knows the expected
+     * length from data_len and can validate actual PKCS#7 padding safely. */
+    *out_len = in_len;
     return 0;
 }
 
@@ -555,10 +555,47 @@ static void tuya_ble_recv(tuya_ble_prov_state_t *state, const uint8_t *packet, u
         TUYA_BLE_HAL_LOGI("[PROTO] peer_pkt_len=%u", state->peer_pkt_len);
     }
 
+    uint32_t frame_expected_len = (uint32_t)BLE_FRAME_HEADER_LEN + data_len + BLE_FRAME_CRC_LEN;
     uint16_t crc_offset = BLE_FRAME_HEADER_LEN + data_len;
-    if (crc_offset + 2 > frame_len) {
-        TUYA_BLE_HAL_LOGW("[RX] Invalid data_len=%d", data_len);
+    if (frame_expected_len > frame_len) {
+        TUYA_BLE_HAL_LOGW("[RX] Length mismatch: cmd=0x%04X raw=%u expected=%lu",
+                          cmd, frame_len, (unsigned long)frame_expected_len);
         return;
+    }
+
+    if (frame_len > frame_expected_len) {
+        uint16_t pad_len = frame_len - (uint16_t)frame_expected_len;
+        uint16_t i;
+        bool is_pkcs7_padding = true;
+        bool is_zero_padding = true;
+
+        /* Mobile implementations seen in the field use all three forms:
+         * an unpadded block, PKCS#7, and a zero-filled final AES block.
+         * Derive the real boundary from data_len and only trim a complete,
+         * consistently encoded tail; CRC is still checked below. */
+        if (pad_len > 16) {
+            TUYA_BLE_HAL_LOGW("[RX] Invalid trailing data: cmd=0x%04X raw=%u expected=%lu",
+                              cmd, frame_len, (unsigned long)frame_expected_len);
+            return;
+        }
+        for (i = 0; i < pad_len; i++) {
+            if (frame[frame_expected_len + i] != 0) {
+                is_zero_padding = false;
+            }
+            if (frame[frame_expected_len + i] != pad_len) {
+                is_pkcs7_padding = false;
+            }
+        }
+        if (!is_pkcs7_padding && !is_zero_padding) {
+            TUYA_BLE_HAL_LOGW("[RX] Invalid padding: cmd=0x%04X raw=%u expected=%lu",
+                              cmd, frame_len, (unsigned long)frame_expected_len);
+            return;
+        }
+        if (is_zero_padding) {
+            TUYA_BLE_HAL_LOGI("[RX] Accepted zero-filled AES tail: cmd=0x%04X len=%u",
+                              cmd, pad_len);
+        }
+        frame_len = (uint16_t)frame_expected_len;
     }
     uint16_t recv_crc = (frame[crc_offset] << 8) | frame[crc_offset + 1];
     uint16_t calc_crc = crc16_modbus(frame, crc_offset);

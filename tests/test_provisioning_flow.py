@@ -6,9 +6,13 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 BLE = ROOT / "overlay/apps/common/LLM/tuya_agentic/le_net_cfg_tuya.c"
+BLE_PROV = ROOT / "overlay/apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya-ble/src/tuya_ble_prov.c"
 DEMO = ROOT / "overlay/apps/common/LLM/tuya_agentic/tuya_agentic_demo.c"
 WIFI = ROOT / "overlay/apps/wifi_story_machine/wifi_app_task.c"
 MUSIC = ROOT / "overlay/apps/wifi_story_machine/app_music.c"
+IOT_HEADER = ROOT / "overlay/apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/include/iot_client.h"
+IOT_CLIENT = ROOT / "overlay/apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client.c"
+IOT_MESSAGE = ROOT / "overlay/apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client_message.c"
 
 
 def read(path: Path) -> str:
@@ -84,6 +88,88 @@ class ProvisioningFlowTests(unittest.TestCase):
         self.assertIn("TUYA_BLE_PROVISION_TIMEOUT_TICKS", ble)
         self.assertNotIn("os_sem_pend(&s_prov_sem, 0)", ble)
         self.assertIn("tuya_provisioning_fail_and_reset", demo)
+
+    def test_bt_ready_event_replaces_fixed_boot_delay_with_timeout_fallback(self) -> None:
+        source = read(DEMO)
+        handler = source.index("static void tuya_agentic_bt_event_handler")
+        main = source.index("void tuya_agentic_main(void *arg)")
+        flow_start = source.index('printf("===== tuya_agentic_main start', main)
+        init = source.index("static int tuya_agentic_main_init(void)")
+        self.assertIn("BT_STATUS_INIT_OK", source[handler:main])
+        self.assertIn("os_sem_post(&s_bt_ready_sem)", source[handler:main])
+        self.assertIn("os_sem_pend(&s_bt_ready_sem, TUYA_BT_READY_TIMEOUT_TICKS)", source[main:flow_start])
+        self.assertNotIn("os_time_dly(400)", source[main:flow_start])
+        self.assertIn("BT init %s; starting agentic flow", source[main:flow_start])
+        self.assertIn("register_sys_event_handler(SYS_BT_EVENT, BT_EVENT_FROM_CON", source[init:])
+        self.assertLess(source.index("os_sem_create(&s_bt_ready_sem, 0)", init),
+                        source.index("register_sys_event_handler(SYS_BT_EVENT", init))
+
+    def test_cloud_reset_uses_two_second_candidate_only_after_successful_ble_stop(self) -> None:
+        source = read(DEMO)
+        reset = source[source.index("void tuya_clear_provision_and_reset(void)"):]
+        self.assertIn("TUYA_CLOUD_RESET_BLE_QUIET_SUCCESS_TICKS 200u", source)
+        self.assertIn("TUYA_CLOUD_RESET_BLE_QUIET_FALLBACK_TICKS 300u", source)
+        self.assertIn("ble_stop_ret = tuya_ble_netcfg_stop()", reset)
+        self.assertIn("ble_stop_ret == 0", reset)
+        self.assertIn("quiet_wait_ticks = ble_stop_ret == 0", reset)
+        self.assertIn("os_time_dly(quiet_wait_ticks)", reset)
+        self.assertIn("reset BLE stop ret=%d; quiet wait=%ums", reset)
+
+    def test_ble_receive_accepts_consistent_mobile_padding_only(self) -> None:
+        source = read(BLE_PROV)
+        decrypt = source[source.index("static int aes_cbc_decrypt"):
+                         source.index("static void ble_id_compress")]
+        receive = source[source.index("uint16_t data_len ="):
+                         source.index("uint16_t recv_crc =", source.index("uint16_t data_len ="))]
+        self.assertIn("*out_len = in_len", decrypt)
+        self.assertNotIn("*out_len = in_len - pad", decrypt)
+        self.assertIn("frame_expected_len", receive)
+        self.assertIn("frame_expected_len > frame_len", receive)
+        self.assertIn("frame_len > frame_expected_len", receive)
+        self.assertIn("is_pkcs7_padding", receive)
+        self.assertIn("is_zero_padding", receive)
+        self.assertIn("frame[frame_expected_len + i] != 0", receive)
+        self.assertIn("frame[frame_expected_len + i] != pad_len", receive)
+        self.assertIn("!is_pkcs7_padding && !is_zero_padding", receive)
+
+
+class CloudRemovalTests(unittest.TestCase):
+    def test_reset_callback_is_carried_through_every_client_creation_path(self) -> None:
+        header = read(IOT_HEADER)
+        client = read(IOT_CLIENT)
+        self.assertIn("iot_reset_callback_t reset_callback", header)
+        self.assertIn("void *reset_user_data", header)
+        self.assertEqual(client.count("reset_callback = config->reset_callback"), 3)
+        self.assertEqual(client.count("reset_user_data = config->reset_user_data"), 3)
+
+    def test_protocol_11_removal_commands_are_consumed_before_dp_dispatch(self) -> None:
+        source = read(IOT_MESSAGE)
+        reset = source.index("iot_client_message_handle_reset(client, decrypted, decrypted_len)")
+        dp_dispatch = source.index("iot_dp_dispatch_downlink", reset)
+        self.assertLess(reset, dp_dispatch)
+        self.assertIn("cJSON_ParseWithLength", source)
+        self.assertIn("jproto->valueint != IOT_PROTO_GW_RESET", source)
+        self.assertIn("strcmp(jgw->valuestring, client->devid)", source)
+        self.assertIn('"reset_factory"', source)
+        self.assertIn("IOT_RESET_REMOTE_FACTORY", source)
+        header = read(IOT_HEADER)
+        self.assertIn("IOT_RESET_REMOTE_UNBIND = 0", header)
+        self.assertIn("IOT_RESET_REMOTE_FACTORY", header)
+        self.assertIn("iot_reset_type_t type = IOT_RESET_REMOTE_UNBIND", source)
+
+    def test_application_defers_erase_until_mqtt_process_owner_exits(self) -> None:
+        source = read(DEMO)
+        callback = source[source.index("static void on_cloud_reset"):
+                          source.index("static void tuya_mqtt_keepalive_task")]
+        reset = source[source.index("if (s_cloud_reset_pending) {", source.index("static void tuya_ai_run")):]
+        self.assertIn("s_cloud_reset_pending = 1", callback)
+        self.assertIn("g_exit = 1", callback)
+        self.assertIn("IOT_RESET_REMOTE_UNBIND", callback)
+        self.assertIn("g_mqtt_ka_run = 0", reset)
+        self.assertLess(reset.index("g_mqtt_ka_run = 0"), reset.index("iot_client_deinit(iot)"))
+        self.assertLess(reset.index("s_mqtt_ka_exited"), reset.index("iot_client_deinit(iot)"))
+        self.assertIn("syscfg_write(VM_TUYA_SCHEMAID_IDX", source)
+        self.assertIn("syscfg_write(VM_TUYA_SCHEMA_IDX", source)
 
 
 if __name__ == "__main__":

@@ -3,9 +3,53 @@
 #include "cipher_wrapper.h"
 #include "iot_config_defaults.h"
 #include "iot_dp_internal.h"
-
+#include "cJSON.h"
 #include <string.h>
 #include <stdio.h>
+
+#define IOT_PROTO_GW_RESET 11
+
+/* Mirrors the reset handling used by agentic-kit in the user-supplied
+ * xiaozhi-esp32 reference: protocol 11 is a cloud device-remove notice;
+ * root type=reset_factory is factory reset, otherwise it is remote unbind. */
+static bool iot_client_message_handle_reset(iot_client_t *client,
+                                            const uint8_t *bytes, size_t len)
+{
+    if (!client || !bytes || len == 0 || !client->reset_callback) return false;
+
+    cJSON *root = cJSON_ParseWithLength((const char *)bytes, len);
+    if (!root) return false;
+
+    cJSON *jproto = cJSON_GetObjectItem(root, "protocol");
+    if (!cJSON_IsNumber(jproto) || jproto->valueint != IOT_PROTO_GW_RESET) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    /* Consume a protocol-11 message for another gateway but never reset this
+     * device. This is a broker-side defensive check from agentic-kit. */
+    cJSON *data = cJSON_GetObjectItem(root, "data");
+    cJSON *jgw = data ? cJSON_GetObjectItem(data, "gwId") : NULL;
+    if (jgw && cJSON_IsString(jgw) && client->devid[0] != '\0' &&
+        strcmp(jgw->valuestring, client->devid) != 0) {
+        log_warn("reset: gwId mismatch; consumed without callback");
+        cJSON_Delete(root);
+        return true;
+    }
+
+    iot_reset_type_t type = IOT_RESET_REMOTE_UNBIND;
+    cJSON *jtype = cJSON_GetObjectItem(root, "type");
+    if (jtype && cJSON_IsString(jtype) &&
+        strcmp(jtype->valuestring, "reset_factory") == 0) {
+        type = IOT_RESET_REMOTE_FACTORY;
+    }
+
+    log_warn("reset: device-remove notice received (type=%s)",
+             type == IOT_RESET_REMOTE_FACTORY ? "factory" : "unbind");
+    client->reset_callback(type, client->reset_user_data);
+    cJSON_Delete(root);
+    return true;
+}
 
 static void mqtt_message_handler(const char *topic, size_t topic_len,
                                  const uint8_t *payload, size_t payload_len,
@@ -35,6 +79,11 @@ static void mqtt_message_handler(const char *topic, size_t topic_len,
                  (unsigned)decrypted_len,
                  (int)dump_len, (const char *)decrypted,
                  decrypted_len > 200 ? "..." : "");
+
+        if (iot_client_message_handle_reset(client, decrypted, decrypted_len)) {
+            client->pal->free(decrypted);
+            return;
+        }
 
         /* Offer the plaintext to the DP layer first; if it does not consume it,
          * forward to the user's raw message callback (backward compatible). */

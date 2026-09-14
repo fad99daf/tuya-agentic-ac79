@@ -18,6 +18,9 @@
 
 #include "system/includes.h"      /* late_initcall 等 */
 #include "system/os/os_api.h"     /* msleep */
+#include "event/event.h"          /* SYS_BT_EVENT / register_sys_event_handler */
+#include "event/bt_event.h"       /* struct bt_event / BT_EVENT_FROM_CON */
+#include "btstack/avctp_user.h"   /* BT_STATUS_INIT_OK */
 #include "mbedtls/base64.h"       /* 宿主 mbedTLS 3.4 */
 
 #include "pal.h"
@@ -126,6 +129,16 @@ static volatile int g_barge_in;           /* barge-in 触发:跳过 TTS 后清�
 static volatile int g_exit;               /* on_disconnect 置位:令本次会话的语音循环退出(supervisor 稍后重连) */
 static volatile int g_link_broken;        /* 上行发送失败:链路已断,快速报废本次会话交 supervisor 重连(不等 60s 超时) */
 static volatile int g_mqtt_ka_run;        /* MQTT 心跳线程运行标志:生命周期=整个 tuya 流程,不跟 AI 会话共存亡 */
+static volatile int s_cloud_reset_pending; /* MQTT 回调只置位;资源释放和 VM 擦除由主任务完成 */
+static volatile int s_mqtt_ka_exited;      /* 防止 deinit 与 iot_client_process 并发 */
+/* 启动路径只依赖蓝牙控制器；在 late_initcall 创建主任务前注册 BT 完成事件。
+ * 信号量使事件早到、晚到都不会丢失，4 秒超时则保留旧路径的兼容兜底。 */
+static volatile int s_bt_ready;
+static OS_SEM s_bt_ready_sem;
+#define TUYA_BT_READY_TIMEOUT_TICKS 400u  /* 4s，等价于原 os_time_dly(400) 上限 */
+/* 阶段 2 A/B 候选值：BLE stop 成功时先验证 2s；失败保留历史 3s 保护。 */
+#define TUYA_CLOUD_RESET_BLE_QUIET_SUCCESS_TICKS 200u
+#define TUYA_CLOUD_RESET_BLE_QUIET_FALLBACK_TICKS 300u
 static int g_audio_frame_logged;          /* 下行首帧帧长只打印一次,供核对 opus_cbr_pktlen */
 #ifdef TUYA_SERVER_VAD_ENABLE
 static volatile int g_server_vad_stop;    /* 云端VAD(TAI_EVT_SERVER_VAD)通知停说:上行循环据此收尾。on_event 在 worker 线程置位,主循环读 */
@@ -359,12 +372,42 @@ static void on_mqtt_message(const char *topic, size_t topic_len,
  * transport_recv 本就阻塞在 recv(超时 MQTT_RECV_TIMEOUT_MS=1s),缩短休眠只是
  * 每 ~1s 多醒一次,CPU 基本不变。*/
 #define TUYA_MQTT_DEAD_WINDOW_MS 10000u  /* 失败持续超该时长才判死:滤掉毫秒级瞬断(原按"连续2轮"计数,轮询提速后两轮仅隔20ms会误杀) */
+static void on_cloud_reset(iot_reset_type_t type, void *user_data)
+{
+    (void)user_data;
+    if (type == IOT_RESET_REMOTE_FACTORY || type == IOT_RESET_REMOTE_UNBIND) {
+        /* This executes in the MQTT process task. Do not stop audio, touch VM,
+         * deinit MQTT, or reset here: the supervisor owns those resources. */
+        s_cloud_reset_pending = 1;
+        g_exit = 1;
+    }
+}
+
+/* 系统事件上下文只唤醒等待者，BLE profile/广播仍在 tuya_agentic 主任务执行。 */
+static void tuya_agentic_bt_event_handler(struct sys_event *event)
+{
+    struct bt_event *bt;
+
+    if (!event || event->type != SYS_BT_EVENT ||
+        event->from != BT_EVENT_FROM_CON || event->len < sizeof(*bt)) {
+        return;
+    }
+    bt = (struct bt_event *)event->payload;
+    if (bt->event == BT_STATUS_INIT_OK && !s_bt_ready) {
+        s_bt_ready = 1;
+        os_sem_post(&s_bt_ready_sem);
+    }
+}
+
 static void tuya_mqtt_keepalive_task(void *arg)
 {
     extern int  iot_client_message_connect(iot_client_t *client);    /* src/iot_client_message.h 未进公共头 */
     extern void iot_client_message_disconnect(iot_client_t *client);
     iot_client_t *iot = (iot_client_t *)arg;
-    if (!iot) return;
+    if (!iot) {
+        s_mqtt_ka_exited = 1;
+        return;
+    }
     int failing = 0;              /* 连续失败中标记(成功清零),配合 fail_since_ms 计失败持续时长 */
     unsigned int fail_since_ms = 0;
     while (g_mqtt_ka_run) {
@@ -380,7 +423,11 @@ static void tuya_mqtt_keepalive_task(void *arg)
             unsigned int backoff = 5000;
             while (g_mqtt_ka_run && iot_client_message_connect(iot) != 0) {
                 printf("[TUYA] mqtt reconnect fail, retry in %ums\r\n", backoff);
-                msleep(backoff);
+                for (unsigned int waited_ms = 0;
+                     waited_ms < backoff && g_mqtt_ka_run;
+                     waited_ms += 100) {
+                    msleep(100);
+                }
                 if (backoff < 60000) backoff *= 2;
             }
             if (g_mqtt_ka_run) printf("[TUYA] mqtt reconnected\r\n");
@@ -388,6 +435,7 @@ static void tuya_mqtt_keepalive_task(void *arg)
         }
         os_time_dly(1);
     }
+    s_mqtt_ka_exited = 1;
 }
 
 /* DP 下行回调:云端下发 DP 值时触发(如说"音量调到20"→云端识别后下发 DP)。
@@ -1087,6 +1135,7 @@ void tuya_agentic_demo(void *arg)
     obcfg.timeout_ms       = 30000;
     obcfg.cert_bundle_attach = NULL;
     obcfg.cacert = NULL;
+    obcfg.reset_callback = on_cloud_reset;
     iot = iot_client_init_on_boarding_with_token(&obcfg, TUYA_ACTIVATION_TOKEN);
     if (!iot) { printf("[TUYA] on_boarding_with_token fail(token 过期/三件套错?)\r\n"); return; }
     printf("[TUYA] activated, devid=%s\r\n", iot->devid);
@@ -1098,6 +1147,7 @@ void tuya_agentic_demo(void *arg)
     cfg.mqtt_disable_tls = false; cfg.mqtt_auto_connect = 1;
     cfg.cert_bundle_attach = NULL; cfg.cacert = NULL;
     cfg.message_callback = on_mqtt_message;   /* MQTT 常驻:收 DP 下行 */
+    cfg.reset_callback = on_cloud_reset;
     extern const char *tuya_get_effective_sw_ver(void);
     cfg.sw_ver = tuya_get_effective_sw_ver();   /* 上报生效版本:VM>源码基线 */
 
@@ -2237,8 +2287,11 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
  * WiFi 断线由 SDK 层自动重连(见 tuya_mqtt_keepalive_task 注释),这里只管
  * AI 会话层。MQTT 心跳线程与音频流都在此启动且跨会话存活:重连等待期间采集
  * 照跑,cbuf 环形覆盖旧数据(无害),会话恢复后 idle-drain 自然消费到新鲜帧。*/
+void tuya_clear_provision_and_reset(void);
+
 static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_key)
 {
+    s_mqtt_ka_exited = 0;
     g_mqtt_ka_run = 1;
     thread_fork("tuya_mqtt_ka", 5, 6 * 1024, 0, 0, tuya_mqtt_keepalive_task, iot);
 
@@ -2253,19 +2306,36 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
     while (1) {
         /* 每次会话尝试前复位跨线程标志(tai ctx 尚未创建,on_disconnect 无竞态) */
         g_exit = 0; g_link_broken = 0;
+        if (s_cloud_reset_pending) break;
         g_tts_playing = 0; g_turn_done = 1;
 #ifdef TUYA_BARGE_IN_ENABLE
         g_barge_in = 0; g_barge_prefill = 0;
 #endif
         printf("[TUYA] session attempt\r\n");
         unsigned int lived_ms = tuya_ai_session(pal, iot, local_key);
+        if (s_cloud_reset_pending) break;
         if (lived_ms > 60000) backoff_ms = 5000;   /* 会话曾健康存活,按首次失败退避 */
         /* 会话报废收尾:清残留 TTS 让喇叭立刻安静,重连后从干净状态起听 */
         _device_rbuf_clear();
         printf("[TUYA] session lost (lived %us), retry in %ums\r\n",
                lived_ms / 1000, backoff_ms);
-        msleep(backoff_ms);
+        for (unsigned int waited_ms = 0;
+             waited_ms < backoff_ms && !s_cloud_reset_pending;
+             waited_ms += 100) {
+            msleep(100);
+        }
+        if (s_cloud_reset_pending) break;
         if (backoff_ms < 60000) backoff_ms *= 2;
+    }
+
+    /* The reset callback runs in tuya_mqtt_ka. Stop the sole
+     * iot_client_process owner before deinit, then erase in this task. */
+    if (s_cloud_reset_pending) {
+        printf("[TUYA] cloud reset requested; stopping MQTT before erase\r\n");
+        g_mqtt_ka_run = 0;
+        while (!s_mqtt_ka_exited) os_time_dly(1);
+        iot_client_deinit(iot);
+        tuya_clear_provision_and_reset();
     }
 }
 
@@ -2390,12 +2460,14 @@ static void tuya_log_redirect(log_level_t level, const char *fmt, va_list args)
 void tuya_agentic_main(void *arg)
 {
     const pal_t *pal = tai_pal_ac791n();
-
-    /* 等 BT/WiFi 控制器初始化完成(late_initcall 跑得太早,BT 还没起来)。
-     * 实测 BT_STATUS_INIT_OK 在开机 ~2.5s 到达,等 4s 留足裕量即可。原 15s 过度保守,
-     * 导致"提示配网后要干等十几秒 BLE 才广播、App 才扫到"。netcfg_start 本身是瞬时的。*/
-    printf("[TUYA] waiting ~4s for BT/WiFi init...\r\n");
-    os_time_dly(400);    /* 400 * 10ms = 4s */
+    /* BT_STATUS_INIT_OK 到达即继续；事件漏发时最多仍等原先 4 秒，避免回归到
+     * 控制器尚未就绪就注册 ATT/profile 的问题。Wi-Fi 在 BLE 得到凭据后才需要。 */
+    if (!s_bt_ready) {
+        printf("[TUYA] waiting <=4s for BT init event...\r\n");
+        os_sem_pend(&s_bt_ready_sem, TUYA_BT_READY_TIMEOUT_TICKS);
+    }
+    printf("[TUYA] BT init %s; starting agentic flow\r\n",
+           s_bt_ready ? "ready" : "event timeout (fallback)");
 
     printf("===== tuya_agentic_main start =====\r\n");
     {
@@ -2459,6 +2531,7 @@ void tuya_agentic_main(void *arg)
         cfg.env = PROD;
         cfg.mqtt_disable_tls = false; cfg.mqtt_auto_connect = 1;
         cfg.cert_bundle_attach = NULL; cfg.cacert = NULL;
+        cfg.reset_callback = on_cloud_reset;
         extern const char *tuya_get_effective_sw_ver(void);
         cfg.sw_ver = tuya_get_effective_sw_ver();   /* 上报生效版本:VM>源码基线 */
 
@@ -2550,6 +2623,7 @@ void tuya_agentic_main(void *arg)
     strncpy((char *)ob.product_key, TUYA_PRODUCT_KEY, sizeof(ob.product_key) - 1);
     ob.env = PROD; ob.mqtt_disable_tls = false; ob.mqtt_auto_connect = 1; ob.timeout_ms = 30000;
     ob.cert_bundle_attach = NULL; ob.cacert = NULL;
+    ob.reset_callback = on_cloud_reset;
     extern const char *tuya_get_effective_sw_ver(void);
     ob.sw_ver = tuya_get_effective_sw_ver();   /* 上报生效版本:VM>源码基线 */
     iot_client_t *iot = iot_client_init_on_boarding_with_token(&ob, s_main_creds.token);
@@ -2642,12 +2716,16 @@ void tuya_agentic_main(void *arg)
 void tuya_clear_provision_and_reset(void)
 {
     char zero[65] = {0};   /* 65 覆盖 ssid/pwd(65),也够 devid/secret/localkey(32)*/
+    int ble_stop_ret;
+    unsigned int quiet_wait_ticks;
     printf("[TUYA] >>> clear provision & reboot (re-enter BLE provisioning) <<<\r\n");
     syscfg_write(VM_TUYA_DEVID_IDX,    zero, 32);
     syscfg_write(VM_TUYA_SECRET_IDX,   zero, 32);
     syscfg_write(VM_TUYA_LOCALKEY_IDX, zero, 32);
     syscfg_write(VM_TUYA_SSID_IDX,     zero, 65);
     syscfg_write(VM_TUYA_PWD_IDX,      zero, 65);
+    syscfg_write(VM_TUYA_SCHEMAID_IDX, zero, 64);
+    syscfg_write(VM_TUYA_SCHEMA_IDX,   zero, 65);
     syscfg_write(VM_TUYA_REGION_IDX,   zero, 1);   /* region 一并清:重配网时重新下发(可能换了区)*/
     /* 同时清杰理 WiFi VM:设回 SMP_CFG_MODE(配网模式)+ 空 ssid。
      * 否则 wifi_app_task 开机读到旧 STA_MODE ssid 自动连网→播"网络连接成功"→
@@ -2657,8 +2735,16 @@ void tuya_clear_provision_and_reset(void)
      *   软复位(P33_SYSTEM_RESET)不像掉电/reset 键那样完全重置 BT 控制器,带活跃
      *   射频状态复位会导致重启后 BLE 链路异常(conn nack → supervision timeout),
      *   配网必失败(实测:长按 K6 走软复位后配网失败,按 reset 键冷启动则成功)。*/
-    tuya_ble_netcfg_stop();
-    os_time_dly(300);   /* 3s:BT 控制器 idle + VM 落盘 */
+    ble_stop_ret = tuya_ble_netcfg_stop();
+    /* stop 成功已确认广播关闭且（如有）断链完成，先以 2s A/B 候选验证。
+     * 失败时不降低原保护时间，避免软复位带活动 BLE 状态重启。 */
+    quiet_wait_ticks = ble_stop_ret == 0 ?
+                       TUYA_CLOUD_RESET_BLE_QUIET_SUCCESS_TICKS :
+                       TUYA_CLOUD_RESET_BLE_QUIET_FALLBACK_TICKS;
+    printf("[TUYA] reset BLE stop ret=%d; quiet wait=%ums%s\r\n",
+           ble_stop_ret, quiet_wait_ticks * 10u,
+           ble_stop_ret == 0 ? " (2s candidate)" : " (3s fallback)");
+    os_time_dly(quiet_wait_ticks);
     extern void cpu_reset(void);
     cpu_reset();
     while (1) { ; }   /* 复位路径,不返回 */
@@ -2669,6 +2755,16 @@ void tuya_clear_provision_and_reset(void)
  *    挪到 WiFi/BT 初始化完成之后,或由按键/事件触发。*/
 static int tuya_agentic_main_init(void)
 {
+    int ret;
+
+    /* 创建信号量必须先于注册：BT 初始化事件即使紧随注册到达也不会丢失。 */
+    os_sem_create(&s_bt_ready_sem, 0);
+    ret = register_sys_event_handler(SYS_BT_EVENT, BT_EVENT_FROM_CON, 0,
+                                     tuya_agentic_bt_event_handler);
+    if (ret) {
+        /* 主任务仍走 4 秒兜底，保持旧版可启动性，并留下串口诊断。 */
+        printf("[TUYA] BT event registration failed: %d; use timeout fallback\r\n", ret);
+    }
     return thread_fork("tuya_agentic", 4, 16 * 1024, 0, 0, tuya_agentic_main, NULL);
 }
 late_initcall(tuya_agentic_main_init);
