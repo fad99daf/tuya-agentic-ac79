@@ -104,17 +104,21 @@ class ProvisioningFlowTests(unittest.TestCase):
         self.assertLess(source.index("os_sem_create(&s_bt_ready_sem, 0)", init),
                         source.index("register_sys_event_handler(SYS_BT_EVENT", init))
 
-    def test_cloud_reset_clears_credentials_then_reboots_directly(self) -> None:
+    def test_cloud_reset_clears_credentials_then_reenters_ble_without_reboot(self) -> None:
         source = read(DEMO)
-        reset = source[source.rindex("void tuya_clear_provision_and_reset(void)"):]
+        reset = source[source.index("static int tuya_clear_provision_credentials(void)"):]
+        cloud_reset = source[source.index("if (s_cloud_reset_pending) {", source.index("static void tuya_ai_run")):]
         self.assertIn("syscfg_write(VM_TUYA_DEVID_IDX", reset)
         self.assertIn("syscfg_write(VM_TUYA_SECRET_IDX", reset)
         self.assertIn("syscfg_write(VM_TUYA_LOCALKEY_IDX", reset)
         self.assertIn("wifi_store_mode_info(SMP_CFG_MODE", reset)
-        self.assertNotIn("tuya_ble_netcfg_stop", reset)
-        self.assertNotIn("quiet_wait_ticks", reset)
-        self.assertLess(reset.index("wifi_store_mode_info(SMP_CFG_MODE"),
-                        reset.index("cpu_reset()"))
+        self.assertIn("syscfg_read(VM_TUYA_DEVID_IDX", reset)
+        self.assertIn("syscfg_read(VM_TUYA_SECRET_IDX", reset)
+        self.assertIn("syscfg_read(VM_TUYA_LOCALKEY_IDX", reset)
+        self.assertIn("wifi_and_network_off()", cloud_reset)
+        self.assertIn("s_cloud_reset_ready = 1", cloud_reset)
+        self.assertIn("goto start_ble_provisioning", source)
+        self.assertNotIn("tuya_clear_provision_and_reset();", cloud_reset)
 
     def test_ble_receive_accepts_consistent_mobile_padding_only(self) -> None:
         source = read(BLE_PROV)

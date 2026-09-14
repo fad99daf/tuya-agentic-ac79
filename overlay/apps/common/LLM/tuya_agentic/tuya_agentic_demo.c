@@ -130,6 +130,7 @@ static volatile int g_exit;               /* on_disconnect 置位:令本次会�
 static volatile int g_link_broken;        /* 上行发送失败:链路已断,快速报废本次会话交 supervisor 重连(不等 60s 超时) */
 static volatile int g_mqtt_ka_run;        /* MQTT 心跳线程运行标志:生命周期=整个 tuya 流程,不跟 AI 会话共存亡 */
 static volatile int s_cloud_reset_pending; /* MQTT 回调只置位;资源释放和 VM 擦除由主任务完成 */
+static volatile int s_cloud_reset_ready;   /* 已验证清除凭据并关网络，可重入 BLE 配网 */
 static volatile int s_mqtt_ka_exited;      /* 防止 deinit 与 iot_client_process 并发 */
 /* 启动路径只依赖蓝牙控制器；在 late_initcall 创建主任务前注册 BT 完成事件。
  * 信号量使事件早到、晚到都不会丢失，4 秒超时则保留旧路径的兼容兜底。 */
@@ -2284,7 +2285,7 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
  * WiFi 断线由 SDK 层自动重连(见 tuya_mqtt_keepalive_task 注释),这里只管
  * AI 会话层。MQTT 心跳线程与音频流都在此启动且跨会话存活:重连等待期间采集
  * 照跑,cbuf 环形覆盖旧数据(无害),会话恢复后 idle-drain 自然消费到新鲜帧。*/
-void tuya_clear_provision_and_reset(void);
+static int tuya_clear_provision_credentials(void);
 
 static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_key)
 {
@@ -2332,7 +2333,17 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
         g_mqtt_ka_run = 0;
         while (!s_mqtt_ka_exited) os_time_dly(1);
         iot_client_deinit(iot);
-        tuya_clear_provision_and_reset();
+        if (tuya_clear_provision_credentials() == 0) {
+            extern void wifi_and_network_off(void);
+            wifi_and_network_off();
+            s_cloud_reset_pending = 0;
+            s_cloud_reset_ready = 1;
+            printf("[TUYA] credentials erased; re-enter BLE provisioning without reboot\r\n");
+        } else {
+            /* 身份凭据未能确认擦除时绝不进入配网，避免旧设备身份残留。 */
+            s_cloud_reset_ready = 0;
+            printf("[TUYA] credential erase verification failed; BLE provisioning blocked\r\n");
+        }
     }
 }
 
@@ -2575,12 +2586,17 @@ void tuya_agentic_main(void *arg)
                  * 当前 loose 模式会吞掉所有 DP 下行。打印状态辅助排查。*/
             }
             tuya_ai_run(pal, iot, localkey);
+            if (s_cloud_reset_ready) {
+                s_cloud_reset_ready = 0;
+                goto start_ble_provisioning;
+            }
         }
         else { printf("[TUYA] iot_client_init fail\r\n"); }
         return;
     }
 
     /* ---- 首次:BLE 配网 ---- */
+start_ble_provisioning:
     s_tuya_provisioning_active = 1;
     printf("[TUYA] no devid, start BLE provisioning...\r\n");
     s_prov_prompt_run = 1;   /* 启动"请配置网络"循环播报(每 30s),配网完成会停 */
@@ -2702,7 +2718,37 @@ void tuya_agentic_main(void *arg)
 
     /* ---- 连 AI ---- */
     tuya_ai_run(pal, iot, lk);
+    if (s_cloud_reset_ready) {
+        s_cloud_reset_ready = 0;
+        goto start_ble_provisioning;
+    }
     printf("===== tuya_agentic_main end =====\r\n");
+}
+
+/* 将移除身份的关键 VM 全部清零并读回确认。syscfg_write 没有可用的错误返回约定，
+ * 因而以三个身份项的 readback 作为是否允许后续配网的判据。 */
+static int tuya_clear_provision_credentials(void)
+{
+    char zero[65] = {0};   /* 65 覆盖 ssid/pwd(65)，也够 devid/secret/localkey(32) */
+    char devid[32] = {0}, secret[32] = {0}, localkey[32] = {0};
+
+    syscfg_write(VM_TUYA_DEVID_IDX,    zero, 32);
+    syscfg_write(VM_TUYA_SECRET_IDX,   zero, 32);
+    syscfg_write(VM_TUYA_LOCALKEY_IDX, zero, 32);
+    syscfg_write(VM_TUYA_SSID_IDX,     zero, 65);
+    syscfg_write(VM_TUYA_PWD_IDX,      zero, 65);
+    syscfg_write(VM_TUYA_SCHEMAID_IDX, zero, 64);
+    syscfg_write(VM_TUYA_SCHEMA_IDX,   zero, 65);
+    syscfg_write(VM_TUYA_REGION_IDX,   zero, 1);   /* 重配网时重新下发 region */
+    wifi_store_mode_info(SMP_CFG_MODE, zero, zero);
+
+    if (syscfg_read(VM_TUYA_DEVID_IDX, devid, sizeof(devid)) <= 0 || devid[0] != 0 ||
+        syscfg_read(VM_TUYA_SECRET_IDX, secret, sizeof(secret)) <= 0 || secret[0] != 0 ||
+        syscfg_read(VM_TUYA_LOCALKEY_IDX, localkey, sizeof(localkey)) <= 0 || localkey[0] != 0) {
+        printf("[TUYA] ERROR: credential VM erase readback failed\r\n");
+        return -1;
+    }
+    return 0;
 }
 
 /* 长按 KEY_PHOTO(K6) 时由 app_music 调用:清除已配网的三元组 + WiFi 凭据并软复位,
@@ -2712,22 +2758,11 @@ void tuya_agentic_main(void *arg)
  * 故重置入口放在 K6 长按(原本是空槽位)。*/
 void tuya_clear_provision_and_reset(void)
 {
-    char zero[65] = {0};   /* 65 覆盖 ssid/pwd(65),也够 devid/secret/localkey(32)*/
     printf("[TUYA] >>> clear provision & reboot (re-enter BLE provisioning) <<<\r\n");
-    syscfg_write(VM_TUYA_DEVID_IDX,    zero, 32);
-    syscfg_write(VM_TUYA_SECRET_IDX,   zero, 32);
-    syscfg_write(VM_TUYA_LOCALKEY_IDX, zero, 32);
-    syscfg_write(VM_TUYA_SSID_IDX,     zero, 65);
-    syscfg_write(VM_TUYA_PWD_IDX,      zero, 65);
-    syscfg_write(VM_TUYA_SCHEMAID_IDX, zero, 64);
-    syscfg_write(VM_TUYA_SCHEMA_IDX,   zero, 65);
-    syscfg_write(VM_TUYA_REGION_IDX,   zero, 1);   /* region 一并清:重配网时重新下发(可能换了区)*/
-    /* 同时清杰理 WiFi VM:设回 SMP_CFG_MODE(配网模式)+ 空 ssid。
-     * 否则 wifi_app_task 开机读到旧 STA_MODE ssid 自动连网→播"网络连接成功"→
-     * 然后才进配网,用户听到两条提示音("网络连接成功"+"请配置网络"),迷惑。*/
-    wifi_store_mode_info(SMP_CFG_MODE, zero, zero);
-    /* 云端移除已由 supervisor 依次结束 AI 与 MQTT，再清除本地凭据。
-     * 此处直接复位；下次启动因 devid 为空，走既有 BLE 配网入口。 */
+    if (tuya_clear_provision_credentials() != 0) {
+        printf("[TUYA] manual reset aborted: credential erase not verified\r\n");
+        return;
+    }
     extern void cpu_reset(void);
     cpu_reset();
     while (1) { ; }   /* 复位路径,不返回 */
