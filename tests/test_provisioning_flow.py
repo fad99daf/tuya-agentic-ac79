@@ -104,16 +104,17 @@ class ProvisioningFlowTests(unittest.TestCase):
         self.assertLess(source.index("os_sem_create(&s_bt_ready_sem, 0)", init),
                         source.index("register_sys_event_handler(SYS_BT_EVENT", init))
 
-    def test_cloud_reset_uses_two_second_candidate_only_after_successful_ble_stop(self) -> None:
+    def test_cloud_reset_clears_credentials_then_reboots_directly(self) -> None:
         source = read(DEMO)
-        reset = source[source.index("void tuya_clear_provision_and_reset(void)"):]
-        self.assertIn("TUYA_CLOUD_RESET_BLE_QUIET_SUCCESS_TICKS 200u", source)
-        self.assertIn("TUYA_CLOUD_RESET_BLE_QUIET_FALLBACK_TICKS 300u", source)
-        self.assertIn("ble_stop_ret = tuya_ble_netcfg_stop()", reset)
-        self.assertIn("ble_stop_ret == 0", reset)
-        self.assertIn("quiet_wait_ticks = ble_stop_ret == 0", reset)
-        self.assertIn("os_time_dly(quiet_wait_ticks)", reset)
-        self.assertIn("reset BLE stop ret=%d; quiet wait=%ums", reset)
+        reset = source[source.rindex("void tuya_clear_provision_and_reset(void)"):]
+        self.assertIn("syscfg_write(VM_TUYA_DEVID_IDX", reset)
+        self.assertIn("syscfg_write(VM_TUYA_SECRET_IDX", reset)
+        self.assertIn("syscfg_write(VM_TUYA_LOCALKEY_IDX", reset)
+        self.assertIn("wifi_store_mode_info(SMP_CFG_MODE", reset)
+        self.assertNotIn("tuya_ble_netcfg_stop", reset)
+        self.assertNotIn("quiet_wait_ticks", reset)
+        self.assertLess(reset.index("wifi_store_mode_info(SMP_CFG_MODE"),
+                        reset.index("cpu_reset()"))
 
     def test_ble_receive_accepts_consistent_mobile_padding_only(self) -> None:
         source = read(BLE_PROV)

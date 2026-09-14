@@ -136,9 +136,6 @@ static volatile int s_mqtt_ka_exited;      /* 防止 deinit 与 iot_client_proce
 static volatile int s_bt_ready;
 static OS_SEM s_bt_ready_sem;
 #define TUYA_BT_READY_TIMEOUT_TICKS 400u  /* 4s，等价于原 os_time_dly(400) 上限 */
-/* 阶段 2 A/B 候选值：BLE stop 成功时先验证 2s；失败保留历史 3s 保护。 */
-#define TUYA_CLOUD_RESET_BLE_QUIET_SUCCESS_TICKS 200u
-#define TUYA_CLOUD_RESET_BLE_QUIET_FALLBACK_TICKS 300u
 static int g_audio_frame_logged;          /* 下行首帧帧长只打印一次,供核对 opus_cbr_pktlen */
 #ifdef TUYA_SERVER_VAD_ENABLE
 static volatile int g_server_vad_stop;    /* 云端VAD(TAI_EVT_SERVER_VAD)通知停说:上行循环据此收尾。on_event 在 worker 线程置位,主循环读 */
@@ -2716,8 +2713,6 @@ void tuya_agentic_main(void *arg)
 void tuya_clear_provision_and_reset(void)
 {
     char zero[65] = {0};   /* 65 覆盖 ssid/pwd(65),也够 devid/secret/localkey(32)*/
-    int ble_stop_ret;
-    unsigned int quiet_wait_ticks;
     printf("[TUYA] >>> clear provision & reboot (re-enter BLE provisioning) <<<\r\n");
     syscfg_write(VM_TUYA_DEVID_IDX,    zero, 32);
     syscfg_write(VM_TUYA_SECRET_IDX,   zero, 32);
@@ -2731,20 +2726,8 @@ void tuya_clear_provision_and_reset(void)
      * 否则 wifi_app_task 开机读到旧 STA_MODE ssid 自动连网→播"网络连接成功"→
      * 然后才进配网,用户听到两条提示音("网络连接成功"+"请配置网络"),迷惑。*/
     wifi_store_mode_info(SMP_CFG_MODE, zero, zero);
-    /* ★复位前先停 BT 广播,让蓝牙控制器进入 idle 再软复位。
-     *   软复位(P33_SYSTEM_RESET)不像掉电/reset 键那样完全重置 BT 控制器,带活跃
-     *   射频状态复位会导致重启后 BLE 链路异常(conn nack → supervision timeout),
-     *   配网必失败(实测:长按 K6 走软复位后配网失败,按 reset 键冷启动则成功)。*/
-    ble_stop_ret = tuya_ble_netcfg_stop();
-    /* stop 成功已确认广播关闭且（如有）断链完成，先以 2s A/B 候选验证。
-     * 失败时不降低原保护时间，避免软复位带活动 BLE 状态重启。 */
-    quiet_wait_ticks = ble_stop_ret == 0 ?
-                       TUYA_CLOUD_RESET_BLE_QUIET_SUCCESS_TICKS :
-                       TUYA_CLOUD_RESET_BLE_QUIET_FALLBACK_TICKS;
-    printf("[TUYA] reset BLE stop ret=%d; quiet wait=%ums%s\r\n",
-           ble_stop_ret, quiet_wait_ticks * 10u,
-           ble_stop_ret == 0 ? " (2s candidate)" : " (3s fallback)");
-    os_time_dly(quiet_wait_ticks);
+    /* 云端移除已由 supervisor 依次结束 AI 与 MQTT，再清除本地凭据。
+     * 此处直接复位；下次启动因 devid 为空，走既有 BLE 配网入口。 */
     extern void cpu_reset(void);
     cpu_reset();
     while (1) { ; }   /* 复位路径,不返回 */
