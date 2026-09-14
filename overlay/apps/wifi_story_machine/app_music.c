@@ -117,6 +117,14 @@ extern int check_user_virtual_audio_if_running(void);
 
 static const struct music_dec_ops local_music_dec_ops;
 
+/* NetCfgEnter.mp3 是 Tuya 配网流程的体感起点。audio_server 没有暴露 DAC
+ * 首样本回调，故把可观测路径拆为 request/open/start/first-progress 四个点；
+ * 其中 first-progress 是本层最接近“首帧已被消费”的确认，不能混同于 request。 */
+static u8 s_netcfg_prompt_trace;
+static u8 s_netcfg_prompt_started;
+static u32 s_netcfg_prompt_request_ms;
+static void *s_netcfg_prompt_file;
+
 static const struct {
     APP_LOCAL_PROMPT_TYPE_E prompt_type;
     const char *file_name;
@@ -1032,6 +1040,10 @@ static int local_music_dec_file(void *file, int breakpoint, void *handler, int a
         }
         return err;
     }
+    if (s_netcfg_prompt_trace) {
+        printf("[TUYA][NETCFG_AUDIO] decoder-open +%u ms\r\n",
+               (unsigned int)(timer_get_ms() - s_netcfg_prompt_request_ms));
+    }
 
     __this->play_time = req.dec.play_time;
     __this->total_time = req.dec.total_time;
@@ -1116,6 +1128,12 @@ static int local_music_dec_file(void *file, int breakpoint, void *handler, int a
             fclose((FILE *)file);
         }
         return err;
+    }
+    if (s_netcfg_prompt_trace) {
+        s_netcfg_prompt_started = 1;
+        s_netcfg_prompt_file = file;
+        printf("[TUYA][NETCFG_AUDIO] decoder-start +%u ms\r\n",
+               (unsigned int)(timer_get_ms() - s_netcfg_prompt_request_ms));
     }
     __this->file = (FILE *)file;
     __this->cmp_file = (void *)file;
@@ -3482,6 +3500,13 @@ static void dec_server_event_handler(void *priv, int argc, int *argv)
         /* __this->play_time = 0; */
         break;
     case AUDIO_SERVER_EVENT_CURR_TIME:
+        if (s_netcfg_prompt_trace && s_netcfg_prompt_started &&
+            s_netcfg_prompt_file == (void *)argv[1]) {
+            printf("[TUYA][NETCFG_AUDIO] first-progress +%u ms (play_time=%d)\r\n",
+                   (unsigned int)(timer_get_ms() - s_netcfg_prompt_request_ms), argv[1]);
+            s_netcfg_prompt_trace = 0;
+            s_netcfg_prompt_started = 0;
+        }
         log_d("play_time: %d\n", argv[1]);
         __this->play_time = argv[1];
 
@@ -3638,7 +3663,19 @@ static int app_music_play_voice_prompt(const char *fname, void *dec_end_handler)
  * 配网等待期设备空闲、未在解码,从此处发起提示音;实际解码仍走 audio_server。*/
 void app_music_play_netcfg_prompt(void)
 {
-    app_music_play_voice_prompt("NetCfgEnter.mp3", NULL);
+    int err;
+
+    s_netcfg_prompt_trace = 1;
+    s_netcfg_prompt_started = 0;
+    s_netcfg_prompt_file = NULL;
+    s_netcfg_prompt_request_ms = timer_get_ms();
+    printf("[TUYA][NETCFG_AUDIO] request\r\n");
+    err = app_music_play_voice_prompt("NetCfgEnter.mp3", NULL);
+    if (err) {
+        s_netcfg_prompt_trace = 0;
+        s_netcfg_prompt_file = NULL;
+        printf("[TUYA][NETCFG_AUDIO] request failed: %d\r\n", err);
+    }
 }
 
 /* Tuya 配网必须在云端激活、关键凭据保存和 MQTT 保持后才报成功。 */
