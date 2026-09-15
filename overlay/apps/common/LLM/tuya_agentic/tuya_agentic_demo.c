@@ -2357,10 +2357,20 @@ static volatile int s_prov_prompt_run;
 #define TUYA_NETWORK_READY_POLL_MS       100u
 
 static volatile int s_tuya_provisioning_active;
+/* wifi_enter_sta_mode() emits a disconnected event while it replaces the
+ * old AP.  app_music normally reacts by reconnecting with its stored AP;
+ * during this handoff that starts a second STA transition and can interrupt
+ * on-boarding's TCP/TLS connection. */
+static volatile int s_tuya_sta_handoff_active;
 
 int tuya_agentic_provisioning_active(void)
 {
     return s_tuya_provisioning_active;
+}
+
+int tuya_agentic_sta_handoff_active(void)
+{
+    return s_tuya_sta_handoff_active;
 }
 
 extern u32 wifi_get_tuya_network_ready_generation(void);
@@ -2619,14 +2629,15 @@ start_ble_provisioning:
 
     /* ---- 连 WiFi(配网给的 ssid/密码)---- */
     u32 network_generation = wifi_get_tuya_network_ready_generation();
+    s_tuya_sta_handoff_active = 1;
     wifi_enter_sta_mode(s_main_creds.ssid, s_main_creds.password);
     if (tuya_wait_for_network_ready(network_generation) != 0) {
         tuya_provisioning_fail_and_reset("network-ready");
         return;
     }
+    s_tuya_sta_handoff_active = 0;
 
-    /* 同步到杰理 wifi 存储:防 app_music 的 wifi_return_sta_mode 读到旧 ssid 覆盖。
-     * 之前换网络后,杰理 VM 里残留旧 ssid(GJ1)覆盖了涂鸦配的 ssid,导致断网连不上 AI。*/
+    /* 同步到杰理 Wi-Fi 存储，供后续正常断线重连使用。 */
     tuya_sync_wifi_to_jl(s_main_creds.ssid, s_main_creds.password);
 
     /* ---- on_boarding 激活 ---- */

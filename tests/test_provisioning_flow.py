@@ -55,6 +55,22 @@ class ProvisioningFlowTests(unittest.TestCase):
         self.assertIn("!tuya_agentic_provisioning_active()", block)
         self.assertIn("app_music_play_voice_prompt(\"NetDisc.mp3\"", block)
 
+    def test_tuya_sta_handoff_suppresses_generic_stored_wifi_reconnect(self) -> None:
+        demo = read(DEMO)
+        music = read(MUSIC)
+        handoff = demo[demo.index("static volatile int s_tuya_sta_handoff_active"):
+                       demo.index("static int tuya_wait_for_network_ready")]
+        connect = demo.index("wifi_enter_sta_mode(s_main_creds.ssid")
+        wait = demo.index("tuya_wait_for_network_ready(network_generation)", connect)
+        block_start = music.index("case NET_EVENT_DISCONNECTED_AND_REQ_CONNECT:")
+        block = music[block_start:music.index("case NET_NTP_GET_TIME_SUCC:", block_start)]
+        self.assertIn("int tuya_agentic_sta_handoff_active(void)", handoff)
+        self.assertLess(demo.rfind("s_tuya_sta_handoff_active = 1", 0, connect), connect)
+        self.assertLess(wait, demo.index("s_tuya_sta_handoff_active = 0", wait))
+        self.assertIn("tuya_agentic_sta_handoff_active()", block)
+        self.assertLess(block.index("tuya_agentic_sta_handoff_active()"),
+                        block.index("wifi_return_sta_mode()"))
+
     def test_pal_thread_join_waits_for_cooperative_worker_exit(self) -> None:
         source = read(PAL)
         entry = source[source.index("static void ac_thr_entry"):

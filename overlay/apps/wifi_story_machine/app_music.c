@@ -19,6 +19,7 @@
 
 #ifdef CONFIG_TUYA_AGENTIC_ENABLE
 extern int tuya_agentic_provisioning_active(void);
+extern int tuya_agentic_sta_handoff_active(void);
 #endif
 
 #if (!defined CONFIG_DUI_SDK_ENABLE) && (!defined CONFIG_TVS_SDK_ENABLE)
@@ -5030,6 +5031,15 @@ static int app_music_net_event_handler(struct net_event *event)
 #endif
             break;
         case NET_EVENT_DISCONNECTED_AND_REQ_CONNECT:
+#ifdef CONFIG_TUYA_AGENTIC_ENABLE
+            /* Tuya has just asked Wi-Fi to switch to the credentials received
+             * over BLE.  Do not let the generic recovery path issue a second
+             * wifi_enter_sta_mode() with stored credentials in this interval. */
+            if (tuya_agentic_sta_handoff_active()) {
+                printf("[TUYA] skip generic STA reconnect during handoff\n");
+                break;
+            }
+#endif
             wifi_return_sta_mode();
             break;
         case NET_NTP_GET_TIME_SUCC:	//NTP获取成功事件返回
