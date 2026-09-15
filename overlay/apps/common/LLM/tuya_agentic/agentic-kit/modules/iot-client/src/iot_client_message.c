@@ -3,9 +3,58 @@
 #include "cipher_wrapper.h"
 #include "iot_config_defaults.h"
 #include "iot_dp_internal.h"
-
+#include "cJSON.h"
 #include <string.h>
 #include <stdio.h>
+
+#define IOT_PROTOCOL_CLOUD_REMOVE 11
+
+/* Protocol 11 is a control-plane message, never a DP message.  Consume every
+ * syntactically recognised protocol-11 frame, but notify the application only
+ * when its non-empty data.gwId exactly identifies this client. */
+static bool iot_client_message_handle_cloud_remove(iot_client_t *client,
+                                                    const uint8_t *bytes,
+                                                    size_t len)
+{
+    if (!client || !bytes || len == 0) return false;
+
+    cJSON *root = cJSON_ParseWithLength((const char *)bytes, len);
+    if (!root) return false;
+
+    cJSON *protocol = cJSON_GetObjectItem(root, "protocol");
+    if (!cJSON_IsNumber(protocol) ||
+        protocol->valueint != IOT_PROTOCOL_CLOUD_REMOVE) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    cJSON *data = cJSON_GetObjectItem(root, "data");
+    cJSON *gwid = cJSON_IsObject(data) ? cJSON_GetObjectItem(data, "gwId") : NULL;
+    if (!cJSON_IsString(gwid) || !gwid->valuestring ||
+        gwid->valuestring[0] == '\0' || client->devid[0] == '\0' ||
+        strcmp(gwid->valuestring, client->devid) != 0) {
+        log_warn("cloud remove: ignored protocol 11 with missing or foreign gwId");
+        cJSON_Delete(root);
+        return true;
+    }
+
+    iot_reset_type_t type = IOT_RESET_REMOTE_UNBIND;
+    cJSON *message_type = cJSON_GetObjectItem(root, "type");
+    if (cJSON_IsString(message_type) && message_type->valuestring &&
+        strcmp(message_type->valuestring, "reset_factory") == 0) {
+        type = IOT_RESET_REMOTE_FACTORY;
+    }
+
+    if (client->reset_callback) {
+        log_warn("cloud remove: accepted protocol 11 (%s)",
+                 type == IOT_RESET_REMOTE_FACTORY ? "factory" : "unbind");
+        client->reset_callback(type, client->reset_user_data);
+    } else {
+        log_warn("cloud remove: no reset callback registered; request ignored");
+    }
+    cJSON_Delete(root);
+    return true;
+}
 
 static void mqtt_message_handler(const char *topic, size_t topic_len,
                                  const uint8_t *payload, size_t payload_len,
@@ -35,6 +84,11 @@ static void mqtt_message_handler(const char *topic, size_t topic_len,
                  (unsigned)decrypted_len,
                  (int)dump_len, (const char *)decrypted,
                  decrypted_len > 200 ? "..." : "");
+
+        if (iot_client_message_handle_cloud_remove(client, decrypted, decrypted_len)) {
+            client->pal->free(decrypted);
+            return;
+        }
 
         /* Offer the plaintext to the DP layer first; if it does not consume it,
          * forward to the user's raw message callback (backward compatible). */

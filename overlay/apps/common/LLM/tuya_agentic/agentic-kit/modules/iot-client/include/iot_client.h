@@ -82,6 +82,16 @@ IOT_API int iot_init(const pal_t *pal);
 typedef void (*iot_message_callback_t)(const char *topic, size_t topic_len,
                                        const uint8_t *data, size_t data_len);
 
+/* Cloud device-removal notices are received by iot_client_process().  The
+ * callback must only enqueue work: the application task that owns the client
+ * performs persistence, deinit and reboot after process() has stopped. */
+typedef enum {
+    IOT_RESET_REMOTE_UNBIND = 0,
+    IOT_RESET_REMOTE_FACTORY,
+} iot_reset_type_t;
+
+typedef void (*iot_reset_callback_t)(iot_reset_type_t type, void *user_data);
+
 /**
  * @brief IoT client configuration structure
  */
@@ -96,6 +106,8 @@ typedef struct {
     const char *cacert;            // CA cert for all TLS (MQTT/HTTPS/IoT-DNS) (PEM, caller-owned, must outlive client)
     tls_cert_bundle_attach_fn cert_bundle_attach; // Platform cert-bundle callback (NULL = none)
     iot_message_callback_t message_callback; // MQTT message callback
+    iot_reset_callback_t reset_callback; // Cloud device-removal callback
+    void *reset_user_data;               // Opaque reset callback context
 
     /* ---- DP layer restore (all caller-owned, may be NULL) ---- */
     const char *schema;            // Persisted DP schema JSON to restore on restart (NULL = none / loose mode)
@@ -122,6 +134,8 @@ typedef struct {
     const char *cacert;            // CA cert for all TLS (MQTT/HTTPS/IoT-DNS) (PEM, caller-owned, must outlive client)
     tls_cert_bundle_attach_fn cert_bundle_attach; // Platform cert-bundle callback (NULL = none)
     iot_message_callback_t message_callback; // MQTT message callback
+    iot_reset_callback_t reset_callback; // Cloud device-removal callback
+    void *reset_user_data;               // Opaque reset callback context
     const char *sw_ver;            // Application firmware version (e.g. "1.2.3"); NULL = use SDK default IOT_SDK_SW_VER
 } iot_on_boarding_config_t;
 
@@ -157,6 +171,8 @@ struct iot_dp_context;
     tls_cert_bundle_attach_fn cert_bundle_attach; // Platform cert-bundle callback (borrowed, NULL = none)
     struct mqtt_client *mqtt;     // Internal MQTT client handle
     iot_message_callback_t message_callback;  // User callback for incoming messages
+    iot_reset_callback_t reset_callback;      // Cloud device-removal callback
+    void *reset_user_data;                     // Opaque reset callback context
 
     struct iot_dp_context *dp;    // DP layer state; points into dp_storage, NULL when inactive
     void *dp_storage[IOT_DP_CONTEXT_STORAGE / sizeof(void *)]; // inline storage for *dp (no heap)
