@@ -2334,15 +2334,12 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
         while (!s_mqtt_ka_exited) os_time_dly(1);
         iot_client_deinit(iot);
         if (tuya_clear_provision_credentials() == 0) {
-            extern void wifi_and_network_off(void);
-            extern void wifi_and_network_on(void);
-            wifi_and_network_off();
-            /* 前一轮移除会卸载 Wi-Fi 驱动和网络栈；不重新启动它，BLE 首轮虽能
-             * 收到凭据，但 DHCP_SUCC 不会产生，只能在失败后的软复位再成功。 */
-            wifi_and_network_on();
+            /* 保持现有 Wi-Fi/network 服务运行。wifi_and_network_off() 后立即
+             * wifi_and_network_on() 会让 lwIP 重复注册 netif（"netif already
+             * added"）；配网完成后的 wifi_enter_sta_mode() 会按新凭据切换网络。 */
             s_cloud_reset_pending = 0;
             s_cloud_reset_ready = 1;
-            printf("[TUYA] credentials erased; Wi-Fi restarted; re-enter BLE provisioning\r\n");
+            printf("[TUYA] credentials erased; keep Wi-Fi service; re-enter BLE provisioning\r\n");
         } else {
             /* 身份凭据未能确认擦除时绝不进入配网，避免旧设备身份残留。 */
             s_cloud_reset_ready = 0;
