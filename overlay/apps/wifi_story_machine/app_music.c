@@ -17,6 +17,10 @@
 #include "generic/circular_buf.h"
 #include "media/audio_effect.h"
 
+#ifdef CONFIG_TUYA_AGENTIC_ENABLE
+extern int tuya_agentic_provisioning_active(void);
+#endif
+
 #if (!defined CONFIG_DUI_SDK_ENABLE) && (!defined CONFIG_TVS_SDK_ENABLE)
 
 #ifdef CONFIG_NET_ENABLE
@@ -3641,6 +3645,12 @@ void app_music_play_netcfg_prompt(void)
     app_music_play_voice_prompt("NetCfgEnter.mp3", NULL);
 }
 
+/* Tuya 首次配网的成功音只能由激活流程显式触发，不能由 DHCP 成功提前触发。 */
+void app_music_play_netcfg_success(void)
+{
+    app_music_play_voice_prompt("NetCfgSucc.mp3", NULL);
+}
+
 /* 涂鸦 OTA 提示音播报(供 tuya_ota.c 跨文件调用;照搬 app_music_play_netcfg_prompt
  * 的导出模式——app_music_play_voice_prompt 是 static,需在 app_music.c 内包一层导出)。
  * type: 0=正在升级(OtaInUpdate.mp3) 1=升级成功(OtaSuccess.mp3) 2=升级失败(OtaFailed.mp3) */
@@ -4924,7 +4934,14 @@ static int app_music_net_event_handler(struct net_event *event)
 #if BT_NET_CFG_EN || BT_NET_CFG_QYAI_EN
                 ble_cfg_net_result_notify(event->event);
 #endif
+#ifdef CONFIG_TUYA_AGENTIC_ENABLE
+                /* DHCP 已完成，但首次 Tuya 配网仍需云端 activation 和凭据落盘。 */
+                if (!tuya_agentic_provisioning_active()) {
+                    app_music_play_voice_prompt("NetCfgSucc.mp3", __this->dec_ops->dec_breakpoint);
+                }
+#else
                 app_music_play_voice_prompt("NetCfgSucc.mp3", __this->dec_ops->dec_breakpoint);
+#endif
                 __this->reconnecting = 0;
 #ifdef CONFIG_SERVER_ASSIGN_PROFILE
                 dev_profile_init();
@@ -4947,7 +4964,12 @@ static int app_music_net_event_handler(struct net_event *event)
             canceladdrinfo();
             __this->_net_dhcp_ready = 0;
 
-            if (__this->net_connected && !is_in_config_network_state() && !__this->reconnecting && __this->mode == NET_MUSIC_MODE) {
+            if (__this->net_connected && !is_in_config_network_state() && !__this->reconnecting && __this->mode == NET_MUSIC_MODE
+#ifdef CONFIG_TUYA_AGENTIC_ENABLE
+                /* BLE 凭据切换 STA 时的短暂断链是预期行为，不能播网络异常。 */
+                && !tuya_agentic_provisioning_active()
+#endif
+               ) {
                 app_music_play_voice_prompt("NetDisc.mp3", NULL);
             }
             __this->net_connected = 0;
@@ -4971,6 +4993,15 @@ static int app_music_net_event_handler(struct net_event *event)
 #endif
             break;
         case NET_EVENT_DISCONNECTED_AND_REQ_CONNECT:
+#ifdef CONFIG_TUYA_AGENTIC_ENABLE
+            /* While Tuya provisioning is active, the only permitted STA
+             * target is the credential received through BLE.  In particular,
+             * do not let this generic recovery path select a remembered AP. */
+            if (tuya_agentic_provisioning_active()) {
+                printf("[TUYA] provisioning active; skip stored Wi-Fi fallback\n");
+                break;
+            }
+#endif
             wifi_return_sta_mode();
             break;
         case NET_NTP_GET_TIME_SUCC:	//NTP获取成功事件返回

@@ -126,6 +126,11 @@ static volatile int g_barge_in;           /* barge-in 触发:跳过 TTS 后清�
 static volatile int g_exit;               /* on_disconnect 置位:令本次会话的语音循环退出(supervisor 稍后重连) */
 static volatile int g_link_broken;        /* 上行发送失败:链路已断,快速报废本次会话交 supervisor 重连(不等 60s 超时) */
 static volatile int g_mqtt_ka_run;        /* MQTT 心跳线程运行标志:生命周期=整个 tuya 流程,不跟 AI 会话共存亡 */
+/* protocol 11 的 MQTT 回调只写此请求槽。首次请求锁定类型；重复帧不覆盖它，
+ * 释放 iot/擦 VM/复位全部由 tuya_ai_run 这个唯一监督者完成。 */
+#define TUYA_CLOUD_RESET_NONE (-1)
+static volatile int s_cloud_reset_type = TUYA_CLOUD_RESET_NONE;
+static volatile int s_mqtt_ka_exited;
 static int g_audio_frame_logged;          /* 下行首帧帧长只打印一次,供核对 opus_cbr_pktlen */
 #ifdef TUYA_SERVER_VAD_ENABLE
 static volatile int g_server_vad_stop;    /* 云端VAD(TAI_EVT_SERVER_VAD)通知停说:上行循环据此收尾。on_event 在 worker 线程置位,主循环读 */
@@ -348,6 +353,9 @@ static void on_mqtt_message(const char *topic, size_t topic_len,
            data ? (const char *)data : "(null)");
 }
 
+extern u32 wifi_get_tuya_network_ready_generation(void);
+extern int wifi_tuya_network_is_ready(void);
+
 /* MQTT 心跳维持线程(MQTT 常驻模式)。
  * 断线自愈:iot_client_process 失败持续超过 TUYA_MQTT_DEAD_WINDOW_MS 才判定连接
  * 死亡,销毁旧句柄(防泄漏,try_connect 直接覆盖指针不 free)后重连;重连退避
@@ -359,15 +367,60 @@ static void on_mqtt_message(const char *topic, size_t topic_len,
  * transport_recv 本就阻塞在 recv(超时 MQTT_RECV_TIMEOUT_MS=1s),缩短休眠只是
  * 每 ~1s 多醒一次,CPU 基本不变。*/
 #define TUYA_MQTT_DEAD_WINDOW_MS 10000u  /* 失败持续超该时长才判死:滤掉毫秒级瞬断(原按"连续2轮"计数,轮询提速后两轮仅隔20ms会误杀) */
+static void on_cloud_reset(iot_reset_type_t type, void *user_data)
+{
+    (void)user_data;
+    if (type != IOT_RESET_REMOTE_UNBIND && type != IOT_RESET_REMOTE_FACTORY) {
+        return;
+    }
+
+    /* This runs inside iot_client_process().  It deliberately performs no
+     * allocation, VM I/O, disconnect, deinit or reboot. */
+    if (s_cloud_reset_type == TUYA_CLOUD_RESET_NONE) {
+        s_cloud_reset_type = (int)type;
+        printf("[TUYA] cloud reset queued: %s\r\n",
+               type == IOT_RESET_REMOTE_FACTORY ? "factory" : "unbind");
+    } else {
+        printf("[TUYA] duplicate cloud reset ignored; keeping %s request\r\n",
+               s_cloud_reset_type == IOT_RESET_REMOTE_FACTORY ? "factory" : "unbind");
+    }
+    g_exit = 1;
+}
+
 static void tuya_mqtt_keepalive_task(void *arg)
 {
     extern int  iot_client_message_connect(iot_client_t *client);    /* src/iot_client_message.h 未进公共头 */
     extern void iot_client_message_disconnect(iot_client_t *client);
     iot_client_t *iot = (iot_client_t *)arg;
-    if (!iot) return;
+    if (!iot) {
+        s_mqtt_ka_exited = 1;
+        return;
+    }
     int failing = 0;              /* 连续失败中标记(成功清零),配合 fail_since_ms 计失败持续时长 */
     unsigned int fail_since_ms = 0;
+    int offline_logged = 0;
+    int mqtt_disconnected = 0;
     while (g_mqtt_ka_run) {
+        /* No DHCP lease means there is no usable IP link.  Do not turn a
+         * Wi-Fi association failure into repeated TLS/TCP attempts. */
+        if (!wifi_tuya_network_is_ready()) {
+            if (!offline_logged) {
+                printf("[TUYA] network offline, cloud reconnect paused\r\n");
+                offline_logged = 1;
+            }
+            if (!mqtt_disconnected) {
+                iot_client_message_disconnect(iot);
+                mqtt_disconnected = 1;
+            }
+            failing = 0;
+            os_time_dly(100);
+            continue;
+        }
+        if (offline_logged) {
+            printf("[TUYA] network restored, resuming cloud reconnect\r\n");
+            offline_logged = 0;
+        }
+        mqtt_disconnected = 0;
         int ret = iot_client_process(iot, 0);
         if (ret == 0) {
             failing = 0;
@@ -378,16 +431,25 @@ static void tuya_mqtt_keepalive_task(void *arg)
             printf("[TUYA] mqtt dead (ret=%d), reconnect...\r\n", ret);
             iot_client_message_disconnect(iot);
             unsigned int backoff = 5000;
-            while (g_mqtt_ka_run && iot_client_message_connect(iot) != 0) {
+            while (g_mqtt_ka_run && wifi_tuya_network_is_ready() &&
+                   iot_client_message_connect(iot) != 0) {
                 printf("[TUYA] mqtt reconnect fail, retry in %ums\r\n", backoff);
-                msleep(backoff);
+                for (unsigned int waited_ms = 0;
+                     waited_ms < backoff && g_mqtt_ka_run &&
+                     wifi_tuya_network_is_ready();
+                     waited_ms += 100) {
+                    msleep(100);
+                }
                 if (backoff < 60000) backoff *= 2;
             }
-            if (g_mqtt_ka_run) printf("[TUYA] mqtt reconnected\r\n");
+            if (g_mqtt_ka_run && wifi_tuya_network_is_ready()) {
+                printf("[TUYA] mqtt reconnected\r\n");
+            }
             failing = 0;
         }
         os_time_dly(1);
     }
+    s_mqtt_ka_exited = 1;
 }
 
 /* DP 下行回调:云端下发 DP 值时触发(如说"音量调到20"→云端识别后下发 DP)。
@@ -1087,6 +1149,7 @@ void tuya_agentic_demo(void *arg)
     obcfg.timeout_ms       = 30000;
     obcfg.cert_bundle_attach = NULL;
     obcfg.cacert = NULL;
+    obcfg.reset_callback = on_cloud_reset;
     iot = iot_client_init_on_boarding_with_token(&obcfg, TUYA_ACTIVATION_TOKEN);
     if (!iot) { printf("[TUYA] on_boarding_with_token fail(token 过期/三件套错?)\r\n"); return; }
     printf("[TUYA] activated, devid=%s\r\n", iot->devid);
@@ -1098,6 +1161,7 @@ void tuya_agentic_demo(void *arg)
     cfg.mqtt_disable_tls = false; cfg.mqtt_auto_connect = 1;
     cfg.cert_bundle_attach = NULL; cfg.cacert = NULL;
     cfg.message_callback = on_mqtt_message;   /* MQTT 常驻:收 DP 下行 */
+    cfg.reset_callback = on_cloud_reset;
     extern const char *tuya_get_effective_sw_ver(void);
     cfg.sw_ver = tuya_get_effective_sw_ver();   /* 上报生效版本:VM>源码基线 */
 
@@ -1222,6 +1286,143 @@ void tuya_agentic_demo(void *arg)
 #define VM_TUYA_SCHEMAID_IDX  181   /* DP schema_id(激活时云端返回,DP 下行解析需要)*/
 #define VM_TUYA_SCHEMA_IDX    182   /* DP schema JSON(激活时云端返回)*/
 #define VM_TUYA_REGION_IDX    183   /* region(1B):配网时云端下发(token前缀+激活响应),直连重启据此选 ATOP/MQTT 域名 */
+#define VM_TUYA_RESET_STATE_IDX 184 /* 仅本模块使用；先写入，断电后继续清除 */
+
+#define TUYA_RESET_MARK_CLEARING_UNBIND  0x51u
+#define TUYA_RESET_MARK_CLEARING_FACTORY 0x52u
+#define TUYA_RESET_MARK_CLEARED_UNBIND   0x61u
+#define TUYA_RESET_MARK_CLEARED_FACTORY  0x62u
+#define TUYA_CLOUD_RESET_STOP_TICKS      200u /* 2s: MQTT recv 最大阻塞 1s，再留一次调度余量 */
+
+static uint8_t tuya_cloud_reset_marker(iot_reset_type_t type, int cleared)
+{
+    if (type == IOT_RESET_REMOTE_FACTORY) {
+        return cleared ? TUYA_RESET_MARK_CLEARED_FACTORY
+                       : TUYA_RESET_MARK_CLEARING_FACTORY;
+    }
+    return cleared ? TUYA_RESET_MARK_CLEARED_UNBIND
+                   : TUYA_RESET_MARK_CLEARING_UNBIND;
+}
+
+static int tuya_cloud_reset_marker_type(uint8_t marker, iot_reset_type_t *type)
+{
+    if (marker == TUYA_RESET_MARK_CLEARING_UNBIND ||
+        marker == TUYA_RESET_MARK_CLEARED_UNBIND) {
+        *type = IOT_RESET_REMOTE_UNBIND;
+        return 0;
+    }
+    if (marker == TUYA_RESET_MARK_CLEARING_FACTORY ||
+        marker == TUYA_RESET_MARK_CLEARED_FACTORY) {
+        *type = IOT_RESET_REMOTE_FACTORY;
+        return 0;
+    }
+    return -1;
+}
+
+static int tuya_cloud_reset_write_marker(uint8_t marker)
+{
+    uint8_t verify = 0;
+    syscfg_write(VM_TUYA_RESET_STATE_IDX, &marker, sizeof(marker));
+    return syscfg_read(VM_TUYA_RESET_STATE_IDX, &verify, sizeof(verify)) ==
+               sizeof(verify) &&
+           verify == marker;
+}
+
+/* Credentials are the identity boundary.  Require all bytes to read back as
+ * zero, not merely a terminating NUL at byte zero. */
+static int tuya_cloud_reset_credentials_cleared(void)
+{
+    uint8_t devid[32] = {0}, secret[32] = {0}, localkey[32] = {0};
+    uint8_t zero[32] = {0};
+    int devid_ok = syscfg_read(VM_TUYA_DEVID_IDX, devid, sizeof(devid)) == sizeof(devid) &&
+                   memcmp(devid, zero, sizeof(devid)) == 0;
+    int secret_ok = syscfg_read(VM_TUYA_SECRET_IDX, secret, sizeof(secret)) == sizeof(secret) &&
+                    memcmp(secret, zero, sizeof(secret)) == 0;
+    int localkey_ok = syscfg_read(VM_TUYA_LOCALKEY_IDX, localkey, sizeof(localkey)) == sizeof(localkey) &&
+                      memcmp(localkey, zero, sizeof(localkey)) == 0;
+    if (!devid_ok || !secret_ok || !localkey_ok) {
+        printf("[TUYA] cloud reset credential readback failed: devid=%d secret=%d localkey=%d\r\n",
+               devid_ok, secret_ok, localkey_ok);
+    }
+    return devid_ok && secret_ok && localkey_ok;
+}
+
+static void tuya_cloud_reset_clear_unbind_state(const char *zero)
+{
+    /* Unbind preserves Tuya's SSID/password cache for a same-home rebind, but
+     * disables the JieLi STA boot path so the next boot always advertises BLE.
+     * Schema and region are binding-scoped and must be obtained anew. */
+    syscfg_write(VM_TUYA_SCHEMAID_IDX, zero, 64);
+    syscfg_write(VM_TUYA_SCHEMA_IDX, zero, 65);
+    syscfg_write(VM_TUYA_REGION_IDX, zero, 1);
+    wifi_store_mode_info(SMP_CFG_MODE, (char *)zero, (char *)zero);
+}
+
+static void tuya_cloud_reset_clear_factory_state(const char *zero)
+{
+    /* Factory reset removes every application-side network/cache record. */
+    syscfg_write(VM_TUYA_SSID_IDX, zero, 65);
+    syscfg_write(VM_TUYA_PWD_IDX, zero, 65);
+    syscfg_write(VM_TUYA_SCHEMAID_IDX, zero, 64);
+    syscfg_write(VM_TUYA_SCHEMA_IDX, zero, 65);
+    syscfg_write(VM_TUYA_REGION_IDX, zero, 1);
+    wifi_store_mode_info(SMP_CFG_MODE, (char *)zero, (char *)zero);
+}
+
+static int tuya_cloud_reset_clear_and_verify(iot_reset_type_t type)
+{
+    char zero[65] = {0};
+
+    syscfg_write(VM_TUYA_DEVID_IDX, zero, 32);
+    syscfg_write(VM_TUYA_SECRET_IDX, zero, 32);
+    syscfg_write(VM_TUYA_LOCALKEY_IDX, zero, 32);
+    if (type == IOT_RESET_REMOTE_FACTORY) {
+        tuya_cloud_reset_clear_factory_state(zero);
+    } else {
+        tuya_cloud_reset_clear_unbind_state(zero);
+    }
+
+    if (!tuya_cloud_reset_credentials_cleared()) {
+        return -1;
+    }
+    return tuya_cloud_reset_write_marker(tuya_cloud_reset_marker(type, 1)) ? 0 : -1;
+}
+
+static void tuya_cloud_reset_cpu_reboot(void)
+{
+    extern void cpu_reset(void);
+    cpu_reset();
+    printf("[TUYA] ERROR: cpu_reset returned; reset marker remains for recovery\r\n");
+}
+
+/* Called before any client is constructed.  A power loss after the initial
+ * marker write is therefore completed while no MQTT/AI worker exists. */
+static int tuya_cloud_reset_recover_if_needed(void)
+{
+    uint8_t marker = 0;
+    iot_reset_type_t type;
+    int read_len = syscfg_read(VM_TUYA_RESET_STATE_IDX, &marker, sizeof(marker));
+
+    if (read_len != sizeof(marker) || marker == 0 || marker == 0xFF) {
+        return 0;
+    }
+    if (tuya_cloud_reset_marker_type(marker, &type) != 0) {
+        printf("[TUYA] invalid cloud-reset marker 0x%x; refusing to use saved identity\r\n",
+               marker);
+        return -1;
+    }
+    printf("[TUYA] recovering interrupted cloud %s reset\r\n",
+           type == IOT_RESET_REMOTE_FACTORY ? "factory" : "unbind");
+    if (tuya_cloud_reset_clear_and_verify(type) != 0) {
+        printf("[TUYA] cloud-reset recovery could not verify cleared credentials\r\n");
+        return -1;
+    }
+    if (!tuya_cloud_reset_write_marker(0)) {
+        printf("[TUYA] cloud-reset recovery could not clear completion marker\r\n");
+        return -1;
+    }
+    return 0;
+}
 
 /* region 枚举转可读名(打日志用;枚举定义在 iot_client.h,AY=中国区...) */
 static const char *region_name(iot_region_t r)
@@ -2237,10 +2438,64 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
  * WiFi 断线由 SDK 层自动重连(见 tuya_mqtt_keepalive_task 注释),这里只管
  * AI 会话层。MQTT 心跳线程与音频流都在此启动且跨会话存活:重连等待期间采集
  * 照跑,cbuf 环形覆盖旧数据(无害),会话恢复后 idle-drain 自然消费到新鲜帧。*/
+static int tuya_cloud_reset_requested(void)
+{
+    return s_cloud_reset_type == IOT_RESET_REMOTE_UNBIND ||
+           s_cloud_reset_type == IOT_RESET_REMOTE_FACTORY;
+}
+
+/* Return non-zero after ownership has transferred to a terminal reset path.
+ * The only unbounded operation in the old implementation was waiting for the
+ * MQTT task to exit.  Do not free iot while it may still be in process(); on a
+ * bounded-wait timeout reboot with the durable marker and finish on next boot. */
+static int tuya_cloud_reset_supervise(iot_client_t *iot)
+{
+    iot_reset_type_t type = (iot_reset_type_t)s_cloud_reset_type;
+
+    if (!tuya_cloud_reset_requested()) {
+        return 0;
+    }
+    if (!tuya_cloud_reset_write_marker(tuya_cloud_reset_marker(type, 0))) {
+        printf("[TUYA] cloud reset marker write failed; identity retained\r\n");
+        s_cloud_reset_type = TUYA_CLOUD_RESET_NONE;
+        return 0;
+    }
+
+    printf("[TUYA] cloud reset supervisor: stop MQTT before deinit\r\n");
+    g_mqtt_ka_run = 0;
+    for (unsigned int tick = 0;
+         tick < TUYA_CLOUD_RESET_STOP_TICKS && !s_mqtt_ka_exited;
+         tick++) {
+        os_time_dly(1);
+    }
+    if (!s_mqtt_ka_exited) {
+        printf("[TUYA] MQTT stop timed out; rebooting to complete marked reset\r\n");
+        tuya_cloud_reset_cpu_reboot();
+        return 1;
+    }
+
+    iot_client_deinit(iot);
+    if (tuya_cloud_reset_clear_and_verify(type) != 0) {
+        printf("[TUYA] cloud reset clear verification failed; reboot for recovery\r\n");
+        tuya_cloud_reset_cpu_reboot();
+        return 1;
+    }
+
+    printf("[TUYA] cloud %s reset verified; reboot to BLE provisioning\r\n",
+           type == IOT_RESET_REMOTE_FACTORY ? "factory" : "unbind");
+    tuya_cloud_reset_cpu_reboot();
+    return 1;
+}
+
 static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_key)
 {
+    s_mqtt_ka_exited = 0;
     g_mqtt_ka_run = 1;
-    thread_fork("tuya_mqtt_ka", 5, 6 * 1024, 0, 0, tuya_mqtt_keepalive_task, iot);
+    if (thread_fork("tuya_mqtt_ka", 5, 6 * 1024, 0, 0,
+                    tuya_mqtt_keepalive_task, iot) != 0) {
+        printf("[TUYA] MQTT keepalive task start failed\r\n");
+        s_mqtt_ka_exited = 1;
+    }
 
     audio_stream_init(16000, 16, 1);
     start_audio_stream();
@@ -2250,21 +2505,53 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
 #endif
 
     unsigned int backoff_ms = 5000;
+    int offline_logged = 0;
     while (1) {
+        /* Session-token and TAI connection retries require a DHCP-ready
+         * network as well.  Retain the client and resume after Wi-Fi recovers. */
+        if (!wifi_tuya_network_is_ready()) {
+            if (!offline_logged) {
+                printf("[TUYA] network offline, AI reconnect paused\r\n");
+                offline_logged = 1;
+            }
+            while (!wifi_tuya_network_is_ready()) {
+                os_time_dly(100);
+            }
+            printf("[TUYA] network restored, resuming AI reconnect\r\n");
+            offline_logged = 0;
+            backoff_ms = 5000;
+            continue;
+        }
         /* 每次会话尝试前复位跨线程标志(tai ctx 尚未创建,on_disconnect 无竞态) */
         g_exit = 0; g_link_broken = 0;
+        if (tuya_cloud_reset_requested()) {
+            if (tuya_cloud_reset_supervise(iot)) return;
+            continue;
+        }
         g_tts_playing = 0; g_turn_done = 1;
 #ifdef TUYA_BARGE_IN_ENABLE
         g_barge_in = 0; g_barge_prefill = 0;
 #endif
         printf("[TUYA] session attempt\r\n");
         unsigned int lived_ms = tuya_ai_session(pal, iot, local_key);
+        if (tuya_cloud_reset_requested()) {
+            if (tuya_cloud_reset_supervise(iot)) return;
+            continue;
+        }
         if (lived_ms > 60000) backoff_ms = 5000;   /* 会话曾健康存活,按首次失败退避 */
         /* 会话报废收尾:清残留 TTS 让喇叭立刻安静,重连后从干净状态起听 */
         _device_rbuf_clear();
         printf("[TUYA] session lost (lived %us), retry in %ums\r\n",
                lived_ms / 1000, backoff_ms);
-        msleep(backoff_ms);
+        for (unsigned int waited_ms = 0;
+             waited_ms < backoff_ms && !tuya_cloud_reset_requested();
+             waited_ms += 100) {
+            msleep(100);
+        }
+        if (tuya_cloud_reset_requested()) {
+            if (tuya_cloud_reset_supervise(iot)) return;
+            continue;
+        }
         if (backoff_ms < 60000) backoff_ms *= 2;
     }
 }
@@ -2273,6 +2560,141 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
  * tuya_ble_netcfg_start 阻塞,故用独立线程周期播报;配网完成/失败/超时置
  * s_prov_prompt_run=0,线程在 ~0.1s 内退出。NetCfgEnter.mp3 是 app_music 现有提示音。*/
 static volatile int s_prov_prompt_run;
+
+#define TUYA_NETWORK_READY_TIMEOUT_MS  30000u
+#define TUYA_NETWORK_READY_POLL_MS       100u
+
+/* accept_current_ready is used only by an already-provisioned boot: an
+ * existing DHCP lease for its saved network is sufficient.  A fresh BLE
+ * provisioning flow must observe a newer DHCP generation. */
+static int tuya_wait_for_network_ready(u32 start_generation, int accept_current_ready)
+{
+    u32 waited_ms = 0;
+
+    while (waited_ms < TUYA_NETWORK_READY_TIMEOUT_MS) {
+        u32 generation = wifi_get_tuya_network_ready_generation();
+        if (wifi_tuya_network_is_ready() &&
+            (accept_current_ready || generation != start_generation)) {
+            printf("[TUYA] network ready: generation %u -> %u\r\n",
+                   start_generation, generation);
+            return 0;
+        }
+        msleep(TUYA_NETWORK_READY_POLL_MS);
+        waited_ms += TUYA_NETWORK_READY_POLL_MS;
+    }
+    printf("[TUYA] network ready timeout\r\n");
+    return -1;
+}
+
+/* A saved, valid provision must survive a temporary AP outage.  After the
+ * bounded startup wait, keep cloud startup paused until DHCP eventually
+ * recovers instead of clearing the device triplet. */
+static void tuya_wait_for_network_available(u32 start_generation)
+{
+    if (tuya_wait_for_network_ready(start_generation, 1) == 0) {
+        return;
+    }
+
+    printf("[TUYA] network still offline; cloud startup paused\r\n");
+    while (!wifi_tuya_network_is_ready()) {
+        os_time_dly(100);
+    }
+    printf("[TUYA] network available after offline wait\r\n");
+}
+
+/* Wi-Fi/DHCP 就绪不代表涂鸦云端激活、凭据落盘和 App 的 MQTT 同步均已完成。
+ * 配网过程保持此标志，使 app_music 不会把 NET_EVENT_CONNECTED 当作成功。 */
+static volatile int s_tuya_provisioning_active;
+
+int tuya_agentic_provisioning_active(void)
+{
+    return s_tuya_provisioning_active;
+}
+
+/* A DHCP lease only proves that some AP supplied an address.  The generic
+ * Wi-Fi recovery path can otherwise reconnect a remembered AP while a Tuya
+ * provisioning attempt is active.  Compare the current STA association with
+ * the exact UTF-8 bytes supplied over BLE before accepting that lease. */
+static int tuya_provisioning_ssid_matches_current_sta(void)
+{
+    struct wifi_mode_info info = {0};
+    size_t configured_len = strlen(s_main_creds.ssid);
+    size_t associated_len;
+
+    info.mode = STA_MODE;
+    wifi_get_mode_cur_info(&info);
+    if (info.mode != STA_MODE || !info.ssid) {
+        printf("[TUYA] provisioning associated SSID unavailable after DHCP\r\n");
+        return 0;
+    }
+
+    associated_len = strlen(info.ssid);
+    if (configured_len != associated_len ||
+        memcmp(info.ssid, s_main_creds.ssid, configured_len) != 0) {
+        printf("[TUYA] provisioning SSID mismatch: configured_len=%u associated_len=%u\r\n",
+               (unsigned int)configured_len, (unsigned int)associated_len);
+        return 0;
+    }
+
+    printf("[TUYA] provisioning SSID verified: bytes=%u\r\n",
+           (unsigned int)configured_len);
+    return 1;
+}
+
+/* No Tuya identity has been persisted yet, so a clean CPU reset is sufficient
+ * to begin a new BLE provisioning attempt.  Keep the activity guard set if a
+ * platform reset unexpectedly returns: an old remembered SSID must still not
+ * be accepted as this attempt's network. */
+static void tuya_restart_ble_provisioning_after_wifi_failure(const char *reason)
+{
+    extern void cpu_reset(void);
+
+    printf("[TUYA] provisioning Wi-Fi %s; reboot to BLE provisioning\r\n", reason);
+    cpu_reset();
+    printf("[TUYA] ERROR: cpu_reset returned; provisioning remains active\r\n");
+}
+
+/* syscfg_write 没有可依赖的错误返回约定；以读回的字节数和内容确认必需数据
+ * 已经落盘。所有条目不通过时都不能解除配网活动态、更不能播成功音。 */
+static int tuya_write_vm_and_verify(u16 index, const void *data, u16 len, const char *name)
+{
+    unsigned char readback[65];
+
+    if (len > sizeof(readback)) {
+        printf("[TUYA] VM verify buffer too small: %s len=%u\r\n",
+               name, (unsigned int)len);
+        return -1;
+    }
+
+    syscfg_write(index, (void *)data, len);
+    if (syscfg_read(index, readback, len) != len || memcmp(readback, data, len) != 0) {
+        printf("[TUYA] VM persistence verify failed: %s\r\n", name);
+        return -1;
+    }
+    return 0;
+}
+
+static int tuya_save_required_provision_data(const iot_client_t *iot)
+{
+    unsigned char region_byte = (unsigned char)iot->region;
+    int failed = 0;
+
+    failed |= tuya_write_vm_and_verify(VM_TUYA_DEVID_IDX, iot->devid, 32, "devid");
+    failed |= tuya_write_vm_and_verify(VM_TUYA_SECRET_IDX, iot->secret_key, 32, "secret_key");
+    failed |= tuya_write_vm_and_verify(VM_TUYA_LOCALKEY_IDX, iot->local_key, 32, "local_key");
+    failed |= tuya_write_vm_and_verify(VM_TUYA_SSID_IDX, s_main_creds.ssid, 65, "ssid");
+    failed |= tuya_write_vm_and_verify(VM_TUYA_PWD_IDX, s_main_creds.password, 65, "password");
+    failed |= tuya_write_vm_and_verify(VM_TUYA_REGION_IDX, &region_byte, 1, "region");
+
+    if (failed) {
+        return -1;
+    }
+
+    printf("[TUYA] required provisioning data persisted, region=%s\r\n",
+           region_name(iot->region));
+    return 0;
+}
+
 static void tuya_prov_prompt_task(void *arg)
 {
     extern void app_music_play_netcfg_prompt(void);
@@ -2293,8 +2715,24 @@ static void tuya_sync_wifi_to_jl(const char *ssid, const char *pwd)
 {
     if (ssid && ssid[0] && ssid[0] != 0xFF) {
         wifi_store_mode_info(STA_MODE, (char *)ssid, (char *)pwd);
-        printf("[TUYA] synced wifi to JL store: ssid=%s\r\n", ssid);
+        printf("[TUYA] synced wifi to JL store: ssid_len=%u\r\n",
+               (unsigned int)strlen(ssid));
     }
+}
+
+static int tuya_vm_string_valid(const char *value, int read_len, size_t value_size)
+{
+    return read_len > 0 && value[0] != '\0' &&
+           (unsigned char)value[0] != 0xFF &&
+           memchr(value, '\0', value_size) != NULL;
+}
+
+/* A Wi-Fi password may intentionally be empty for an open network, but its
+ * VM record still needs to be present, non-erased, and NUL-terminated. */
+static int tuya_vm_wifi_password_valid(const char *value, int read_len, size_t value_size)
+{
+    return read_len > 0 && (unsigned char)value[0] != 0xFF &&
+           memchr(value, '\0', value_size) != NULL;
 }
 
 /* ========================================================================= */
@@ -2343,6 +2781,8 @@ static void tuya_log_redirect(log_level_t level, const char *fmt, va_list args)
     if (tuya_log_mutex_inited) os_mutex_post(&tuya_log_mutex);
 }
 
+void tuya_clear_provision_and_reset(void);
+
 void tuya_agentic_main(void *arg)
 {
     const pal_t *pal = tai_pal_ac791n();
@@ -2370,33 +2810,51 @@ void tuya_agentic_main(void *arg)
     log_set_handler(tuya_log_redirect);
     log_set_level(TUYA_SDK_LOG_LEVEL);   /* 见上方宏,改它即可控制日志量 */
 
+    if (tuya_cloud_reset_recover_if_needed() != 0) {
+        printf("[TUYA] cloud-reset recovery incomplete; refusing to start with saved identity\r\n");
+        return;
+    }
+
     char devid[32] = {0}, secret[32] = {0}, localkey[32] = {0};
-    /* syscfg_read 成功返回字节数(>0),失败返回负数;之前误写成 ==0,导致每次开机都判
-     * "没有 devid"而重新配网(三元组其实在 flash 里)。参考 stream_protocol.c:157 的用法。*/
-    int have = (syscfg_read(VM_TUYA_DEVID_IDX, devid, sizeof(devid)) > 0 && devid[0] != 0 && devid[0] != 0xFF);
+    /* 仅 devid 存在不等于身份有效：三个凭据都必须完整且非空，否则直接进入
+     * 既有 BLE 配网入口，绝不尝试带半套/已清除凭据连云。*/
+    int have = syscfg_read(VM_TUYA_DEVID_IDX, devid, sizeof(devid)) == sizeof(devid) &&
+               syscfg_read(VM_TUYA_SECRET_IDX, secret, sizeof(secret)) == sizeof(secret) &&
+               syscfg_read(VM_TUYA_LOCALKEY_IDX, localkey, sizeof(localkey)) == sizeof(localkey) &&
+               devid[0] != 0 && devid[0] != 0xFF &&
+               secret[0] != 0 && secret[0] != 0xFF &&
+               localkey[0] != 0 && localkey[0] != 0xFF;
     if (have) {
-        syscfg_read(VM_TUYA_SECRET_IDX, secret, sizeof(secret));
-        syscfg_read(VM_TUYA_LOCALKEY_IDX, localkey, sizeof(localkey));
         printf("[TUYA] already provisioned, devid=%s\r\n", devid);
 
         /* 直连路径必须自己重连 WiFi:开机 wifi 子系统落回 SMP_CFG_MODE 监听(没联网),
          * 直接 iot_client_init 连 AI 云必失败→"说话没反应"。读配网时一并存的 ssid/password,
          * 复用首次配网那套 wifi_enter_sta_mode + 轮询 SUCC + 等 DHCP(见下方首次配网段)。*/
+        int secret_len = sizeof(secret);
+        int localkey_len = sizeof(localkey);
         char ssid[65] = {0}, pwd[65] = {0};
-        syscfg_read(VM_TUYA_SSID_IDX, ssid, sizeof(ssid) - 1);
-        syscfg_read(VM_TUYA_PWD_IDX,  pwd,  sizeof(pwd) - 1);
-        if (ssid[0] != 0 && ssid[0] != 0xFF) {
-            /* wifi_app_task 开机已自动连 VM 里的 SSID 并播报过提示音。
-             * 不再重复重连(wifi_get_sta_connect_state 在 wifi_app_task 被杀后返回值不可靠,
-             * 且 wifi_enter_sta_mode 会断开再重连,导致第二次提示音)。直接用现有连接即可。*/
-            printf("[TUYA] wifi already connected by wifi_app_task (ssid=%s)\r\n", ssid);
-            /* 同步到杰理 wifi 存储:防 app_music 的 wifi_return_sta_mode 读到旧 ssid 覆盖 */
-            tuya_sync_wifi_to_jl(ssid, pwd);
-        } else {
-            /* devid 在但 ssid 空:本修复前烧的设备没存 ssid → 没法联网,直连 AI 必失败。
-             * 提示一下,重配一次网即补上 ssid。*/
-            printf("[TUYA] WARN: devid present but no stored wifi ssid -> AI will fail, re-provision once\r\n");
+        int ssid_len = syscfg_read(VM_TUYA_SSID_IDX, ssid, sizeof(ssid));
+        int pwd_len = syscfg_read(VM_TUYA_PWD_IDX,  pwd,  sizeof(pwd));
+        if (!tuya_vm_string_valid(secret, secret_len, sizeof(secret)) ||
+            !tuya_vm_string_valid(localkey, localkey_len, sizeof(localkey)) ||
+            !tuya_vm_string_valid(ssid, ssid_len, sizeof(ssid)) ||
+            !tuya_vm_wifi_password_valid(pwd, pwd_len, sizeof(pwd))) {
+            /* Only a corrupt/missing local provision justifies clearing it.
+             * Association failures and DHCP timeouts never enter this path. */
+            printf("[TUYA] invalid stored provisioning data -> reset to BLE provisioning\r\n");
+            tuya_clear_provision_and_reset();
+            return;
         }
+
+        printf("[TUYA] already provisioned; verifying Wi-Fi before cloud startup\r\n");
+        u32 network_generation = wifi_get_tuya_network_ready_generation();
+        if (!wifi_tuya_network_is_ready()) {
+            /* Tuya's persisted credentials are authoritative here.  They let
+             * startup recover even if the separate JieLi Wi-Fi VM is stale. */
+            wifi_enter_sta_mode(ssid, pwd);
+        }
+        tuya_wait_for_network_available(network_generation);
+        tuya_sync_wifi_to_jl(ssid, pwd);
 
         iot_client_config_t cfg;
         memset(&cfg, 0, sizeof(cfg));
@@ -2415,6 +2873,7 @@ void tuya_agentic_main(void *arg)
         cfg.env = PROD;
         cfg.mqtt_disable_tls = false; cfg.mqtt_auto_connect = 1;
         cfg.cert_bundle_attach = NULL; cfg.cacert = NULL;
+        cfg.reset_callback = on_cloud_reset;
         extern const char *tuya_get_effective_sw_ver(void);
         cfg.sw_ver = tuya_get_effective_sw_ver();   /* 上报生效版本:VM>源码基线 */
 
@@ -2467,6 +2926,7 @@ void tuya_agentic_main(void *arg)
     }
 
     /* ---- 首次:BLE 配网 ---- */
+    s_tuya_provisioning_active = 1;
     printf("[TUYA] no devid, start BLE provisioning...\r\n");
     s_prov_prompt_run = 1;   /* 启动"请配置网络"循环播报(每 30s),配网完成会停 */
     thread_fork("tuya_prov_prompt", 6, 4 * 1024, 0, 0, tuya_prov_prompt_task, NULL);
@@ -2477,19 +2937,25 @@ void tuya_agentic_main(void *arg)
         printf("[TUYA] BLE provisioning failed/timeout\r\n"); return;
     }
     tuya_ble_netcfg_stop();   /* 配网完停 BLE,释放内存给 WiFi/TLS */
-    printf("[TUYA] BLE done: ssid=%s token=%s\r\n", s_main_creds.ssid, s_main_creds.token);
+    printf("[TUYA] BLE done: ssid_len=%u token_len=%u\r\n",
+           (unsigned int)strlen(s_main_creds.ssid),
+           (unsigned int)strlen(s_main_creds.token));
 
     /* ---- 连 WiFi(配网给的 ssid/密码)---- */
+    u32 network_generation = wifi_get_tuya_network_ready_generation();
     wifi_enter_sta_mode(s_main_creds.ssid, s_main_creds.password);
-    /* 等 WiFi 关联成功:原死等满 20s 太慢,改成轮询真实状态,一连上就继续。 */
-    for (int i = 0; i < 100; i++) {   /* 最多等 ~20s */
-        if (wifi_get_sta_connect_state() == WIFI_STA_CONNECT_SUCC) {
-            printf("[TUYA] wifi STA connected, wait DHCP...\r\n");
-            break;
-        }
-        msleep(200);
+    if (tuya_wait_for_network_ready(network_generation, 0) != 0) {
+        /* No cloud activation attempt is made without a new DHCP lease.
+         * Restart cleanly so the user can submit corrected BLE credentials. */
+        tuya_restart_ble_provisioning_after_wifi_failure("unavailable");
+        return;
     }
-    msleep(1500);   /* 关联成功后给 DHCP ~1.5s 拿 IP(实测 DHCP 在 SUCC 后 ~0.4s 完成) */
+    if (!tuya_provisioning_ssid_matches_current_sta()) {
+        /* Never activate, persist, or announce success for a remembered AP
+         * that happened to reconnect during this BLE provisioning attempt. */
+        tuya_restart_ble_provisioning_after_wifi_failure("SSID mismatch");
+        return;
+    }
 
     /* 同步到杰理 wifi 存储:防 app_music 的 wifi_return_sta_mode 读到旧 ssid 覆盖。
      * 之前换网络后,杰理 VM 里残留旧 ssid(GJ1)覆盖了涂鸦配的 ssid,导致断网连不上 AI。*/
@@ -2503,21 +2969,25 @@ void tuya_agentic_main(void *arg)
     strncpy((char *)ob.product_key, TUYA_PRODUCT_KEY, sizeof(ob.product_key) - 1);
     ob.env = PROD; ob.mqtt_disable_tls = false; ob.mqtt_auto_connect = 1; ob.timeout_ms = 30000;
     ob.cert_bundle_attach = NULL; ob.cacert = NULL;
+    ob.reset_callback = on_cloud_reset;
     extern const char *tuya_get_effective_sw_ver(void);
     ob.sw_ver = tuya_get_effective_sw_ver();   /* 上报生效版本:VM>源码基线 */
     iot_client_t *iot = iot_client_init_on_boarding_with_token(&ob, s_main_creds.token);
     if (!iot) { printf("[TUYA] on_boarding_with_token fail\r\n"); return; }
+    if (!iot->devid[0] || !iot->secret_key[0] || !iot->local_key[0]) {
+        printf("[TUYA] activation returned incomplete required credentials\r\n");
+        return;
+    }
     printf("[TUYA] activated, devid=%s\r\n", iot->devid);
 
     /* ---- 持久化三元组 + WiFi 凭据(下次开机直连)----
      * 三元组连涂鸦 AI 云;ssid/password 供直连路径开机重连 WiFi(否则开机离线,连 AI 必失败)。*/
     char lk[32] = {0};
     strncpy(lk, (const char *)iot->local_key, sizeof(lk) - 1);
-    syscfg_write(VM_TUYA_DEVID_IDX,    iot->devid,            32);
-    syscfg_write(VM_TUYA_SECRET_IDX,   iot->secret_key,       32);
-    syscfg_write(VM_TUYA_LOCALKEY_IDX, iot->local_key,        32);
-    syscfg_write(VM_TUYA_SSID_IDX,     s_main_creds.ssid,     65);
-    syscfg_write(VM_TUYA_PWD_IDX,      s_main_creds.password, 65);
+    if (tuya_save_required_provision_data(iot) != 0) {
+        printf("[TUYA] required provisioning data was not persisted\r\n");
+        return;
+    }
     /* DP schema:激活时云端在 response 里返回 schema_id + schema JSON。
      * 存到 VM,下次开机直连时读出来恢复→iot_dp_schema_check_update 才能工作→DP 下行才能解析。*/
     if (iot->schema_id[0] != '\0') {
@@ -2534,15 +3004,6 @@ void tuya_agentic_main(void *arg)
         printf("[TUYA] WARNING: schema body is NULL/empty after activation! "
                "(cloud did not return schema in activate response)\r\n");
     }
-    /* region 落 VM:激活时云端已明确下发(token 前缀 + 激活响应 region 字段,
-     * iot->region 即解析结果)。不落盘的话重启直连只能靠硬编码,海外区设备
-     * 重启后会打到中国区域名(a1.tuyacn.com)导致 AI token/MQTT 全失败。*/
-    {
-        uint8_t region_byte = (uint8_t)iot->region;
-        syscfg_write(VM_TUYA_REGION_IDX, &region_byte, 1);
-        printf("[TUYA] saved region=%s\r\n", region_name(iot->region));
-    }
-
     /* ---- hold MQTT 让 App 判定配网成功 ----
      * on_boarding 已建好 MQTT(涂鸦IoT云,设备上线绑定)。App 判"配网成功"靠它,需保持
      * 几秒让云端同步给 App。之后 tuya_ai_run 保持 MQTT 常驻不断开(MQTT 与 AI 是各自
@@ -2551,6 +3012,9 @@ void tuya_agentic_main(void *arg)
      *   改 3s 足够,缩短开机到可对话的延迟。*/
     printf("[TUYA] hold MQTT ~3s for app to confirm provisioning...\r\n");
     msleep(3000);
+    s_tuya_provisioning_active = 0;
+    extern void app_music_play_netcfg_success(void);
+    app_music_play_netcfg_success();
 
     /* ---- 连 AI 之前先检查涂鸦云 OTA(与直连路径保持一致)----
      * 配网首次激活后云端一般无待升级固件,但保持检查可应对"激活即升级"场景。
@@ -2580,34 +3044,25 @@ void tuya_agentic_main(void *arg)
     printf("===== tuya_agentic_main end =====\r\n");
 }
 
-/* 长按 KEY_PHOTO(K6) 时由 app_music 调用:清除已配网的三元组 + WiFi 凭据并软复位,
- * 复位后 tuya_agentic_main 读不到 devid → 自动重新进入 BLE 配网。
+/* 长按 KEY_PHOTO(K6) 时由 app_music 调用:使用与云端 factory reset 相同的
+ * 可恢复清除状态机；复位后 tuya_agentic_main 读不到有效身份 → 自动进入 BLE 配网。
  * 给用户一个"主动重新配网"的入口(否则开机直连,没法重配)。
  * 板上 Reset/Update 是硬件键(固件读不到),电源键是自锁拨动开关(按不出长按),
  * 故重置入口放在 K6 长按(原本是空槽位)。*/
 void tuya_clear_provision_and_reset(void)
 {
-    char zero[65] = {0};   /* 65 覆盖 ssid/pwd(65),也够 devid/secret/localkey(32)*/
     printf("[TUYA] >>> clear provision & reboot (re-enter BLE provisioning) <<<\r\n");
-    syscfg_write(VM_TUYA_DEVID_IDX,    zero, 32);
-    syscfg_write(VM_TUYA_SECRET_IDX,   zero, 32);
-    syscfg_write(VM_TUYA_LOCALKEY_IDX, zero, 32);
-    syscfg_write(VM_TUYA_SSID_IDX,     zero, 65);
-    syscfg_write(VM_TUYA_PWD_IDX,      zero, 65);
-    syscfg_write(VM_TUYA_REGION_IDX,   zero, 1);   /* region 一并清:重配网时重新下发(可能换了区)*/
-    /* 同时清杰理 WiFi VM:设回 SMP_CFG_MODE(配网模式)+ 空 ssid。
-     * 否则 wifi_app_task 开机读到旧 STA_MODE ssid 自动连网→播"网络连接成功"→
-     * 然后才进配网,用户听到两条提示音("网络连接成功"+"请配置网络"),迷惑。*/
-    wifi_store_mode_info(SMP_CFG_MODE, zero, zero);
-    /* ★复位前先停 BT 广播,让蓝牙控制器进入 idle 再软复位。
-     *   软复位(P33_SYSTEM_RESET)不像掉电/reset 键那样完全重置 BT 控制器,带活跃
-     *   射频状态复位会导致重启后 BLE 链路异常(conn nack → supervision timeout),
-     *   配网必失败(实测:长按 K6 走软复位后配网失败,按 reset 键冷启动则成功)。*/
-    tuya_ble_netcfg_stop();
-    os_time_dly(300);   /* 3s:BT 控制器 idle + VM 落盘 */
-    extern void cpu_reset(void);
-    cpu_reset();
-    while (1) { ; }   /* 复位路径,不返回 */
+    if (!tuya_cloud_reset_write_marker(
+            tuya_cloud_reset_marker(IOT_RESET_REMOTE_FACTORY, 0))) {
+        printf("[TUYA] local reset marker write failed; credentials retained\r\n");
+        return;
+    }
+    if (tuya_cloud_reset_clear_and_verify(IOT_RESET_REMOTE_FACTORY) != 0) {
+        printf("[TUYA] local reset verification failed; reboot for recovery\r\n");
+        tuya_cloud_reset_cpu_reboot();
+        return;
+    }
+    tuya_cloud_reset_cpu_reboot();
 }
 
 /* boot 自启动:系统初始化后 fork tuya_agentic_main

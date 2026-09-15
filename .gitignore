@@ -21,6 +21,8 @@ cpu/wl82/tools/sdk.elf*
 .claude/
 *.swp
 *~
+__pycache__/
+*.py[cod]
 
 # 操作系统
 .DS_Store

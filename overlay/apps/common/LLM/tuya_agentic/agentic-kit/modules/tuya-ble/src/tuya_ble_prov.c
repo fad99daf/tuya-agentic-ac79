@@ -1,7 +1,6 @@
 /* 配网诊断:点亮 HAL 日志宏(默认是空操作,编译后什么都看不到)。
- * 目的:抓 App 经 BLE 下发的完整 WiFi 配置 JSON(看有没有 timezone 等额外字段)、
- * 以及 App 发的其它命令(Unhandled CMD/subcmd 若出现,说明有我们没处理的数据)。
- * BLE 只在配网期间运行,日志量可控;诊断完可注释掉这 4 个 define 恢复安静。*/
+ * 仅记录协议元数据和错误；Wi-Fi JSON、SSID、密码、token 及已解密报文都不能输出，
+ * 以免串口日志泄露配网凭据。*/
 #include <stdio.h>
 static void ble_prov_hexdump(const uint8_t *buf, size_t len)
 {
@@ -186,13 +185,46 @@ static int aes_cbc_decrypt(const uint8_t *key, const uint8_t *iv,
     mbedtls_aes_free(&aes);
     if (ret != 0) return ret;
 
-    uint8_t pad = out[in_len - 1];
-    if (pad == 0 || pad > 16) {
-        *out_len = in_len;
-    } else {
-        *out_len = in_len - pad;
-    }
+    /* Do not infer padding from the final byte.  An unpadded frame can end in
+     * a CRC byte in the PKCS#7 range.  The frame's data_len gives its real
+     * boundary, so tuya_ble_recv validates any trailing AES bytes there. */
+    *out_len = in_len;
     return 0;
+}
+
+static bool tuya_ble_valid_aes_padding(const uint8_t *frame, uint16_t frame_len,
+                                       uint32_t frame_expected_len)
+{
+    uint16_t pad_len;
+    uint16_t i;
+    bool is_pkcs7_padding = true;
+    bool is_zero_padding = true;
+
+    if (frame_expected_len > frame_len) {
+        return false;
+    }
+
+    pad_len = frame_len - (uint16_t)frame_expected_len;
+    if (pad_len == 0) {
+        return true;
+    }
+
+    /* AES-CBC adds at most one block.  A full 16-byte PKCS#7/zero-filled
+     * block is accepted; any other suffix must be exactly pad_len bytes. */
+    if (pad_len > 16) {
+        return false;
+    }
+
+    for (i = 0; i < pad_len; i++) {
+        if (frame[frame_expected_len + i] != pad_len) {
+            is_pkcs7_padding = false;
+        }
+        if (frame[frame_expected_len + i] != 0) {
+            is_zero_padding = false;
+        }
+    }
+
+    return is_pkcs7_padding || is_zero_padding;
 }
 
 static void ble_id_compress(const uint8_t *in, uint8_t *out)
@@ -416,7 +448,6 @@ static void handle_pair_req(tuya_ble_prov_state_t *state, const uint8_t *data, u
 static void handle_wifi_config(tuya_ble_prov_state_t *state, const uint8_t *data, uint16_t data_len)
 {
     TUYA_BLE_HAL_LOGI("[PROTO] FRM_DOWNLINK_TRANSPARENT_REQ (%d bytes):", data_len);
-    TUYA_BLE_HAL_HEXDUMP(data, data_len);
 
     if (data_len < 4) {
         TUYA_BLE_HAL_LOGW("[PROTO] Transparent data too short");
@@ -443,11 +474,12 @@ static void handle_wifi_config(tuya_ble_prov_state_t *state, const uint8_t *data
 
     char json_str[512];
     uint16_t json_len = data_len - offset;
-    if (json_len >= sizeof(json_str)) json_len = sizeof(json_str) - 1;
+    if (json_len == 0 || json_len >= sizeof(json_str)) {
+        TUYA_BLE_HAL_LOGW("[PROTO] WiFi JSON length invalid: %u", json_len);
+        return;
+    }
     memcpy(json_str, &data[offset], json_len);
     json_str[json_len] = '\0';
-
-    TUYA_BLE_HAL_LOGI("[PROTO] WiFi JSON: %s", json_str);
 
     cJSON *root = cJSON_Parse(json_str);
     if (root == NULL) {
@@ -458,24 +490,54 @@ static void handle_wifi_config(tuya_ble_prov_state_t *state, const uint8_t *data
     memset(&state->creds, 0, sizeof(state->creds));
 
     cJSON *ssid = cJSON_GetObjectItem(root, "ssid");
-    if (cJSON_IsString(ssid) && ssid->valuestring) {
-        strncpy(state->creds.ssid, ssid->valuestring, TUYA_BLE_SSID_MAX_LEN);
-        TUYA_BLE_HAL_LOGI("[PROTO] SSID: %s", state->creds.ssid);
+    if (!cJSON_IsString(ssid) || ssid->valuestring == NULL) {
+        TUYA_BLE_HAL_LOGW("[PROTO] WiFi SSID missing");
+        cJSON_Delete(root);
+        return;
     }
+
+    /* strlen counts the UTF-8 octets handed to the Wi-Fi driver, not user
+     * visible Unicode characters.  Never truncate a multi-byte SSID. */
+    size_t ssid_len = strlen(ssid->valuestring);
+    if (ssid_len == 0 || ssid_len > TUYA_BLE_SSID_MAX_LEN) {
+        TUYA_BLE_HAL_LOGW("[PROTO] WiFi SSID byte length invalid: %u",
+                          (unsigned int)ssid_len);
+        cJSON_Delete(root);
+        return;
+    }
+    memcpy(state->creds.ssid, ssid->valuestring, ssid_len);
+    state->creds.ssid[ssid_len] = '\0';
 
     cJSON *pwd = cJSON_GetObjectItem(root, "pwd");
     if (cJSON_IsString(pwd) && pwd->valuestring) {
-        strncpy(state->creds.password, pwd->valuestring, TUYA_BLE_PASSWORD_MAX_LEN);
-        TUYA_BLE_HAL_LOGI("[PROTO] Password: %s", state->creds.password);
+        size_t password_len = strlen(pwd->valuestring);
+        if (password_len > TUYA_BLE_PASSWORD_MAX_LEN) {
+            TUYA_BLE_HAL_LOGW("[PROTO] WiFi password byte length invalid: %u",
+                              (unsigned int)password_len);
+            cJSON_Delete(root);
+            return;
+        }
+        memcpy(state->creds.password, pwd->valuestring, password_len);
+        state->creds.password[password_len] = '\0';
     }
 
     cJSON *token = cJSON_GetObjectItem(root, "token");
     if (cJSON_IsString(token) && token->valuestring) {
-        strncpy(state->creds.token, token->valuestring, TUYA_BLE_TOKEN_MAX_LEN);
-        TUYA_BLE_HAL_LOGI("[PROTO] Token: %s", state->creds.token);
+        size_t token_len = strlen(token->valuestring);
+        if (token_len > TUYA_BLE_TOKEN_MAX_LEN) {
+            TUYA_BLE_HAL_LOGW("[PROTO] WiFi token byte length invalid: %u",
+                              (unsigned int)token_len);
+            cJSON_Delete(root);
+            return;
+        }
+        memcpy(state->creds.token, token->valuestring, token_len);
+        state->creds.token[token_len] = '\0';
     }
 
     cJSON_Delete(root);
+
+    TUYA_BLE_HAL_LOGI("[PROTO] WiFi credentials accepted: ssid_bytes=%u",
+                      (unsigned int)ssid_len);
 
     uint8_t resp[5] = {0x00, 0x00, 0x00, 0x01, 0x00};
     tuya_ble_send(state, FRM_UPLINK_TRANSPARENT_REQ, resp, sizeof(resp), ENCRYPTION_MODE_KEY_12);
@@ -488,11 +550,11 @@ static void handle_wifi_config(tuya_ble_prov_state_t *state, const uint8_t *data
 static void tuya_ble_recv(tuya_ble_prov_state_t *state, const uint8_t *packet, uint16_t packet_len)
 {
     TUYA_BLE_HAL_LOGI("[RX] packet_len=%d", packet_len);
-    TUYA_BLE_HAL_HEXDUMP(packet, packet_len > 64 ? 64 : packet_len);
 
     if (packet_len < 2) return;
 
     uint8_t encrypt_mode = packet[0];
+    bool encrypted_packet = encrypt_mode != ENCRYPTION_MODE_NONE;
     TUYA_BLE_HAL_LOGI("[RX] encrypt_mode=0x%02X", encrypt_mode);
 
     uint8_t *frame = state->rx_frame;
@@ -535,8 +597,7 @@ static void tuya_ble_recv(tuya_ble_prov_state_t *state, const uint8_t *packet, u
             TUYA_BLE_HAL_LOGE("[RX] Decryption failed, ret=%d", ret);
             return;
         }
-        TUYA_BLE_HAL_LOGI("[RX] Decrypted frame (%d bytes):", frame_len);
-        TUYA_BLE_HAL_HEXDUMP(frame, frame_len > 64 ? 64 : frame_len);
+        TUYA_BLE_HAL_LOGI("[RX] Decrypted frame length=%d", frame_len);
     }
 
     if (frame_len < BLE_FRAME_MIN_LEN) {
@@ -545,26 +606,38 @@ static void tuya_ble_recv(tuya_ble_prov_state_t *state, const uint8_t *packet, u
     }
 
     uint32_t sn = (frame[0] << 24) | (frame[1] << 16) | (frame[2] << 8) | frame[3];
-    state->last_rx_sn = sn;
     uint16_t cmd = (frame[8] << 8) | frame[9];
     uint16_t data_len = (frame[10] << 8) | frame[11];
     const uint8_t *data = &frame[12];
 
-    if (cmd == FRM_QRY_DEV_INFO_REQ && data_len >= 2) {
-        state->peer_pkt_len = ((uint16_t)data[0] << 8) | data[1];
-        TUYA_BLE_HAL_LOGI("[PROTO] peer_pkt_len=%u", state->peer_pkt_len);
-    }
-
-    uint16_t crc_offset = BLE_FRAME_HEADER_LEN + data_len;
-    if (crc_offset + 2 > frame_len) {
-        TUYA_BLE_HAL_LOGW("[RX] Invalid data_len=%d", data_len);
+    uint32_t frame_expected_len = (uint32_t)BLE_FRAME_HEADER_LEN + data_len + BLE_FRAME_CRC_LEN;
+    if (frame_expected_len > frame_len) {
+        TUYA_BLE_HAL_LOGW("[RX] Length mismatch: cmd=0x%04X raw=%u expected=%lu",
+                          cmd, frame_len, (unsigned long)frame_expected_len);
         return;
     }
+
+    if (frame_len > frame_expected_len &&
+        (!encrypted_packet ||
+         !tuya_ble_valid_aes_padding(frame, frame_len, frame_expected_len))) {
+        TUYA_BLE_HAL_LOGW("[RX] Invalid padding: cmd=0x%04X raw=%u expected=%lu",
+                          cmd, frame_len, (unsigned long)frame_expected_len);
+        return;
+    }
+
+    uint16_t crc_offset = (uint16_t)(frame_expected_len - BLE_FRAME_CRC_LEN);
     uint16_t recv_crc = (frame[crc_offset] << 8) | frame[crc_offset + 1];
     uint16_t calc_crc = crc16_modbus(frame, crc_offset);
     if (recv_crc != calc_crc) {
         TUYA_BLE_HAL_LOGW("[RX] CRC mismatch: recv=0x%04X calc=0x%04X", recv_crc, calc_crc);
         return;
+    }
+
+    state->last_rx_sn = sn;
+
+    if (cmd == FRM_QRY_DEV_INFO_REQ && data_len >= 2) {
+        state->peer_pkt_len = ((uint16_t)data[0] << 8) | data[1];
+        TUYA_BLE_HAL_LOGI("[PROTO] peer_pkt_len=%u", state->peer_pkt_len);
     }
 
     TUYA_BLE_HAL_LOGI("[RX] SN=%lu, CMD=0x%04X, LEN=%d, CRC=OK",
@@ -691,8 +764,6 @@ int tuya_ble_prov_on_data(tuya_ble_prov_state_t *state, const uint8_t *raw, uint
     if (state == NULL || raw == NULL || len == 0 || len > TUYA_BLE_RX_BUF_SIZE) {
         return -1;
     }
-
-    TUYA_BLE_HAL_HEXDUMP(raw, len > 64 ? 64 : len);
 
     int offset = 0;
     uint32_t subpkg_num = 0;

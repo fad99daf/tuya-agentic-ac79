@@ -55,6 +55,24 @@ static struct {
 
 #define __this	(&wifi_app_hdl)
 
+#ifdef CONFIG_TUYA_AGENTIC_ENABLE
+/* Cloud clients may run independently of the Wi-Fi state machine.  Publish
+ * readiness only after DHCP has completed, and revoke it as soon as this STA
+ * link can no longer carry cloud traffic. */
+static volatile u32 s_tuya_network_ready_generation;
+static volatile int s_tuya_network_ready;
+
+u32 wifi_get_tuya_network_ready_generation(void)
+{
+    return s_tuya_network_ready_generation;
+}
+
+int wifi_tuya_network_is_ready(void)
+{
+    return s_tuya_network_ready;
+}
+#endif
+
 extern void airkiss_ssid_check(void);
 
 int __attribute__((weak)) wifi_force_set_lan_setting_info(void)
@@ -588,6 +606,9 @@ static int wifi_event_callback(void *network_ctx, enum WIFI_EVENT event)
 
     case WIFI_EVENT_STA_CONNECT_TIMEOUT_NOT_FOUND_SSID:
         puts("|network_user_callback->WIFI_STA_CONNECT_TIMEOUT_NOT_FOUND_SSID\n");
+#ifdef CONFIG_TUYA_AGENTIC_ENABLE
+        s_tuya_network_ready = 0;
+#endif
         net.arg = "net";
         net.event = NET_CONNECT_TIMEOUT_NOT_FOUND_SSID;
         net_event_notify(NET_EVENT_FROM_USER, &net);
@@ -595,6 +616,9 @@ static int wifi_event_callback(void *network_ctx, enum WIFI_EVENT event)
 
     case WIFI_EVENT_STA_CONNECT_ASSOCIAT_FAIL:
         puts("|network_user_callback->WIFI_STA_CONNECT_ASSOCIAT_FAIL\n");
+#ifdef CONFIG_TUYA_AGENTIC_ENABLE
+        s_tuya_network_ready = 0;
+#endif
         net.arg = "net";
         net.event = NET_CONNECT_ASSOCIAT_FAIL;
         net_event_notify(NET_EVENT_FROM_USER, &net);
@@ -602,6 +626,9 @@ static int wifi_event_callback(void *network_ctx, enum WIFI_EVENT event)
 
     case WIFI_EVENT_STA_CONNECT_ASSOCIAT_TIMEOUT:
         puts("|network_user_callback->WIFI_STA_CONNECT_ASSOCIAT_TIMEOUT .....\n");
+#ifdef CONFIG_TUYA_AGENTIC_ENABLE
+        s_tuya_network_ready = 0;
+#endif
         break;
 
     case WIFI_EVENT_STA_NETWORK_STACK_DHCP_SUCC:
@@ -672,11 +699,21 @@ static int wifi_event_callback(void *network_ctx, enum WIFI_EVENT event)
 
         net.arg = "net";
         net.event = NET_EVENT_CONNECTED;
+#ifdef CONFIG_TUYA_AGENTIC_ENABLE
+        /* Publish state before the application callback, which may wake the
+         * Tuya startup task immediately. */
+        s_tuya_network_ready = 1;
+        s_tuya_network_ready_generation++;
+#endif
         net_event_notify(NET_EVENT_FROM_USER, &net);
         break;
 
     case WIFI_EVENT_STA_DISCONNECT:
         puts("|network_user_callback->WIFI_STA_DISCONNECT\n");
+
+#ifdef CONFIG_TUYA_AGENTIC_ENABLE
+        s_tuya_network_ready = 0;
+#endif
 
         /*wifi_rxfilter_cfg(0);*/
 
