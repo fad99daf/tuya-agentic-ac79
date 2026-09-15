@@ -4993,6 +4993,15 @@ static int app_music_net_event_handler(struct net_event *event)
 #endif
             break;
         case NET_EVENT_DISCONNECTED_AND_REQ_CONNECT:
+#ifdef CONFIG_TUYA_AGENTIC_ENABLE
+            /* While Tuya provisioning is active, the only permitted STA
+             * target is the credential received through BLE.  In particular,
+             * do not let this generic recovery path select a remembered AP. */
+            if (tuya_agentic_provisioning_active()) {
+                printf("[TUYA] provisioning active; skip stored Wi-Fi fallback\n");
+                break;
+            }
+#endif
             wifi_return_sta_mode();
             break;
         case NET_NTP_GET_TIME_SUCC:	//NTP获取成功事件返回

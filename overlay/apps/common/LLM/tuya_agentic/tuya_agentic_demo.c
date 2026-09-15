@@ -2611,6 +2611,49 @@ int tuya_agentic_provisioning_active(void)
     return s_tuya_provisioning_active;
 }
 
+/* A DHCP lease only proves that some AP supplied an address.  The generic
+ * Wi-Fi recovery path can otherwise reconnect a remembered AP while a Tuya
+ * provisioning attempt is active.  Compare the current STA association with
+ * the exact UTF-8 bytes supplied over BLE before accepting that lease. */
+static int tuya_provisioning_ssid_matches_current_sta(void)
+{
+    struct wifi_mode_info info = {0};
+    size_t configured_len = strlen(s_main_creds.ssid);
+    size_t associated_len;
+
+    info.mode = STA_MODE;
+    wifi_get_mode_cur_info(&info);
+    if (info.mode != STA_MODE || !info.ssid) {
+        printf("[TUYA] provisioning associated SSID unavailable after DHCP\r\n");
+        return 0;
+    }
+
+    associated_len = strlen(info.ssid);
+    if (configured_len != associated_len ||
+        memcmp(info.ssid, s_main_creds.ssid, configured_len) != 0) {
+        printf("[TUYA] provisioning SSID mismatch: configured_len=%u associated_len=%u\r\n",
+               (unsigned int)configured_len, (unsigned int)associated_len);
+        return 0;
+    }
+
+    printf("[TUYA] provisioning SSID verified: bytes=%u\r\n",
+           (unsigned int)configured_len);
+    return 1;
+}
+
+/* No Tuya identity has been persisted yet, so a clean CPU reset is sufficient
+ * to begin a new BLE provisioning attempt.  Keep the activity guard set if a
+ * platform reset unexpectedly returns: an old remembered SSID must still not
+ * be accepted as this attempt's network. */
+static void tuya_restart_ble_provisioning_after_wifi_failure(const char *reason)
+{
+    extern void cpu_reset(void);
+
+    printf("[TUYA] provisioning Wi-Fi %s; reboot to BLE provisioning\r\n", reason);
+    cpu_reset();
+    printf("[TUYA] ERROR: cpu_reset returned; provisioning remains active\r\n");
+}
+
 /* syscfg_write 没有可依赖的错误返回约定；以读回的字节数和内容确认必需数据
  * 已经落盘。所有条目不通过时都不能解除配网活动态、更不能播成功音。 */
 static int tuya_write_vm_and_verify(u16 index, const void *data, u16 len, const char *name)
@@ -2902,9 +2945,15 @@ void tuya_agentic_main(void *arg)
     u32 network_generation = wifi_get_tuya_network_ready_generation();
     wifi_enter_sta_mode(s_main_creds.ssid, s_main_creds.password);
     if (tuya_wait_for_network_ready(network_generation, 0) != 0) {
-        /* No cloud activation attempt is made without a DHCP lease.  The
-         * user can correct credentials and begin a new BLE provisioning run. */
-        printf("[TUYA] provisioning Wi-Fi unavailable; cloud activation skipped\r\n");
+        /* No cloud activation attempt is made without a new DHCP lease.
+         * Restart cleanly so the user can submit corrected BLE credentials. */
+        tuya_restart_ble_provisioning_after_wifi_failure("unavailable");
+        return;
+    }
+    if (!tuya_provisioning_ssid_matches_current_sta()) {
+        /* Never activate, persist, or announce success for a remembered AP
+         * that happened to reconnect during this BLE provisioning attempt. */
+        tuya_restart_ble_provisioning_after_wifi_failure("SSID mismatch");
         return;
     }
 
