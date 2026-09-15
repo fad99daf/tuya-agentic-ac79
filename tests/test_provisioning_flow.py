@@ -10,6 +10,7 @@ BLE_PROV = ROOT / "overlay/apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya
 DEMO = ROOT / "overlay/apps/common/LLM/tuya_agentic/tuya_agentic_demo.c"
 WIFI = ROOT / "overlay/apps/wifi_story_machine/wifi_app_task.c"
 MUSIC = ROOT / "overlay/apps/wifi_story_machine/app_music.c"
+PAL = ROOT / "overlay/apps/common/LLM/tuya_agentic/pal_ac791n.c"
 IOT_HEADER = ROOT / "overlay/apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/include/iot_client.h"
 IOT_CLIENT = ROOT / "overlay/apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client.c"
 IOT_MESSAGE = ROOT / "overlay/apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client_message.c"
@@ -53,6 +54,20 @@ class ProvisioningFlowTests(unittest.TestCase):
         self.assertIn("tuya_agentic_provisioning_active()", block)
         self.assertIn("!tuya_agentic_provisioning_active()", block)
         self.assertIn("app_music_play_voice_prompt(\"NetDisc.mp3\"", block)
+
+    def test_pal_thread_join_waits_for_cooperative_worker_exit(self) -> None:
+        source = read(PAL)
+        entry = source[source.index("static void ac_thr_entry"):
+                       source.index("static int ac_thread_create")]
+        join = source[source.index("static int ac_thread_join"):
+                      source.index("/* ------------------------------------------------------------------------- */\n/* 导出")]
+        self.assertIn("volatile int completed", source)
+        self.assertIn("th->completed = 1", entry)
+        self.assertIn("th->completed = 0", source)
+        self.assertIn("while (!th->completed)", join)
+        self.assertIn("os_time_dly(1)", join)
+        self.assertLess(join.index("while (!th->completed)"),
+                        join.index("thread_kill(&th->pid, KILL_WAIT)"))
 
     def test_ble_stop_never_calls_unpaired_official_module_exit(self) -> None:
         source = read(BLE)

@@ -208,8 +208,9 @@ static void ac_mutex_destroy(void *m)
 }
 
 /* ------------------------------------------------------------------------- */
-/* 线程 —— thread_fork(void fn(void*)) + trampoline 桥接 PAL 的 void* fn(void*),
- * join 用 thread_kill(KILL_WAIT)。                                          */
+/* 线程 —— thread_fork(void fn(void*)) + trampoline 桥接 PAL 的 void* fn(void*).
+ * AC79 的 KILL_WAIT 只能等待任务自行退出；不能在任务仍运行时把它当 pthread_join
+ * 调用，否则内核会持续打印 "thread can't kill"。                             */
 /* ------------------------------------------------------------------------- */
 typedef struct {
     void *(*fn)(void *);
@@ -218,6 +219,7 @@ typedef struct {
 
 typedef struct {
     volatile int pid;
+    volatile int completed; /* ac_thr_entry 已从 PAL 工作函数返回 */
     ac_thr_arg   a;
 } ac_thr_handle_t;
 
@@ -225,6 +227,7 @@ static void ac_thr_entry(void *p)
 {
     ac_thr_handle_t *th = (ac_thr_handle_t *)p;
     th->a.fn(th->a.arg);
+    th->completed = 1;
     /* 入口返回后,thread_fork 创建的任务会自动结束 */
 }
 
@@ -235,6 +238,7 @@ static int ac_thread_create(void **handle, void *(*func)(void *), void *arg)
     th->a.fn  = func;
     th->a.arg = arg;
     th->pid   = 0;
+    th->completed = 0;
 
     /* stk_size 单位是 4 字节;6*1024 = 24KB(跑 mbedTLS 握手,不够再加)*/
     int rc = thread_fork("tuya_pal", 4, 6 * 1024, 0, (int *)&th->pid, ac_thr_entry, th);
@@ -250,7 +254,14 @@ static int ac_thread_join(void *handle)
 {
     if (!handle) return -1;
     ac_thr_handle_t *th = (ac_thr_handle_t *)handle;
-    thread_kill(&th->pid, KILL_WAIT);
+    /* tai_disconnect 已先置 ctx->running=0，工作函数会在下一次轮询返回。
+     * 等 trampoline 确认返回后才让 AC79 回收任务；KILL_WAIT 不负责强杀活跃任务。 */
+    while (!th->completed) {
+        os_time_dly(1);
+    }
+    if (th->pid) {
+        thread_kill(&th->pid, KILL_WAIT);
+    }
     free(th);
     return 0;
 }
