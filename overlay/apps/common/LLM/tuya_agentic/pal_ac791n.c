@@ -4,7 +4,7 @@
  * 把 agentic-kit 的 pal/pal.h 契约(14 个回调)桥接到 AC79 宿主 API。
  * TCP 部分基本照搬 pal/pal_freertos.c(同为 lwIP);mutex 用 FreeRTOS 递归信号量
  * (configUSE_RECURSIVE_MUTEXES=1,见 include_lib/system/os/FreeRTOS/FreeRTOSConfig.h);
- * thread 用 thread_fork + thread_kill(KILL_WAIT);time 用 sys_timer_get_ms()。
+ * thread 用 thread_fork + 协作式 join；time 用 sys_timer_get_ms()。
  *
  * 递归锁是硬要求:iot-client 的 DP schema 更新路径会重入锁(pal.h 注释、iot_dp.c),
  * 普通互斥锁会死锁。
@@ -209,8 +209,9 @@ static void ac_mutex_destroy(void *m)
 
 /* ------------------------------------------------------------------------- */
 /* 线程 —— thread_fork(void fn(void*)) + trampoline 桥接 PAL 的 void* fn(void*).
- * AC79 的 KILL_WAIT 只能等待任务自行退出；不能在任务仍运行时把它当 pthread_join
- * 调用，否则内核会持续打印 "thread can't kill"。                             */
+ * thread_fork 的入口函数返回后由 AC79 自行回收任务。KILL_WAIT 不是 pthread_join：
+ * 即便入口已置 completed，任务也可能尚未完成返回现场，调用它会反复打印
+ * "thread can't kill" 并阻塞移除后的 BLE 重启。                               */
 /* ------------------------------------------------------------------------- */
 typedef struct {
     void *(*fn)(void *);
@@ -218,7 +219,6 @@ typedef struct {
 } ac_thr_arg;
 
 typedef struct {
-    volatile int pid;
     volatile int completed; /* ac_thr_entry 已从 PAL 工作函数返回 */
     ac_thr_arg   a;
 } ac_thr_handle_t;
@@ -237,11 +237,10 @@ static int ac_thread_create(void **handle, void *(*func)(void *), void *arg)
     if (!th) return -1;
     th->a.fn  = func;
     th->a.arg = arg;
-    th->pid   = 0;
     th->completed = 0;
 
     /* stk_size 单位是 4 字节;6*1024 = 24KB(跑 mbedTLS 握手,不够再加)*/
-    int rc = thread_fork("tuya_pal", 4, 6 * 1024, 0, (int *)&th->pid, ac_thr_entry, th);
+    int rc = thread_fork("tuya_pal", 4, 6 * 1024, 0, NULL, ac_thr_entry, th);
     if (rc != 0) {
         free(th);
         return -1;
@@ -255,12 +254,10 @@ static int ac_thread_join(void *handle)
     if (!handle) return -1;
     ac_thr_handle_t *th = (ac_thr_handle_t *)handle;
     /* tai_disconnect 已先置 ctx->running=0，工作函数会在下一次轮询返回。
-     * 等 trampoline 确认返回后才让 AC79 回收任务；KILL_WAIT 不负责强杀活跃任务。 */
+     * 完成标记由入口写在最后一次访问 th 之后；随后只释放本适配层的句柄，
+     * 任务本体由 thread_fork 在入口返回时回收，绝不能再 KILL_WAIT。 */
     while (!th->completed) {
         os_time_dly(1);
-    }
-    if (th->pid) {
-        thread_kill(&th->pid, KILL_WAIT);
     }
     free(th);
     return 0;

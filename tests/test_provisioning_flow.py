@@ -82,8 +82,8 @@ class ProvisioningFlowTests(unittest.TestCase):
         self.assertIn("th->completed = 0", source)
         self.assertIn("while (!th->completed)", join)
         self.assertIn("os_time_dly(1)", join)
-        self.assertLess(join.index("while (!th->completed)"),
-                        join.index("thread_kill(&th->pid, KILL_WAIT)"))
+        self.assertIn('thread_fork("tuya_pal", 4, 6 * 1024, 0, NULL', source)
+        self.assertNotIn("thread_kill(", join)
 
     def test_ble_stop_never_calls_unpaired_official_module_exit(self) -> None:
         source = read(BLE)
