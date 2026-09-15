@@ -17,6 +17,10 @@
 #include "generic/circular_buf.h"
 #include "media/audio_effect.h"
 
+#ifdef CONFIG_TUYA_AGENTIC_ENABLE
+extern int tuya_agentic_provisioning_active(void);
+#endif
+
 #if (!defined CONFIG_DUI_SDK_ENABLE) && (!defined CONFIG_TVS_SDK_ENABLE)
 
 #ifdef CONFIG_NET_ENABLE
@@ -4969,7 +4973,6 @@ static int app_music_net_event_handler(struct net_event *event)
 #endif
 #ifdef CONFIG_TUYA_AGENTIC_ENABLE
                 /* DHCP 成功不等于 Tuya 云端激活/绑定成功；其余联网处理必须保留。 */
-                extern int tuya_agentic_provisioning_active(void);
                 if (!tuya_agentic_provisioning_active()) {
                     app_music_play_voice_prompt("NetCfgSucc.mp3", __this->dec_ops->dec_breakpoint);
                 }
@@ -4998,7 +5001,12 @@ static int app_music_net_event_handler(struct net_event *event)
             canceladdrinfo();
             __this->_net_dhcp_ready = 0;
 
-            if (__this->net_connected && !is_in_config_network_state() && !__this->reconnecting && __this->mode == NET_MUSIC_MODE) {
+            if (__this->net_connected && !is_in_config_network_state() && !__this->reconnecting && __this->mode == NET_MUSIC_MODE
+#ifdef CONFIG_TUYA_AGENTIC_ENABLE
+                /* 手机下发新 SSID 后的 STA 切换会产生一次预期断开，不能误报为网络异常。 */
+                && !tuya_agentic_provisioning_active()
+#endif
+               ) {
                 app_music_play_voice_prompt("NetDisc.mp3", NULL);
             }
             __this->net_connected = 0;

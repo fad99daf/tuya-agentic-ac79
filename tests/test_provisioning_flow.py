@@ -45,6 +45,15 @@ class ProvisioningFlowTests(unittest.TestCase):
         self.assertIn("tuya_agentic_provisioning_active()", block)
         self.assertIn("app_music_play_voice_prompt(\"NetCfgSucc.mp3\"", block)
 
+    def test_expected_wifi_handoff_does_not_announce_network_disconnection(self) -> None:
+        source = read(MUSIC)
+        disconnected = source.index("case NET_EVENT_DISCONNECTED:")
+        timeout = source.index("case NET_EVENT_SMP_CFG_TIMEOUT:", disconnected)
+        block = source[disconnected:timeout]
+        self.assertIn("tuya_agentic_provisioning_active()", block)
+        self.assertIn("!tuya_agentic_provisioning_active()", block)
+        self.assertIn("app_music_play_voice_prompt(\"NetDisc.mp3\"", block)
+
     def test_ble_stop_never_calls_unpaired_official_module_exit(self) -> None:
         source = read(BLE)
         stop = source[source.index("int tuya_ble_netcfg_stop(void)"):]
