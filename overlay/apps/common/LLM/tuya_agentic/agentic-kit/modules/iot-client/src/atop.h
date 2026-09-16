@@ -166,6 +166,14 @@ typedef struct {
 int atop_device_reset(const pal_t *pal, const device_reset_request_t *request);
 
 /**
+ * @brief Send, but do not wait for, `tuya.device.reset` v4.0.
+ *
+ * OPRT_OK means the complete HTTP request was handed to the transport; it
+ * does not indicate that the cloud accepted the device removal.
+ */
+int atop_device_reset_notify(const pal_t *pal, const device_reset_request_t *request);
+
+/**
  * @brief Get QR code info from Tuya cloud (tuya.device.qrcode.info.get)
  *
  * @param[in]  request  Request parameters (uuid, authkey, app_id, type)

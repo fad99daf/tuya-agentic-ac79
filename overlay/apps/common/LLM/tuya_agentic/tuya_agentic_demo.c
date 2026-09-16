@@ -130,9 +130,10 @@ static volatile int g_mqtt_ka_run;        /* MQTT 心跳线程运行标志:生�
  * 释放 iot/擦 VM/复位全部由 tuya_ai_run 这个唯一监督者完成。 */
 #define TUYA_CLOUD_RESET_NONE (-1)
 static volatile int s_cloud_reset_type = TUYA_CLOUD_RESET_NONE;
-/* K6 runs in app_music's key context, which neither owns iot_client_t nor may
- * perform TLS, VM I/O, MQTT teardown, or reboot.  It only sets this request;
- * tuya_ai_run serialises the cloud request and the existing reset state machine. */
+/* K6 runs in app_music's key context.  With a live iot client it only sets
+ * this request; tuya_ai_run serialises the best-effort cloud notification and
+ * the local reset state machine.  Before a client exists, K6 follows the
+ * standalone local path so an offline boot cannot make factory reset unusable. */
 static volatile int s_local_factory_reset_requested;
 static volatile int s_tuya_cloud_client_ready;
 static volatile int s_mqtt_ka_exited;
@@ -1417,6 +1418,24 @@ static void tuya_clear_invalid_provision_and_reset(void)
     tuya_cloud_reset_cpu_reboot();
 }
 
+/* Used only while no iot_client_t exists (for example, an offline boot that is
+ * blocked waiting for DHCP).  The K6 callback may use this self-contained path
+ * because there is no MQTT/process worker to serialise with. */
+static int tuya_local_factory_reset_without_client(void)
+{
+    printf("[TUYA] K6 local factory reset without cloud client\r\n");
+    if (!tuya_cloud_reset_write_marker(
+            tuya_cloud_reset_marker(IOT_RESET_REMOTE_FACTORY, 0))) {
+        printf("[TUYA] K6 local reset marker write failed; credentials retained\r\n");
+        return 0;
+    }
+    if (tuya_cloud_reset_clear_and_verify(IOT_RESET_REMOTE_FACTORY) != 0) {
+        printf("[TUYA] K6 local reset verification failed; reboot for recovery\r\n");
+    }
+    tuya_cloud_reset_cpu_reboot();
+    return 1;
+}
+
 /* Called before any client is constructed.  A power loss after the initial
  * marker write is therefore completed while no MQTT/AI worker exists. */
 static int tuya_cloud_reset_recover_if_needed(void)
@@ -2519,25 +2538,24 @@ static int tuya_cloud_reset_supervise(iot_client_t *iot)
  * writes. */
 static int tuya_local_factory_reset_supervise(iot_client_t *iot)
 {
-    int ret;
-
     if (!tuya_local_factory_reset_requested()) {
         return 0;
     }
 
-    ret = iot_client_factory_reset(iot);
     s_local_factory_reset_requested = 0;
-    if (ret != OPRT_OK) {
-        /* Never erase the identity when the cloud did not accept removal.
-         * The user may retry K6 after restoring network or correcting time. */
-        printf("[TUYA] K6 cloud device removal failed (%d); credentials retained\r\n", ret);
-        return 0;
+    if (wifi_tuya_network_is_ready()) {
+        /* This emits the signed tuya.device.reset request but intentionally
+         * does not receive or evaluate its result.  A local physical reset
+         * must remain available even if the AP, DNS, TLS or cloud is down. */
+        printf("[TUYA] K6 reset: sending cloud device-removal notification\r\n");
+        (void)iot_client_factory_reset_notify(iot);
+    } else {
+        printf("[TUYA] K6 reset: network offline; skipping cloud notification\r\n");
     }
 
-    printf("[TUYA] K6 cloud factory reset verified; clearing local state\r\n");
-    /* The cloud can also emit protocol 11 for this operation. Factory policy
-     * is intentional for the physical K6 path, so it wins over that callback's
-     * unbind/factory hint before the shared teardown starts. */
+    printf("[TUYA] K6 local factory reset: clearing local state\r\n");
+    /* The cloud can also emit protocol 11 for this operation.  Physical K6
+     * remains factory policy and does not wait for the notification response. */
     s_cloud_reset_type = IOT_RESET_REMOTE_FACTORY;
     return tuya_cloud_reset_supervise(iot);
 }
@@ -2569,16 +2587,11 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
             if (tuya_cloud_reset_supervise(iot)) return;
             continue;
         }
-        /* A K6 request needs a usable link for tuya.device.reset. Wait here
-         * instead of falling into an AI-session retry, and retain all local
-         * credentials if the link never returns. */
+        /* K6 never waits for a network recovery.  If online, the supervisor
+         * makes one send-only cloud notification; otherwise it immediately
+         * continues with the same local factory-reset state machine. */
         if (tuya_local_factory_reset_requested()) {
-            printf("[TUYA] K6 reset pending; waiting for cloud network\r\n");
-            while (!wifi_tuya_network_is_ready() && tuya_local_factory_reset_requested()) {
-                os_time_dly(100);
-            }
-            if (tuya_local_factory_reset_requested() &&
-                tuya_local_factory_reset_supervise(iot)) {
+            if (tuya_local_factory_reset_supervise(iot)) {
                 return;
             }
             continue;
@@ -3138,26 +3151,27 @@ void tuya_agentic_main(void *arg)
     printf("===== tuya_agentic_main end =====\r\n");
 }
 
-/* 长按 KEY_PHOTO(K6) 时由 app_music 调用。按键上下文不拥有 iot_client_t，
- * 因而绝不能直接做 HTTPS、VM 擦除或复位；它只请求 Agentic 主任务执行
- * tuya.device.reset。云端确认后才复用可恢复清除状态机，确保 App 先移除设备。
+/* 长按 KEY_PHOTO(K6) 时由 app_music 调用。存在 iot_client_t 时，按键任务
+ * 只请求 Agentic 主任务发送一次 tuya.device.reset 并复用可恢复清除状态机；
+ * 不等待云端响应。尚无 client（包括离线启动）时走独立本地路径，确保 K6
+ * 始终可以恢复出厂。
  * 板上 Reset/Update 是硬件键(固件读不到),电源键是自锁拨动开关(按不出长按),
  * 故重置入口放在 K6 长按(原本是空槽位)。*/
 void tuya_clear_provision_and_reset(void)
 {
-    if (!s_tuya_cloud_client_ready) {
-        /* An unbound device has no cloud identity to remove.  Do not recreate
-         * the App-residue bug by falling back to a blind local wipe. */
-        printf("[TUYA] K6 reset ignored: cloud identity is not ready\r\n");
-        return;
-    }
     if (s_local_factory_reset_requested) {
         printf("[TUYA] K6 reset already pending\r\n");
         return;
     }
     s_local_factory_reset_requested = 1;
     g_exit = 1;  /* make an active TAI session return to its supervisor */
-    printf("[TUYA] K6 reset: requesting cloud device removal\r\n");
+    if (!s_tuya_cloud_client_ready) {
+        if (!tuya_local_factory_reset_without_client()) {
+            s_local_factory_reset_requested = 0;
+        }
+        return;
+    }
+    printf("[TUYA] K6 reset queued\r\n");
 }
 
 /* boot 自启动:系统初始化后 fork tuya_agentic_main

@@ -32,7 +32,7 @@ static int32_t transport_send(NetworkContext_t *pNetworkContext,
 
     if (ctx->use_tls) {
         int r = tls_write(ctx->tls, (const uint8_t *)pBuffer,
-                          bytesToSend, 30000 /* 30s */);
+                          bytesToSend, ctx->timeout_ms);
         if (r != TLS_OK) {
             log_error("TLS write error");
             return OPRT_COMMUNICATION_ERROR;
@@ -289,7 +289,32 @@ http_client_status_t http_client_request(const http_client_request_t *request,
         .respFlags = 0
     };
 
-    // Send HTTP request
+    if (request->send_only) {
+        /* K6 factory reset must remain usable while the cloud is unreachable.
+         * Complete the TLS/HTTP write, but deliberately do not enter the
+         * response receive loop: the caller will immediately continue with
+         * its local reset policy regardless of the cloud's eventual result. */
+        http_status = HTTPClient_SendHttpHeaders(&transport,
+                                                 NULL,
+                                                 &request_headers,
+                                                 request->body_length,
+                                                 0);
+        if (http_status == HTTPSuccess && request->body_length > 0) {
+            http_status = HTTPClient_SendHttpData(&transport,
+                                                  NULL,
+                                                  request->body,
+                                                  request->body_length);
+        }
+        pal->free(http_buf);
+        disconnect(network_ctx);
+        if (http_status != HTTPSuccess) {
+            log_error("HTTP request send-only failed: %d", http_status);
+            return HTTP_CLIENT_ERROR;
+        }
+        return HTTP_CLIENT_SUCCESS;
+    }
+
+    // Send HTTP request and receive its response.
     http_status = HTTPClient_Send(&transport,
                                   &request_headers,
                                   request->body,

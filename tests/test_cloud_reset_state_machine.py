@@ -108,32 +108,49 @@ class CloudResetStateMachineTests(unittest.TestCase):
         self.assertIn("no devid, start BLE provisioning", main)
         self.assertNotIn("while (1) { ; }", main[main.index("void tuya_clear_provision_and_reset"):])
 
-    def test_local_factory_reset_requires_cloud_success_before_shared_teardown(self) -> None:
+    def test_local_factory_reset_is_available_without_a_cloud_response(self) -> None:
         header = read(HEADER)
         client = read(CLIENT)
         atop = read(ATOP)
         demo = read(DEMO)
+        http = read(ROOT / "overlay/apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/http_client_interface.c")
         k6 = demo[demo.rindex("void tuya_clear_provision_and_reset"):
                   demo.index("static int tuya_agentic_main_init")]
         supervisor = demo[demo.index("static int tuya_local_factory_reset_supervise"):
                           demo.index("static void tuya_ai_run")]
+        run = demo[demo.index("static void tuya_ai_run"):
+                   demo.index("/* 配网等待期循环播报")]
+        send_only = http[http.index("if (request->send_only)"):
+                         http.index("// Send HTTP request and receive its response.")]
 
         self.assertIn("iot_client_factory_reset", header)
+        self.assertIn("iot_client_factory_reset_notify", header)
         self.assertIn("device_reset_request_t request", client)
         self.assertIn("return atop_device_reset(client->pal, &request)", client)
+        self.assertIn("return atop_device_reset_notify(client->pal, &request)", client)
         self.assertIn('ATOP_DEVICE_RESET "tuya.device.reset"', atop)
         self.assertIn('.version = "4.0"', atop)
+        self.assertIn("atop_device_reset_notify", atop)
+        self.assertIn("send_only ? ATOP_DEVICE_RESET_NOTIFY_TIMEOUT_MS : 0", atop)
         self.assertIn("bool success = atop_response.success", atop)
         self.assertIn("if (!success)", atop)
         self.assertIn("s_local_factory_reset_requested = 1", k6)
         self.assertIn("g_exit = 1", k6)
         self.assertNotIn("syscfg_write", k6)
         self.assertNotIn("cpu_reset", k6)
-        self.assertLess(supervisor.index("iot_client_factory_reset(iot)"),
+        self.assertIn("tuya_local_factory_reset_without_client()", k6)
+        self.assertIn("wifi_tuya_network_is_ready()", supervisor)
+        self.assertIn("iot_client_factory_reset_notify(iot)", supervisor)
+        self.assertNotIn("iot_client_factory_reset(iot)", supervisor)
+        self.assertNotIn("if (ret != OPRT_OK)", supervisor)
+        self.assertLess(supervisor.index("iot_client_factory_reset_notify(iot)"),
                         supervisor.index("s_cloud_reset_type = IOT_RESET_REMOTE_FACTORY"))
         self.assertLess(supervisor.index("s_cloud_reset_type = IOT_RESET_REMOTE_FACTORY"),
                         supervisor.index("tuya_cloud_reset_supervise(iot)"))
-        self.assertIn("credentials retained", supervisor)
+        self.assertNotIn("waiting for cloud network", run)
+        self.assertIn("HTTPClient_SendHttpHeaders", send_only)
+        self.assertIn("HTTPClient_SendHttpData", send_only)
+        self.assertNotIn("HTTPClient_Send(&transport", send_only)
 
 
 if __name__ == "__main__":

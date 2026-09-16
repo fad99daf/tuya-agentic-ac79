@@ -573,10 +573,11 @@ static int atop_response_result_parse_cjson(const uint8_t *input, size_t ilen, a
                                                                        .path = path_buffer,
                                                                        .headers = headers,
                                                                        .headers_count = headers_count,
-                                                                       .body = body_buffer,
-                                                                       .body_length = body_length,
-                                                                       .timeout_ms = IOT_HTTP_TIMEOUT_MS_DEFAULT,
-                                                                       .pal = pal},
+                                                                        .body = body_buffer,
+                                                                        .body_length = body_length,
+                                                                        .timeout_ms = request->timeout_ms,
+                                                                        .send_only = request->send_only,
+                                                                        .pal = pal},
                                         &http_response);
 
       /* Release http buffer */

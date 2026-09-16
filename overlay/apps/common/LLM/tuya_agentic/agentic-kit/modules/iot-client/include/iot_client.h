@@ -280,6 +280,16 @@ IOT_API int iot_client_get_session_token(iot_client_t *client, const char *agent
 IOT_API int iot_client_factory_reset(iot_client_t *client);
 
 /**
+ * @brief Send a best-effort device-removal notification without awaiting its
+ * cloud response.
+ *
+ * OPRT_OK only means the signed HTTP request was handed to the transport; it
+ * is not cloud acceptance.  Callers that choose this availability-first mode
+ * must not make their local reset conditional on the return value.
+ */
+IOT_API int iot_client_factory_reset_notify(iot_client_t *client);
+
+/**
  * @brief Get CA certificate for a target host via IoT DNS service.
  *
  * @param client         Pointer to iot_client_t instance (must not be NULL)

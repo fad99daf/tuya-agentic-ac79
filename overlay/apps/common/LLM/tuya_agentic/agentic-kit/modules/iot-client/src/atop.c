@@ -374,10 +374,14 @@ int atop_device_meta_save(const pal_t *pal, const device_meta_save_request_t *re
 
 /* Local factory reset is a device-initiated cloud operation.  Keep it as a
  * named ATOP helper rather than exposing atop_base to applications, so every
- * caller uses the client identity, resolved endpoint, and success check. */
+ * caller uses the client identity and resolved endpoint; callers select either
+ * cloud-confirmed or send-only delivery explicitly. */
 #define ATOP_DEVICE_RESET "tuya.device.reset"
+#define ATOP_DEVICE_RESET_NOTIFY_TIMEOUT_MS 1000u
 
-int atop_device_reset(const pal_t *pal, const device_reset_request_t *request)
+static int atop_device_reset_request(const pal_t *pal,
+                                     const device_reset_request_t *request,
+                                     bool send_only)
 {
     if (pal == NULL || request == NULL || request->devid == NULL ||
         request->devid[0] == '\0' || request->key == NULL || request->key[0] == '\0') {
@@ -400,6 +404,8 @@ int atop_device_reset(const pal_t *pal, const device_reset_request_t *request)
         .timestamp = timestamp,
         .api = ATOP_DEVICE_RESET,
         .version = "4.0",
+        .send_only = send_only,
+        .timeout_ms = send_only ? ATOP_DEVICE_RESET_NOTIFY_TIMEOUT_MS : 0,
         .data = post_data,
         .datalen = (size_t)written,
         .host = request->host,
@@ -415,6 +421,13 @@ int atop_device_reset(const pal_t *pal, const device_reset_request_t *request)
         return ret;
     }
 
+    if (send_only) {
+        /* No response is received in this mode, so this cannot prove the
+         * cloud processed the reset.  The local K6 policy intentionally does
+         * not use the result as a prerequisite for factory reset. */
+        return OPRT_OK;
+    }
+
     bool success = atop_response.success;
     atop_base_response_free(pal, &atop_response);
     if (!success) {
@@ -422,6 +435,16 @@ int atop_device_reset(const pal_t *pal, const device_reset_request_t *request)
         return OPRT_COMMUNICATION_ERROR;
     }
     return OPRT_OK;
+}
+
+int atop_device_reset(const pal_t *pal, const device_reset_request_t *request)
+{
+    return atop_device_reset_request(pal, request, false);
+}
+
+int atop_device_reset_notify(const pal_t *pal, const device_reset_request_t *request)
+{
+    return atop_device_reset_request(pal, request, true);
 }
 
 /* ============================================================================
