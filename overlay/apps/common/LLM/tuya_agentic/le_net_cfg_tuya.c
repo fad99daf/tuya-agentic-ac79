@@ -291,10 +291,33 @@ int tuya_ble_netcfg_start(const char *device_name,
 
 void tuya_ble_netcfg_stop(void)
 {
+    struct ble_server_operation_t *ble_ops = NULL;
+
+    /* This module implements Wi-Fi provisioning only.  Once its caller has
+     * accepted the credentials, leaving the ATT link up lets Android select
+     * the bound-device BLE DP transport that this provisioning-only module
+     * intentionally does not implement.  Stop the current link so both App
+     * platforms use the existing MQTT DP path after provisioning. */
     s_stop_requested = 1;
     s_adv_restart_pending = 0;
     ble_user_cmd_prepare(BLE_CMD_ADV_ENABLE, 1, 0);
-    printf("[tuya_ble] stopped\r\n");
+
+    if (!s_ble_connected) {
+        printf("[tuya_ble] stopped: no active ATT link\r\n");
+        return;
+    }
+
+    /* Use the AC79 server operation rather than an unverified raw HCI command.
+     * The platform implementation owns the real connection handle and guards
+     * a duplicate disconnect while one is already pending. */
+    ble_get_server_operation_table(&ble_ops);
+    if (!ble_ops || !ble_ops->disconnect) {
+        printf("[tuya_ble][W] stopped: active link, disconnect op unavailable\r\n");
+        return;
+    }
+
+    printf("[tuya_ble] stopped: disconnect request ret=%d\r\n",
+           ble_ops->disconnect(NULL));
 }
 
 /* ---- worker 任务:替 btstack 任务(栈只有 4KB)跑 mbedTLS 加密 ---- */

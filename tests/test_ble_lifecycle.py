@@ -53,6 +53,15 @@ class BleLifecycleTests(unittest.TestCase):
         self.assertIn("s_stop_requested = 1", stop)
         self.assertIn("s_adv_restart_pending = 0", stop)
 
+    def test_stop_disconnects_the_active_provisioning_link_for_mqtt_handoff(self) -> None:
+        stop = self.source[self.source.index("void tuya_ble_netcfg_stop(void)"):]
+        self.assertIn("if (!s_ble_connected)", stop)
+        self.assertIn("ble_get_server_operation_table(&ble_ops)", stop)
+        self.assertIn("!ble_ops || !ble_ops->disconnect", stop)
+        self.assertIn("ble_ops->disconnect(NULL)", stop)
+        self.assertLess(stop.index("s_stop_requested = 1"),
+                        stop.index("ble_ops->disconnect(NULL)"))
+
 
 if __name__ == "__main__":
     unittest.main()
