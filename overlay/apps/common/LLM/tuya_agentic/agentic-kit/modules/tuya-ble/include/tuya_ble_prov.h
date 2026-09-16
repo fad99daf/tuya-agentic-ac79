@@ -21,6 +21,9 @@ extern "C" {
 #define TUYA_BLE_TX_BUF_SIZE        1024
 
 typedef int (*tuya_ble_hal_send_t)(const uint8_t *buf, uint16_t len, void *ctx);
+/* Called only after a KEY15 frame has passed AES/CRC validation.  The payload
+ * is the V4 DP KLV sequence (the five-byte V4 request prefix is stripped). */
+typedef int (*tuya_ble_dp_rx_cb_t)(const uint8_t *klv, uint16_t len, void *ctx);
 
 void tuya_ble_hal_random(uint8_t *buf, size_t len);
 
@@ -84,6 +87,14 @@ typedef struct {
     uint8_t key_11[16];
     bool paired;
 
+    /* Bound-device credentials.  They are copied from the activated client
+     * rather than reusing provisioning key_11/key_12. */
+    bool bound_session;
+    uint8_t login_key[16];
+    uint8_t sec_key[16];
+    tuya_ble_dp_rx_cb_t dp_rx_cb;
+    void *dp_rx_ctx;
+
     uint8_t trsmitr_seq;
     uint16_t peer_pkt_len;
     uint8_t rx_buf[TUYA_BLE_RX_BUF_SIZE];
@@ -105,6 +116,11 @@ void tuya_ble_prov_get_read_payload(const tuya_ble_prov_state_t *state,
                                      const uint8_t **adv_data, uint8_t *adv_len,
                                      const uint8_t **rsp_data, uint8_t *rsp_len);
 void tuya_ble_prov_set_paired(tuya_ble_prov_state_t *state, bool paired);
+int tuya_ble_prov_enable_bound_session(tuya_ble_prov_state_t *state,
+                                       const uint8_t login_key[16],
+                                       const uint8_t sec_key[16],
+                                       tuya_ble_dp_rx_cb_t dp_rx_cb,
+                                       void *dp_rx_ctx);
 
 #ifdef __cplusplus
 }

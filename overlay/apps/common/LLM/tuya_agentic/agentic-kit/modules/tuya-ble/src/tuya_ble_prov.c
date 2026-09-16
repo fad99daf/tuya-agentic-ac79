@@ -27,6 +27,7 @@ static void ble_prov_hexdump(const uint8_t *buf, size_t len)
 
 #define FRM_QRY_DEV_INFO_REQ         0x0000
 #define FRM_PAIR_REQ                 0x0001
+#define FRM_DP_CMD_SEND_V4            0x0027
 #define FRM_RPT_NET_STAT_REQ         0x001E
 #define FRM_DOWNLINK_TRANSPARENT_REQ 0x801B
 #define FRM_UPLINK_TRANSPARENT_REQ   0x801C
@@ -34,6 +35,8 @@ static void ble_prov_hexdump(const uint8_t *buf, size_t len)
 #define ENCRYPTION_MODE_NONE        0x00
 #define ENCRYPTION_MODE_KEY_11      0x0B
 #define ENCRYPTION_MODE_KEY_12      0x0C
+#define ENCRYPTION_MODE_KEY_14      0x0E
+#define ENCRYPTION_MODE_SESSION_KEY15 0x0F
 
 #define TUYA_BLE_PROTOCOL_VER_HI    0x04
 #define TUYA_BLE_PROTOCOL_VER_LO    0x04
@@ -115,6 +118,27 @@ static int generate_key_12(const uint8_t *key_11, const uint8_t *pair_rand,
     memcpy(buf, key_11, 16);
     memcpy(buf + 16, pair_rand, TUYA_BLE_PAIR_RAND_LEN);
     return md5_hash(buf, sizeof(buf), out_key);
+}
+
+/* Tuya BLE 4.4 bound-device keys.  This intentionally has no fallback to
+ * provisioning keys: KEY14 is MD5(local_key || seckey), while KEY15 also
+ * includes the fresh six-byte srand returned by device-info. */
+static int generate_bound_key(const tuya_ble_prov_state_t *state,
+                              uint8_t mode, uint8_t *out_key)
+{
+    uint8_t material[16 + 16 + TUYA_BLE_PAIR_RAND_LEN];
+    size_t len = 32;
+
+    if (!state->bound_session) return -1;
+    memcpy(material, state->login_key, 16);
+    memcpy(material + 16, state->sec_key, 16);
+    if (mode == ENCRYPTION_MODE_SESSION_KEY15) {
+        memcpy(material + len, state->pair_rand, TUYA_BLE_PAIR_RAND_LEN);
+        len += TUYA_BLE_PAIR_RAND_LEN;
+    } else if (mode != ENCRYPTION_MODE_KEY_14) {
+        return -1;
+    }
+    return md5_hash(material, len, out_key);
 }
 
 static int generate_register_key(const uint8_t *auth_key, const uint8_t *service_rand,
@@ -315,6 +339,11 @@ static int tuya_ble_send(tuya_ble_prov_state_t *state, uint16_t cmd,
         if (encrypt_mode == ENCRYPTION_MODE_KEY_11) {
             memcpy(iv, state->server_rand, 16);
             memcpy(enc_key, state->key_11, 16);
+        } else if (encrypt_mode == ENCRYPTION_MODE_KEY_14 ||
+                   encrypt_mode == ENCRYPTION_MODE_SESSION_KEY15) {
+            tuya_ble_hal_random(iv, sizeof(iv));
+            ret = generate_bound_key(state, encrypt_mode, enc_key);
+            if (ret != 0) return ret;
         } else {
             tuya_ble_hal_random(iv, 16);
             if (encrypt_mode == ENCRYPTION_MODE_KEY_12) {
@@ -357,7 +386,8 @@ static int tuya_ble_send(tuya_ble_prov_state_t *state, uint16_t cmd,
     return rc;
 }
 
-static void handle_dev_info_req(tuya_ble_prov_state_t *state, const uint8_t *data, uint16_t data_len)
+static void handle_dev_info_req(tuya_ble_prov_state_t *state, const uint8_t *data,
+                                uint16_t data_len, uint8_t encrypt_mode)
 {
     TUYA_BLE_HAL_LOGI("[PROTO] FRM_QRY_DEV_INFO_REQ, data_len=%d", data_len);
 
@@ -375,7 +405,7 @@ static void handle_dev_info_req(tuya_ble_prov_state_t *state, const uint8_t *dat
     resp[2] = TUYA_BLE_PROTOCOL_VER_HI;
     resp[3] = TUYA_BLE_PROTOCOL_VER_LO;
     resp[4] = 0x05;
-    resp[5] = 0x00;
+    resp[5] = state->bound_session ? 0x01 : 0x00;
     memcpy(&resp[6], state->pair_rand, TUYA_BLE_PAIR_RAND_LEN);
 
     int reg_key_ret = generate_register_key((const uint8_t *)state->cfg.auth_key,
@@ -411,10 +441,13 @@ static void handle_dev_info_req(tuya_ble_prov_state_t *state, const uint8_t *dat
 
     TUYA_BLE_HAL_LOGI("[PROTO] DevInfo response, %d bytes", payload_len);
     TUYA_BLE_HAL_HEXDUMP(resp, payload_len);
-    tuya_ble_send(state, FRM_QRY_DEV_INFO_REQ, resp, payload_len, ENCRYPTION_MODE_KEY_11);
+    (void)encrypt_mode;
+    tuya_ble_send(state, FRM_QRY_DEV_INFO_REQ, resp, payload_len,
+                  state->bound_session ? ENCRYPTION_MODE_KEY_14 : ENCRYPTION_MODE_KEY_11);
 }
 
-static void handle_pair_req(tuya_ble_prov_state_t *state, const uint8_t *data, uint16_t data_len)
+static void handle_pair_req(tuya_ble_prov_state_t *state, const uint8_t *data,
+                            uint16_t data_len, uint8_t encrypt_mode)
 {
     TUYA_BLE_HAL_LOGI("[PROTO] FRM_PAIR_REQ, data_len=%d", data_len);
     if (data_len > 0) {
@@ -437,11 +470,13 @@ static void handle_pair_req(tuya_ble_prov_state_t *state, const uint8_t *data, u
     }
 
     uint8_t resp[1] = {result};
-    tuya_ble_send(state, FRM_PAIR_REQ, resp, 1, ENCRYPTION_MODE_KEY_12);
+    tuya_ble_send(state, FRM_PAIR_REQ, resp, 1,
+                  state->bound_session ? encrypt_mode : ENCRYPTION_MODE_KEY_12);
 
     if (state->paired) {
         uint8_t net_stat = 0x00;
-        tuya_ble_send(state, FRM_RPT_NET_STAT_REQ, &net_stat, 1, ENCRYPTION_MODE_KEY_12);
+        tuya_ble_send(state, FRM_RPT_NET_STAT_REQ, &net_stat, 1,
+                      state->bound_session ? ENCRYPTION_MODE_SESSION_KEY15 : ENCRYPTION_MODE_KEY_12);
     }
 }
 
@@ -586,6 +621,11 @@ static void tuya_ble_recv(tuya_ble_prov_state_t *state, const uint8_t *packet, u
         } else if (encrypt_mode == ENCRYPTION_MODE_KEY_12) {
             ret = generate_key_12(state->key_11, state->pair_rand, dec_key);
             if (ret != 0) return;
+        } else if ((encrypt_mode == ENCRYPTION_MODE_KEY_14 ||
+                    encrypt_mode == ENCRYPTION_MODE_SESSION_KEY15) &&
+                   state->bound_session) {
+            ret = generate_bound_key(state, encrypt_mode, dec_key);
+            if (ret != 0) return;
         } else {
             TUYA_BLE_HAL_LOGW("[RX] Unsupported encrypt_mode=0x%02X", encrypt_mode);
             return;
@@ -645,13 +685,39 @@ static void tuya_ble_recv(tuya_ble_prov_state_t *state, const uint8_t *packet, u
 
     switch (cmd) {
     case FRM_QRY_DEV_INFO_REQ:
-        handle_dev_info_req(state, data, data_len);
+        handle_dev_info_req(state, data, data_len, encrypt_mode);
         break;
     case FRM_PAIR_REQ:
-        handle_pair_req(state, data, data_len);
+        handle_pair_req(state, data, data_len, encrypt_mode);
         break;
     case FRM_DOWNLINK_TRANSPARENT_REQ:
         handle_wifi_config(state, data, data_len);
+        break;
+    case FRM_DP_CMD_SEND_V4:
+        if (!state->bound_session || encrypt_mode != ENCRYPTION_MODE_SESSION_KEY15 || data_len < 5) {
+            TUYA_BLE_HAL_LOGW("[DP] reject: bound=%d mode=0x%02X data_len=%u",
+                              state->bound_session, encrypt_mode, data_len);
+            break;
+        }
+        /* Protocol V4 ACK is version + request SN + result code.  ACK before
+         * app dispatch matches the Tuya BLE SDK and prevents mobile retries
+         * while the application callback runs. */
+        {
+            uint8_t ack[6];
+            memcpy(ack, data, 5);
+            ack[5] = 0;
+            if (tuya_ble_send(state, FRM_DP_CMD_SEND_V4, ack, sizeof(ack),
+                              ENCRYPTION_MODE_SESSION_KEY15) != 0) {
+                TUYA_BLE_HAL_LOGE("[DP] ACK notify failed");
+                break;
+            }
+        }
+        if (!state->dp_rx_cb) {
+            TUYA_BLE_HAL_LOGW("[DP] no application bridge");
+            break;
+        }
+        ret = state->dp_rx_cb(data + 5, data_len - 5, state->dp_rx_ctx);
+        TUYA_BLE_HAL_LOGI("[DP] V4 dispatch ret=%d", ret);
         break;
     default:
         TUYA_BLE_HAL_LOGW("[RX] Unhandled CMD=0x%04X", cmd);
@@ -833,4 +899,22 @@ void tuya_ble_prov_get_read_payload(const tuya_ble_prov_state_t *state,
 void tuya_ble_prov_set_paired(tuya_ble_prov_state_t *state, bool paired)
 {
     if (state) state->paired = paired;
+}
+
+int tuya_ble_prov_enable_bound_session(tuya_ble_prov_state_t *state,
+                                       const uint8_t login_key[16],
+                                       const uint8_t sec_key[16],
+                                       tuya_ble_dp_rx_cb_t dp_rx_cb,
+                                       void *dp_rx_ctx)
+{
+    if (!state || !login_key || !sec_key || !dp_rx_cb) return -1;
+    memcpy(state->login_key, login_key, sizeof(state->login_key));
+    memcpy(state->sec_key, sec_key, sizeof(state->sec_key));
+    state->dp_rx_cb = dp_rx_cb;
+    state->dp_rx_ctx = dp_rx_ctx;
+    state->bound_session = true;
+    /* A bound device must pair again after every new ATT connection; the
+     * session key is then derived from the new device-info srand. */
+    state->paired = false;
+    return 0;
 }

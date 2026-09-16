@@ -3025,6 +3025,10 @@ void tuya_agentic_main(void *arg)
                 /* 若 check_update 未拉到 schema(version 门控/云端无更新),
                  * 当前 loose 模式会吞掉所有 DP 下行。打印状态辅助排查。*/
             }
+            printf("[TUYA] starting bound BLE DP transport...\r\n");
+            printf("[TUYA] bound BLE DP start ret=%d\r\n",
+                   tuya_ble_bound_session_start("TUYA", TUYA_PRODUCT_KEY, TUYA_UUID,
+                                                TUYA_AUTH_KEY, iot));
             tuya_ai_run(pal, iot, localkey);
         }
         else { printf("[TUYA] iot_client_init fail\r\n"); }
@@ -3145,6 +3149,11 @@ void tuya_agentic_main(void *arg)
         iot_dp_set_callback(iot, (iot_dp_callback_t)on_dp_downlink, NULL);
         printf("[TUYA] DP callback registered (provisioning path)\r\n");
     }
+
+    printf("[TUYA] starting bound BLE DP transport...\r\n");
+    printf("[TUYA] bound BLE DP start ret=%d\r\n",
+           tuya_ble_bound_session_start("TUYA", TUYA_PRODUCT_KEY, TUYA_UUID,
+                                        TUYA_AUTH_KEY, iot));
 
     /* ---- 连 AI ---- */
     tuya_ai_run(pal, iot, lk);

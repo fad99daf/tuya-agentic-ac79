@@ -110,6 +110,17 @@ class BleProvisioningProtocolTests(unittest.TestCase):
         self.assertNotIn("TUYA_BLE_HAL_HEXDUMP(packet", receive)
         self.assertNotIn("TUYA_BLE_HAL_HEXDUMP(frame", receive)
 
+    def test_bound_key15_dp_path_is_distinct_from_provisioning(self) -> None:
+        source = BLE_PROV.read_text(encoding="utf-8")
+        receive = source[source.index("static void tuya_ble_recv") : source.index("static void build_adv_data")]
+        self.assertIn("ENCRYPTION_MODE_KEY_14", source)
+        self.assertIn("ENCRYPTION_MODE_SESSION_KEY15", source)
+        self.assertIn("generate_bound_key", source)
+        self.assertIn("FRM_DP_CMD_SEND_V4", receive)
+        self.assertIn("data + 5, data_len - 5", receive)
+        self.assertIn("tuya_ble_send(state, FRM_DP_CMD_SEND_V4", receive)
+        self.assertIn("tuya_ble_prov_enable_bound_session", source)
+
 
 if __name__ == "__main__":
     unittest.main()

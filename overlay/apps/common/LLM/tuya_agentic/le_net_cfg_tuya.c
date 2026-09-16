@@ -20,6 +20,17 @@
 
 #include "le_net_cfg_tuya.h"          /* profile_data + handle 宏 + 对外 API */
 #include "tuya_ble_prov.h"            /* agentic-kit 涂鸦配网协议 */
+#include "iot_client.h"
+#include "cJSON.h"
+#include "mbedtls/base64.h"
+
+#include <stdlib.h>
+
+/* This is deliberately the same ingress used by MQTT after its transport
+ * decryption.  The BLE transport has already authenticated KEY15 and turns
+ * the KLV payload into a protocol-5 envelope below. */
+extern bool iot_dp_dispatch_downlink(iot_client_t *client, const char *topic,
+                                     size_t topic_len, const uint8_t *bytes, size_t len);
 
 /* AC79 BLE 事件/adv 相关宏(le_net_cfg.c 里用的,这里引用)*/
 #ifndef HCI_EVENT_PACKET
@@ -51,10 +62,126 @@ static volatile u8  s_prov_done = 0;           /* 已拿到 {ssid,password,token
 static volatile u8  s_stop_requested = 0;      /* 主动 stop 时禁止断链后重开广播 */
 static volatile u8  s_ble_connected = 0;       /* 由杰理官方 BLE 状态回调维护 */
 static volatile u8  s_adv_restart_pending = 0; /* 交给 worker 在 HCI 回调退出后恢复广播 */
+static volatile u8  s_bound_session_active = 0;
+static volatile u8  s_profile_initialized = 0;
 static tuya_prov_result_cb_t s_user_cb = NULL;
 static OS_SEM s_prov_sem;                      /* 配网完成信号(阻塞 tuya_ble_netcfg_start)*/
 
 #define TUYA_BLE_RESTART_DELAY_MS  20u
+
+#define TUYA_DP_T_RAW    0
+#define TUYA_DP_T_BOOL   1
+#define TUYA_DP_T_VALUE  2
+#define TUYA_DP_T_STRING 3
+#define TUYA_DP_T_ENUM   4
+#define TUYA_DP_T_BITMAP 5
+
+/* Translate the official BLE V4 KLV payload to the existing protocol-5 DP
+ * ingress.  It keeps schema validation and the established application DP
+ * callback identical for BLE and MQTT. */
+static int tuya_ble_dp_to_app(const uint8_t *klv, uint16_t len, void *ctx)
+{
+    iot_client_t *iot = (iot_client_t *)ctx;
+    cJSON *root = NULL, *data = NULL, *dps = NULL;
+    char *json = NULL;
+    uint16_t off = 0;
+    int ret = -1;
+
+    if (!iot || !klv || !len) return -1;
+    root = cJSON_CreateObject();
+    data = cJSON_CreateObject();
+    dps = cJSON_CreateObject();
+    if (!root || !data || !dps || !cJSON_AddNumberToObject(root, "protocol", 5) ||
+        !cJSON_AddItemToObject(root, "data", data) || !cJSON_AddItemToObject(data, "dps", dps)) {
+        goto out;
+    }
+    /* Ownership transfers to root after AddItemToObject. */
+    data = NULL;
+    dps = NULL;
+
+    while (off < len) {
+        uint8_t id, type;
+        uint16_t value_len;
+        char id_text[4];
+        const uint8_t *value;
+        cJSON *item = NULL;
+
+        if (len - off < 4) goto out;
+        id = klv[off++];
+        type = klv[off++];
+        value_len = ((uint16_t)klv[off] << 8) | klv[off + 1];
+        off += 2;
+        if (value_len > len - off) goto out;
+        value = klv + off;
+        off += value_len;
+        snprintf(id_text, sizeof(id_text), "%u", id);
+
+        switch (type) {
+        case TUYA_DP_T_BOOL:
+            if (value_len != 1) goto out;
+            item = cJSON_CreateBool(value[0] != 0);
+            break;
+        case TUYA_DP_T_VALUE:
+        case TUYA_DP_T_BITMAP:
+            if (value_len != 4) goto out;
+            item = cJSON_CreateNumber((double)((int32_t)((uint32_t)value[0] << 24 |
+                                                          (uint32_t)value[1] << 16 |
+                                                          (uint32_t)value[2] << 8 | value[3])));
+            break;
+        case TUYA_DP_T_ENUM: {
+            uint32_t v = 0;
+            if (value_len == 0 || value_len > 4) goto out;
+            for (uint16_t i = 0; i < value_len; i++) v = (v << 8) | value[i];
+            item = cJSON_CreateNumber((double)v);
+            break;
+        }
+        case TUYA_DP_T_STRING: {
+            char *str = malloc(value_len + 1);
+            if (!str) goto out;
+            memcpy(str, value, value_len);
+            str[value_len] = '\0';
+            item = cJSON_CreateString(str);
+            free(str);
+            break;
+        }
+        case TUYA_DP_T_RAW: {
+            size_t encoded_len = 0;
+            char *encoded = malloc(((size_t)value_len + 2) / 3 * 4 + 1);
+            if (!encoded || mbedtls_base64_encode((unsigned char *)encoded,
+                                                  ((size_t)value_len + 2) / 3 * 4 + 1,
+                                                  &encoded_len, value, value_len) != 0) {
+                if (encoded) free(encoded);
+                goto out;
+            }
+            encoded[encoded_len] = '\0';
+            item = cJSON_CreateString(encoded);
+            free(encoded);
+            break;
+        }
+        default:
+            printf("[tuya_ble][DP] unsupported KLV type=%u id=%u\r\n", type, id);
+            goto out;
+        }
+        if (!item || !cJSON_AddItemToObject(cJSON_GetObjectItem(cJSON_GetObjectItem(root, "data"), "dps"),
+                                             id_text, item)) {
+            if (item) cJSON_Delete(item);
+            goto out;
+        }
+    }
+
+    json = cJSON_PrintUnformatted(root);
+    if (!json) goto out;
+    ret = iot_dp_dispatch_downlink(iot, "ble", 3, (const uint8_t *)json, strlen(json)) ? 0 : -1;
+    printf("[tuya_ble][DP] KLV=%u dispatch=%d\r\n", len, ret);
+out:
+    if (json) cJSON_free(json);
+    if (root) cJSON_Delete(root);
+    else {
+        if (dps) cJSON_Delete(dps);
+        if (data) cJSON_Delete(data);
+    }
+    return ret;
+}
 
 static ble_cmd_ret_e tuya_ble_adv_enable_with_retry(u8 enable)
 {
@@ -184,7 +311,7 @@ static void tuya_ble_state_cb(void *priv, ble_state_e state)
         s_con_handle = 0;
         s_notify_enabled = 0;
         tuya_ble_prov_set_paired(&s_prov, false);
-        if (!s_stop_requested && !s_prov_done) {
+        if (!s_stop_requested && (!s_prov_done || s_bound_session_active)) {
             /* 不在 BT/HCI 回调内改广播数据：先让官方断链处理退出。 */
             s_adv_restart_pending = 1;
             os_taskq_post("tuya_prov_w", 0);
@@ -221,6 +348,7 @@ static int tuya_ble_profile_init(void)
     /* wifi_story_machine 启动时已做过的(sm_init / le_device_db_init / hci_event_callback_set /
      * le_l2cap_register_packet_handler)不能重复调,否则 ASSERT("sm init again")崩溃。
      * 这里只做:使用官方状态通道、换 GATT profile、注册 ATT 回调。*/
+    if (s_profile_initialized) return 0;
     ble_get_server_operation_table(&ble_ops);
     if (!ble_ops || !ble_ops->regist_state_cbk) {
         printf("[tuya_ble] official BLE operations unavailable\r\n");
@@ -233,6 +361,7 @@ static int tuya_ble_profile_init(void)
     }
     att_server_init(profile_data, tuya_att_read, tuya_att_write);
     att_server_register_packet_handler(tuya_pkt_handler);
+    s_profile_initialized = 1;
     return 0;
 }
 
@@ -248,6 +377,7 @@ int tuya_ble_netcfg_start(const char *device_name,
     printf("[tuya_ble] netcfg start: name=%s pid=%s uuid=%s\r\n", device_name, product_key, uuid);
     s_user_cb = cb;
     s_prov_done = 0;
+    s_bound_session_active = 0;
     s_stop_requested = 0;
     s_ble_connected = 0;
     s_adv_restart_pending = 0;
@@ -291,33 +421,54 @@ int tuya_ble_netcfg_start(const char *device_name,
 
 void tuya_ble_netcfg_stop(void)
 {
-    struct ble_server_operation_t *ble_ops = NULL;
-
-    /* This module implements Wi-Fi provisioning only.  Once its caller has
-     * accepted the credentials, leaving the ATT link up lets Android select
-     * the bound-device BLE DP transport that this provisioning-only module
-     * intentionally does not implement.  Stop the current link so both App
-     * platforms use the existing MQTT DP path after provisioning. */
+    /* Stop provisioning advertisements while Wi-Fi activation is in flight.
+     * Do not tear down an existing ATT connection: after activation it becomes
+     * the bound-device KEY15 DP transport. */
     s_stop_requested = 1;
     s_adv_restart_pending = 0;
     ble_user_cmd_prepare(BLE_CMD_ADV_ENABLE, 1, 0);
+    printf("[tuya_ble] provisioning advertising stopped; ATT retained=%u\r\n",
+           s_ble_connected);
+}
 
-    if (!s_ble_connected) {
-        printf("[tuya_ble] stopped: no active ATT link\r\n");
-        return;
+int tuya_ble_bound_session_start(const char *device_name,
+                                 const char *product_key,
+                                 const char *uuid,
+                                 const char *auth_key,
+                                 const void *iot_client)
+{
+    const iot_client_t *iot = (const iot_client_t *)iot_client;
+    tuya_ble_prov_cfg_ext_t cfg;
+
+    if (!device_name || !product_key || !uuid || !auth_key || !iot ||
+        !iot->local_key[0] || !iot->secret_key[0]) return -1;
+
+    /* On first boot no provisioning profile exists; after activation reuse the
+     * live GATT connection but replace the provisioning key state. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.device_name = device_name;
+    cfg.product_key = product_key;
+    cfg.uuid = uuid;
+    cfg.auth_key = auth_key;
+    cfg.cb = prov_complete_cb;
+    cfg.send_fn = tuya_hal_send;
+    if (tuya_ble_prov_init(&s_prov, &cfg) != 0 ||
+        tuya_ble_prov_enable_bound_session(&s_prov,
+                                           (const uint8_t *)iot->local_key,
+                                           (const uint8_t *)iot->secret_key,
+                                           tuya_ble_dp_to_app, (void *)iot) != 0) {
+        printf("[tuya_ble][DP] bound session init failed\r\n");
+        return -2;
     }
+    if (tuya_ble_profile_init() != 0) return -3;
 
-    /* Use the AC79 server operation rather than an unverified raw HCI command.
-     * The platform implementation owns the real connection handle and guards
-     * a duplicate disconnect while one is already pending. */
-    ble_get_server_operation_table(&ble_ops);
-    if (!ble_ops || !ble_ops->disconnect) {
-        printf("[tuya_ble][W] stopped: active link, disconnect op unavailable\r\n");
-        return;
-    }
-
-    printf("[tuya_ble] stopped: disconnect request ret=%d\r\n",
-           ble_ops->disconnect(NULL));
+    s_prov_done = 1;
+    s_stop_requested = 0;
+    s_bound_session_active = 1;
+    tuya_make_adv();
+    ble_user_cmd_prepare(BLE_CMD_ADV_ENABLE, 1, 1);
+    printf("[tuya_ble][DP] bound session advertising enabled\r\n");
+    return 0;
 }
 
 /* ---- worker 任务:替 btstack 任务(栈只有 4KB)跑 mbedTLS 加密 ---- */
@@ -340,7 +491,7 @@ static void tuya_ble_prov_worker_task(void *arg)
             s_adv_restart_pending = 0;
             /* 给官方 HCI 断链收尾留出时间，再恢复 Tuya 的广播数据。 */
             msleep(TUYA_BLE_RESTART_DELAY_MS);
-            if (!s_stop_requested && !s_prov_done && !s_ble_connected) {
+            if (!s_stop_requested && (!s_prov_done || s_bound_session_active) && !s_ble_connected) {
                 ret = tuya_ble_adv_enable_with_retry(0);
                 if (ret == BLE_CMD_RET_SUCESS) {
                     tuya_make_adv();

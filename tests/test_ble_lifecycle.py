@@ -35,7 +35,7 @@ class BleLifecycleTests(unittest.TestCase):
         self.assertIn("s_ble_connected = 0", self.callback)
 
     def test_disconnect_only_schedules_advertising_recovery(self) -> None:
-        self.assertIn("!s_stop_requested && !s_prov_done", self.callback)
+        self.assertIn("!s_stop_requested && (!s_prov_done || s_bound_session_active)", self.callback)
         self.assertIn("s_adv_restart_pending = 1", self.callback)
         self.assertIn('os_taskq_post("tuya_prov_w", 0)', self.callback)
         self.assertNotIn("msleep(", self.callback)
@@ -44,7 +44,7 @@ class BleLifecycleTests(unittest.TestCase):
     def test_worker_recovers_tuya_advertising_after_callback_returns(self) -> None:
         self.assertIn("if (s_adv_restart_pending)", self.worker)
         self.assertIn("msleep(TUYA_BLE_RESTART_DELAY_MS)", self.worker)
-        self.assertIn("!s_stop_requested && !s_prov_done && !s_ble_connected", self.worker)
+        self.assertIn("!s_stop_requested && (!s_prov_done || s_bound_session_active) && !s_ble_connected", self.worker)
         self.assertIn("tuya_make_adv();", self.worker)
         self.assertIn("tuya_ble_adv_enable_with_retry(1)", self.worker)
 
@@ -53,14 +53,17 @@ class BleLifecycleTests(unittest.TestCase):
         self.assertIn("s_stop_requested = 1", stop)
         self.assertIn("s_adv_restart_pending = 0", stop)
 
-    def test_stop_disconnects_the_active_provisioning_link_for_mqtt_handoff(self) -> None:
+    def test_stop_preserves_the_att_link_until_bound_session_is_ready(self) -> None:
         stop = self.source[self.source.index("void tuya_ble_netcfg_stop(void)"):]
-        self.assertIn("if (!s_ble_connected)", stop)
-        self.assertIn("ble_get_server_operation_table(&ble_ops)", stop)
-        self.assertIn("!ble_ops || !ble_ops->disconnect", stop)
-        self.assertIn("ble_ops->disconnect(NULL)", stop)
-        self.assertLess(stop.index("s_stop_requested = 1"),
-                        stop.index("ble_ops->disconnect(NULL)"))
+        self.assertIn("ATT retained", stop)
+        self.assertNotIn("->disconnect(", stop)
+
+    def test_bound_session_is_started_with_activated_credentials(self) -> None:
+        self.assertIn("int tuya_ble_bound_session_start", self.source)
+        self.assertIn("iot->local_key", self.source)
+        self.assertIn("iot->secret_key", self.source)
+        self.assertIn("tuya_ble_prov_enable_bound_session", self.source)
+        self.assertIn("tuya_ble_dp_to_app", self.source)
 
 
 if __name__ == "__main__":

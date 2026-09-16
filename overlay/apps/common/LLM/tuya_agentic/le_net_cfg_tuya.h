@@ -78,6 +78,16 @@ int tuya_ble_netcfg_start(const char *device_name,
 /* 停止 BLE、释放蓝牙内存(配网成功、连上 WiFi 后调,腾出 RAM 给 TLS/AI)*/
 void tuya_ble_netcfg_stop(void);
 
+/* Start/restart the post-activation BLE transport.  @p iot_client points to
+ * the live iot_client_t and supplies the activated local_key/seckey used by
+ * Tuya BLE KEY14/KEY15.  It is intentionally void* here so this board GATT
+ * header does not expose the agentic-kit client type to unrelated users. */
+int tuya_ble_bound_session_start(const char *device_name,
+                                 const char *product_key,
+                                 const char *uuid,
+                                 const char *auth_key,
+                                 const void *iot_client);
+
 #ifdef __cplusplus
 }
 #endif
