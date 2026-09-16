@@ -151,6 +151,11 @@ class CloudResetStateMachineTests(unittest.TestCase):
         self.assertIn("HTTPClient_SendHttpHeaders", send_only)
         self.assertIn("HTTPClient_SendHttpData", send_only)
         self.assertNotIn("HTTPClient_Send(&transport", send_only)
+        self.assertIn("static uint32_t http_client_get_timestamp_ms(void)", http)
+        self.assertIn("return (uint32_t)timer_get_ms()", http)
+        self.assertNotIn("HTTPClient_SendHttpHeaders(&transport,\n                                                  NULL,", send_only)
+        self.assertNotIn("HTTPClient_SendHttpData(&transport,\n                                                   NULL,", send_only)
+        self.assertEqual(send_only.count("http_client_get_timestamp_ms"), 2)
 
 
 if __name__ == "__main__":

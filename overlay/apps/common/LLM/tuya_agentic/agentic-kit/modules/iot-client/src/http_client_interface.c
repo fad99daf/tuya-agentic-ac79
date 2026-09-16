@@ -6,6 +6,19 @@
 #include <string.h>
 #include <stdio.h>
 
+/* coreHTTP's split send APIs invoke this callback unconditionally.  The normal
+ * HTTPClient_Send() path substitutes its private zero-timestamp callback when
+ * HTTPResponse_t.getTime is NULL, but SendHttpHeaders()/SendHttpData() do not.
+ * The physical K6 notification deliberately uses those split APIs so it can
+ * skip receiving a response.  AC79 exposes timer_get_ms() as the monotonic
+ * millisecond clock (also used by the Agentic demo); provide it explicitly to
+ * keep the write-only path from jumping through a NULL function pointer. */
+extern unsigned int timer_get_ms(void);
+static uint32_t http_client_get_timestamp_ms(void)
+{
+    return (uint32_t)timer_get_ms();
+}
+
 // Shared TLS transport (mbedTLS lives entirely inside common/tls).
 #include "tls.h"
 
@@ -295,15 +308,15 @@ http_client_status_t http_client_request(const http_client_request_t *request,
          * response receive loop: the caller will immediately continue with
          * its local reset policy regardless of the cloud's eventual result. */
         http_status = HTTPClient_SendHttpHeaders(&transport,
-                                                 NULL,
-                                                 &request_headers,
-                                                 request->body_length,
-                                                 0);
+                                                  http_client_get_timestamp_ms,
+                                                  &request_headers,
+                                                  request->body_length,
+                                                  0);
         if (http_status == HTTPSuccess && request->body_length > 0) {
             http_status = HTTPClient_SendHttpData(&transport,
-                                                  NULL,
-                                                  request->body,
-                                                  request->body_length);
+                                                   http_client_get_timestamp_ms,
+                                                   request->body,
+                                                   request->body_length);
         }
         pal->free(http_buf);
         disconnect(network_ctx);
