@@ -31,6 +31,9 @@ typedef struct {
     const uint8_t *body;
     size_t body_length;
     uint32_t timeout_ms;
+    /* Send headers and body, then close without receiving or parsing a reply.
+     * This is an explicitly best-effort delivery mode, not a success result. */
+    bool send_only;
     const pal_t *pal;
 } http_client_request_t;
 

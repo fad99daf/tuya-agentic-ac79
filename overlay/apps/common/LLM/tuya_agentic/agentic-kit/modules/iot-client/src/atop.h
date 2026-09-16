@@ -147,6 +147,33 @@ typedef struct {
 int atop_device_meta_save(const pal_t *pal, const device_meta_save_request_t *request, device_meta_save_response_t *response);
 
 /**
+ * @brief Parameters for a locally initiated cloud factory reset.
+ */
+typedef struct {
+    const char *devid;
+    const char *key;
+    const char *host;
+    uint16_t port;
+    const char *cacert;
+    tls_cert_bundle_attach_fn cert_bundle_attach;
+} device_reset_request_t;
+
+/**
+ * @brief Request device removal with ATOP `tuya.device.reset` v4.0.
+ *
+ * Returns OPRT_OK only when the ATOP response has `success: true`.
+ */
+int atop_device_reset(const pal_t *pal, const device_reset_request_t *request);
+
+/**
+ * @brief Send, but do not wait for, `tuya.device.reset` v4.0.
+ *
+ * OPRT_OK means the complete HTTP request was handed to the transport; it
+ * does not indicate that the cloud accepted the device removal.
+ */
+int atop_device_reset_notify(const pal_t *pal, const device_reset_request_t *request);
+
+/**
  * @brief Get QR code info from Tuya cloud (tuya.device.qrcode.info.get)
  *
  * @param[in]  request  Request parameters (uuid, authkey, app_id, type)

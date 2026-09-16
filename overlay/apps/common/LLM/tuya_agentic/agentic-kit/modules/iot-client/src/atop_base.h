@@ -35,6 +35,10 @@
      const char *uuid;
      const char *devid;
      uint32_t timestamp;
+     /* Non-zero sends the signed request but deliberately does not await the
+      * HTTP response.  It is suitable only for best-effort notifications. */
+     bool send_only;
+     uint32_t timeout_ms;
      void *data;
      size_t datalen;
      const void *user_data;

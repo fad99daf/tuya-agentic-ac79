@@ -527,6 +527,48 @@ IOT_API int iot_client_get_session_token(iot_client_t *client, const char *agent
     return OPRT_OK;
 }
 
+IOT_API int iot_client_factory_reset(iot_client_t *client)
+{
+    if (client == NULL || client->devid[0] == '\0' || client->secret_key[0] == '\0') {
+        log_error("iot_client_factory_reset: client identity is unavailable");
+        return OPRT_INVALID_PARAMETER;
+    }
+
+    char host_buffer[64] = {0};
+    uint16_t port = IOT_DEFAULT_PORT;
+    iot_client_resolve_atop_host(client, host_buffer, sizeof(host_buffer), &port);
+    device_reset_request_t request = {
+        .devid = client->devid,
+        .key = client->secret_key,
+        .host = host_buffer[0] ? host_buffer : NULL,
+        .port = port,
+        .cacert = client->cacert,
+        .cert_bundle_attach = client->cert_bundle_attach,
+    };
+    return atop_device_reset(client->pal, &request);
+}
+
+IOT_API int iot_client_factory_reset_notify(iot_client_t *client)
+{
+    if (client == NULL || client->devid[0] == '\0' || client->secret_key[0] == '\0') {
+        log_error("iot_client_factory_reset_notify: client identity is unavailable");
+        return OPRT_INVALID_PARAMETER;
+    }
+
+    char host_buffer[64] = {0};
+    uint16_t port = IOT_DEFAULT_PORT;
+    iot_client_resolve_atop_host(client, host_buffer, sizeof(host_buffer), &port);
+    device_reset_request_t request = {
+        .devid = client->devid,
+        .key = client->secret_key,
+        .host = host_buffer,
+        .port = port,
+        .cacert = client->cacert,
+        .cert_bundle_attach = client->cert_bundle_attach,
+    };
+    return atop_device_reset_notify(client->pal, &request);
+}
+
 IOT_API int iot_client_process(iot_client_t *client, uint32_t timeout_ms)
 {
     if (client == NULL) {

@@ -262,6 +262,34 @@ IOT_API int iot_client_publish(iot_client_t *client, const uint8_t *data, size_t
 IOT_API int iot_client_get_session_token(iot_client_t *client, const char *agent_code, char *token, size_t token_len);
 
 /**
+ * @brief Ask Tuya cloud to remove this device before a locally initiated
+ * factory reset.
+ *
+ * Sends ATOP `tuya.device.reset` v4.0 with the client's device identity.
+ * A successful transport alone is not sufficient: this function returns
+ * OPRT_OK only when the cloud response explicitly reports success.  It does
+ * not disconnect MQTT, erase credentials, or reboot; the application that
+ * owns @p client must do those actions only after this call succeeds.
+ *
+ * Do not call from a reset callback. The caller is responsible for
+ * serialising reset teardown with iot_client_deinit() and credential storage.
+ *
+ * @param client Initialized client with a non-empty device id and secret key.
+ * @return OPRT_OK only after the cloud accepted the reset request.
+ */
+IOT_API int iot_client_factory_reset(iot_client_t *client);
+
+/**
+ * @brief Send a best-effort device-removal notification without awaiting its
+ * cloud response.
+ *
+ * OPRT_OK only means the signed HTTP request was handed to the transport; it
+ * is not cloud acceptance.  Callers that choose this availability-first mode
+ * must not make their local reset conditional on the return value.
+ */
+IOT_API int iot_client_factory_reset_notify(iot_client_t *client);
+
+/**
  * @brief Get CA certificate for a target host via IoT DNS service.
  *
  * @param client         Pointer to iot_client_t instance (must not be NULL)

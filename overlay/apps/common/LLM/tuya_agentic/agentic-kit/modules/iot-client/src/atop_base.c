@@ -573,10 +573,11 @@ static int atop_response_result_parse_cjson(const uint8_t *input, size_t ilen, a
                                                                        .path = path_buffer,
                                                                        .headers = headers,
                                                                        .headers_count = headers_count,
-                                                                       .body = body_buffer,
-                                                                       .body_length = body_length,
-                                                                       .timeout_ms = IOT_HTTP_TIMEOUT_MS_DEFAULT,
-                                                                       .pal = pal},
+                                                                        .body = body_buffer,
+                                                                        .body_length = body_length,
+                                                                        .timeout_ms = request->timeout_ms,
+                                                                        .send_only = request->send_only,
+                                                                        .pal = pal},
                                         &http_response);
 
       /* Release http buffer */
@@ -588,6 +589,15 @@ static int atop_response_result_parse_cjson(const uint8_t *input, size_t ilen, a
           return (http_status == HTTP_CLIENT_TLS_ERROR)
                      ? OPRT_TLS_HANDSHAKE_FAILED
                      : OPRT_COMMUNICATION_ERROR;
+      }
+
+      /* send_only deliberately closes the transport without receiving an
+       * HTTP response.  There is therefore no response body to decrypt or
+       * parse below; treating it as one produces the misleading "param
+       * error" from atop_response_result_parse_cjson(NULL, ...), even after
+       * the signed request has been written successfully. */
+      if (request->send_only) {
+          return OPRT_OK;
       }
 
     size_t result_buffer_length = 0;

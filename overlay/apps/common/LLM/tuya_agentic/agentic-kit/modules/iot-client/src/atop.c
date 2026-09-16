@@ -372,6 +372,81 @@ int atop_device_meta_save(const pal_t *pal, const device_meta_save_request_t *re
     return OPRT_OK;
 }
 
+/* Local factory reset is a device-initiated cloud operation.  Keep it as a
+ * named ATOP helper rather than exposing atop_base to applications, so every
+ * caller uses the client identity and resolved endpoint; callers select either
+ * cloud-confirmed or send-only delivery explicitly. */
+#define ATOP_DEVICE_RESET "tuya.device.reset"
+#define ATOP_DEVICE_RESET_NOTIFY_TIMEOUT_MS 1000u
+
+static int atop_device_reset_request(const pal_t *pal,
+                                     const device_reset_request_t *request,
+                                     bool send_only)
+{
+    if (pal == NULL || request == NULL || request->devid == NULL ||
+        request->devid[0] == '\0' || request->key == NULL || request->key[0] == '\0') {
+        log_error("atop_device_reset: devid or key is empty");
+        return OPRT_INVALID_PARAMETER;
+    }
+
+    uint32_t timestamp = (uint32_t)time(NULL);
+    char post_data[32];
+    int written = snprintf(post_data, sizeof(post_data),
+                           "{\"t\":%" PRIu32 "}", timestamp);
+    if (written < 0 || (size_t)written >= sizeof(post_data)) {
+        return OPRT_COMMUNICATION_ERROR;
+    }
+
+    atop_base_request_t atop_request = {
+        .devid = request->devid,
+        .key = request->key,
+        .path = "/d.json",
+        .timestamp = timestamp,
+        .api = ATOP_DEVICE_RESET,
+        .version = "4.0",
+        .send_only = send_only,
+        .timeout_ms = send_only ? ATOP_DEVICE_RESET_NOTIFY_TIMEOUT_MS : 0,
+        .data = post_data,
+        .datalen = (size_t)written,
+        .host = request->host,
+        .port = request->port,
+        .cacert = request->cacert,
+        .cert_bundle_attach = request->cert_bundle_attach,
+    };
+    atop_base_response_t atop_response = {0};
+    int ret = atop_base_request(pal, &atop_request, &atop_response);
+    if (ret != OPRT_OK) {
+        log_error("atop_device_reset request error:%d", ret);
+        atop_base_response_free(pal, &atop_response);
+        return ret;
+    }
+
+    if (send_only) {
+        /* No response is received in this mode, so this cannot prove the
+         * cloud processed the reset.  The local K6 policy intentionally does
+         * not use the result as a prerequisite for factory reset. */
+        return OPRT_OK;
+    }
+
+    bool success = atop_response.success;
+    atop_base_response_free(pal, &atop_response);
+    if (!success) {
+        log_error("atop_device_reset: cloud rejected the request");
+        return OPRT_COMMUNICATION_ERROR;
+    }
+    return OPRT_OK;
+}
+
+int atop_device_reset(const pal_t *pal, const device_reset_request_t *request)
+{
+    return atop_device_reset_request(pal, request, false);
+}
+
+int atop_device_reset_notify(const pal_t *pal, const device_reset_request_t *request)
+{
+    return atop_device_reset_request(pal, request, true);
+}
+
 /* ============================================================================
  * QR Code Info Service Implementation
  * ============================================================================ */

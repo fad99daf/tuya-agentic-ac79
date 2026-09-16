@@ -22,7 +22,7 @@ End-side port of **Tuya agentic-kit** (AI Agent cloud voice chat) onto the **Jie
 - **Tuya cloud OTA** — checks for upgrade before connecting to AI on boot; downloads, flashes, and auto-reboots if a new firmware exists (dual-bank)
 - **Tuya BLE one-click provisioning** — via the "Tuya Smart" App
 - **Persistent credentials** — device triple (devid/secret/localkey) written to VM after activation; direct-connect on later boots
-- **K6 long-press resets provisioning** — clears credentials and re-enters provisioning
+- **K6 factory reset** — notifies cloud removal when possible, without awaiting a response, then always clears local credentials and re-enters provisioning
 
 > Note: this port does **not** include image understanding/generation or device MCP (not implemented on the device side). Cloud AI capabilities depend on the Tuya platform configuration.
 
@@ -32,7 +32,7 @@ End-side port of **Tuya agentic-kit** (AI Agent cloud voice chat) onto the **Jie
 
 - **JieLi AC791N (wl82)** board (based on the SDK's `wifi_story_machine` app)
 - Microphone (uplink ASR), speaker (downlink TTS)
-- Keys **K1–K8** (AD ladder on PB1); **K6 = KEY_PHOTO, long-press = clear provisioning & reset**
+- Keys **K1–K8** (AD ladder on PB1); **K6 = KEY_PHOTO, long-press = best-effort cloud notification then factory reset**
 - UART (flashing + logs, default 115200)
 
 ---
@@ -154,8 +154,8 @@ Edit `apps/wifi_story_machine/include/app_config.h`:
 
 ### Reset provisioning
 
-- **Long-press K6** → clears the VM triple → soft reset → re-enters provisioning on reboot
-- (BT advertising is stopped before the reset to avoid a dirty BT-controller state after soft reset causing provisioning failure — see FAQ)
+- **Long-press K6** → when networking and an IoT client are available, sends one cloud `tuya.device.reset` request without reading its response → stops MQTT, clears the VM triple, and soft-resets → re-enters provisioning on reboot.
+- When offline or before a client exists, it skips the cloud notification and still performs the local factory reset. K6 therefore remains usable offline; the App may retain an old device that must be removed there.
 
 ---
 
@@ -164,7 +164,7 @@ Edit `apps/wifi_story_machine/include/app_config.h`:
 | Symptom | Cause / Fix |
 |---|---|
 | **Tuya App can't find the Bluetooth device** | You flashed the placeholder build; `demo.c` still says `YOUR_PID_HERE`. Fill in real PID/uuid/authkey and rebuild |
-| **Provisioning fails after long-press K6** (but works after the reset key) | Soft reset (P33) doesn't fully reset the BT controller like a power cycle. Fixed by stopping BT + delay before reset; if it still happens occasionally, use the reset key (cold boot) or retry |
+| **K6 long-press does not reboot** | K6 does not depend on a cloud response. Check `K6 local reset marker write failed` or the power/key logs. An offline reset can leave an old device in the App; remove it in the App. |
 | **Downlink TTS has squeal/noise** | If opus behaves abnormally, fall back to PCM (comment out `TUYA_DOWNLINK_OPUS_ENABLE`). Opus is now working (CBR + sample_rate=0 auto-resampling) |
 | **Connects then drops (conn nack → timeout) during provisioning** | Usually 2.4G RF interference. Turn off phone WiFi, move closer, retry a few times |
 | **Music stops after ~30 seconds** | Platform trial-clip limit; full songs require the paid music capability on the Tuya platform |
