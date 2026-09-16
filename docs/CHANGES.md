@@ -55,9 +55,9 @@
 - **turn-start 能量门**(非 barge 轮):无唤醒词+单麦开麦易自言自语,VAD 触发后再核 1 帧能量才起轮。
 - **idle 持续排空**:空闲不断丢 mic,保证 VAD 触发时无积压;**绝不**在 VAD 触发时 clear(会吞刚触发的话音)。
 
-**⑥ `tuya_clear_provision_and_reset()`(L944)** — K6 长按入口:把 VM 176~180 全写 0 → **`tuya_ble_netcfg_stop()` 先停 BT 广播** → `os_time_dly(300)`(BT 控制器 idle + VM 落盘)→ `cpu_reset()` → 重启后读不到 devid 自动重新配网。
+**⑥ `tuya_clear_provision_and_reset()`（MYWO-20 更新）** — K6 长按入口不再直接擦除 VM。按键任务仅置位请求并退出当前 AI 会话；持有 `iot_client_t` 的 Agentic 任务调用 `tuya.device.reset` v4.0，明确收到云端成功后，才按“停止 MQTT → deinit → 可恢复地清除 VM → 软复位”执行。网络、TLS/时间或云端拒绝时凭据保留，用户可再次长按重试，避免 App 保留旧设备。
 
-   > **修复(软复位后 BT 脏状态 → 配网失败)**:`cpu_reset()` 内部走 `P33_SYSTEM_RESET`,虽是整机软复位,但**不像掉电 / reset 键那样彻底重置 BT 控制器**。若复位前 BT 处于广播/连接活跃态,带脏射频状态复位会导致重启后 BLE 链路异常(`conn nack` 雪崩 → 5s supervision timeout 断开,reason 0x08),配网必失败。**实测复现**:长按 K6(走软复位)后配网失败,紧接着按 reset 键(冷启动)则配网成功。**解法**:复位前先 `tuya_ble_netcfg_stop()` 停广播 + 延迟 3s 让 BT 控制器进 idle,再软复位。已验证修复。
+   > 启动时发现 VM 本身损坏/缺字段仍走独立的本地恢复分支；它与健康已绑定设备的 K6 路径严格分开，不能用“先擦本地再重启”替代云端解绑。
 
 **⑦ 产品三件套**(L46-48,构建期硬编码):`TUYA_PRODUCT_KEY` / `TUYA_UUID` / `TUYA_AUTH_KEY`。
 

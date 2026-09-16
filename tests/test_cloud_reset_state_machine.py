@@ -5,6 +5,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 HEADER = ROOT / "overlay/apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/include/iot_client.h"
 CLIENT = ROOT / "overlay/apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client.c"
+ATOP = ROOT / "overlay/apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop.c"
 MESSAGE = ROOT / "overlay/apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client_message.c"
 DEMO = ROOT / "overlay/apps/common/LLM/tuya_agentic/tuya_agentic_demo.c"
 
@@ -106,6 +107,33 @@ class CloudResetStateMachineTests(unittest.TestCase):
         self.assertIn("localkey[0] != 0", main)
         self.assertIn("no devid, start BLE provisioning", main)
         self.assertNotIn("while (1) { ; }", main[main.index("void tuya_clear_provision_and_reset"):])
+
+    def test_local_factory_reset_requires_cloud_success_before_shared_teardown(self) -> None:
+        header = read(HEADER)
+        client = read(CLIENT)
+        atop = read(ATOP)
+        demo = read(DEMO)
+        k6 = demo[demo.rindex("void tuya_clear_provision_and_reset"):
+                  demo.index("static int tuya_agentic_main_init")]
+        supervisor = demo[demo.index("static int tuya_local_factory_reset_supervise"):
+                          demo.index("static void tuya_ai_run")]
+
+        self.assertIn("iot_client_factory_reset", header)
+        self.assertIn("device_reset_request_t request", client)
+        self.assertIn("return atop_device_reset(client->pal, &request)", client)
+        self.assertIn('ATOP_DEVICE_RESET "tuya.device.reset"', atop)
+        self.assertIn('.version = "4.0"', atop)
+        self.assertIn("bool success = atop_response.success", atop)
+        self.assertIn("if (!success)", atop)
+        self.assertIn("s_local_factory_reset_requested = 1", k6)
+        self.assertIn("g_exit = 1", k6)
+        self.assertNotIn("syscfg_write", k6)
+        self.assertNotIn("cpu_reset", k6)
+        self.assertLess(supervisor.index("iot_client_factory_reset(iot)"),
+                        supervisor.index("s_cloud_reset_type = IOT_RESET_REMOTE_FACTORY"))
+        self.assertLess(supervisor.index("s_cloud_reset_type = IOT_RESET_REMOTE_FACTORY"),
+                        supervisor.index("tuya_cloud_reset_supervise(iot)"))
+        self.assertIn("credentials retained", supervisor)
 
 
 if __name__ == "__main__":

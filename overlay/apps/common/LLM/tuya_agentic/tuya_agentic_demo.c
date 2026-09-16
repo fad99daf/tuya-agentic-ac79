@@ -130,6 +130,11 @@ static volatile int g_mqtt_ka_run;        /* MQTT 心跳线程运行标志:生�
  * 释放 iot/擦 VM/复位全部由 tuya_ai_run 这个唯一监督者完成。 */
 #define TUYA_CLOUD_RESET_NONE (-1)
 static volatile int s_cloud_reset_type = TUYA_CLOUD_RESET_NONE;
+/* K6 runs in app_music's key context, which neither owns iot_client_t nor may
+ * perform TLS, VM I/O, MQTT teardown, or reboot.  It only sets this request;
+ * tuya_ai_run serialises the cloud request and the existing reset state machine. */
+static volatile int s_local_factory_reset_requested;
+static volatile int s_tuya_cloud_client_ready;
 static volatile int s_mqtt_ka_exited;
 static int g_audio_frame_logged;          /* 下行首帧帧长只打印一次,供核对 opus_cbr_pktlen */
 #ifdef TUYA_SERVER_VAD_ENABLE
@@ -1395,6 +1400,23 @@ static void tuya_cloud_reset_cpu_reboot(void)
     printf("[TUYA] ERROR: cpu_reset returned; reset marker remains for recovery\r\n");
 }
 
+/* Corrupt local storage is the exceptional case where a usable cloud identity
+ * cannot be established.  Keep that boot-recovery policy separate from K6:
+ * a physical reset of a healthy, bound device must never take this path. */
+static void tuya_clear_invalid_provision_and_reset(void)
+{
+    printf("[TUYA] clearing invalid local provisioning and rebooting\r\n");
+    if (!tuya_cloud_reset_write_marker(
+            tuya_cloud_reset_marker(IOT_RESET_REMOTE_FACTORY, 0))) {
+        printf("[TUYA] invalid-provision reset marker write failed; credentials retained\r\n");
+        return;
+    }
+    if (tuya_cloud_reset_clear_and_verify(IOT_RESET_REMOTE_FACTORY) != 0) {
+        printf("[TUYA] invalid-provision reset verification failed; reboot for recovery\r\n");
+    }
+    tuya_cloud_reset_cpu_reboot();
+}
+
 /* Called before any client is constructed.  A power loss after the initial
  * marker write is therefore completed while no MQTT/AI worker exists. */
 static int tuya_cloud_reset_recover_if_needed(void)
@@ -2444,6 +2466,11 @@ static int tuya_cloud_reset_requested(void)
            s_cloud_reset_type == IOT_RESET_REMOTE_FACTORY;
 }
 
+static int tuya_local_factory_reset_requested(void)
+{
+    return s_local_factory_reset_requested != 0;
+}
+
 /* Return non-zero after ownership has transferred to a terminal reset path.
  * The only unbounded operation in the old implementation was waiting for the
  * MQTT task to exit.  Do not free iot while it may still be in process(); on a
@@ -2487,6 +2514,34 @@ static int tuya_cloud_reset_supervise(iot_client_t *iot)
     return 1;
 }
 
+/* Called only by the task that owns iot. K6 never reaches this function
+ * directly, so a key event cannot race iot_client_process(), deinit, or VM
+ * writes. */
+static int tuya_local_factory_reset_supervise(iot_client_t *iot)
+{
+    int ret;
+
+    if (!tuya_local_factory_reset_requested()) {
+        return 0;
+    }
+
+    ret = iot_client_factory_reset(iot);
+    s_local_factory_reset_requested = 0;
+    if (ret != OPRT_OK) {
+        /* Never erase the identity when the cloud did not accept removal.
+         * The user may retry K6 after restoring network or correcting time. */
+        printf("[TUYA] K6 cloud device removal failed (%d); credentials retained\r\n", ret);
+        return 0;
+    }
+
+    printf("[TUYA] K6 cloud factory reset verified; clearing local state\r\n");
+    /* The cloud can also emit protocol 11 for this operation. Factory policy
+     * is intentional for the physical K6 path, so it wins over that callback's
+     * unbind/factory hint before the shared teardown starts. */
+    s_cloud_reset_type = IOT_RESET_REMOTE_FACTORY;
+    return tuya_cloud_reset_supervise(iot);
+}
+
 static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_key)
 {
     s_mqtt_ka_exited = 0;
@@ -2507,6 +2562,27 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
     unsigned int backoff_ms = 5000;
     int offline_logged = 0;
     while (1) {
+        /* An actual cloud removal notification is authoritative. If it races
+         * a K6 press, consume it first and do not send a second reset request. */
+        if (tuya_cloud_reset_requested()) {
+            s_local_factory_reset_requested = 0;
+            if (tuya_cloud_reset_supervise(iot)) return;
+            continue;
+        }
+        /* A K6 request needs a usable link for tuya.device.reset. Wait here
+         * instead of falling into an AI-session retry, and retain all local
+         * credentials if the link never returns. */
+        if (tuya_local_factory_reset_requested()) {
+            printf("[TUYA] K6 reset pending; waiting for cloud network\r\n");
+            while (!wifi_tuya_network_is_ready() && tuya_local_factory_reset_requested()) {
+                os_time_dly(100);
+            }
+            if (tuya_local_factory_reset_requested() &&
+                tuya_local_factory_reset_supervise(iot)) {
+                return;
+            }
+            continue;
+        }
         /* Session-token and TAI connection retries require a DHCP-ready
          * network as well.  Retain the client and resume after Wi-Fi recovers. */
         if (!wifi_tuya_network_is_ready()) {
@@ -2525,7 +2601,12 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
         /* 每次会话尝试前复位跨线程标志(tai ctx 尚未创建,on_disconnect 无竞态) */
         g_exit = 0; g_link_broken = 0;
         if (tuya_cloud_reset_requested()) {
+            s_local_factory_reset_requested = 0;
             if (tuya_cloud_reset_supervise(iot)) return;
+            continue;
+        }
+        if (tuya_local_factory_reset_requested()) {
+            if (tuya_local_factory_reset_supervise(iot)) return;
             continue;
         }
         g_tts_playing = 0; g_turn_done = 1;
@@ -2535,7 +2616,12 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
         printf("[TUYA] session attempt\r\n");
         unsigned int lived_ms = tuya_ai_session(pal, iot, local_key);
         if (tuya_cloud_reset_requested()) {
+            s_local_factory_reset_requested = 0;
             if (tuya_cloud_reset_supervise(iot)) return;
+            continue;
+        }
+        if (tuya_local_factory_reset_requested()) {
+            if (tuya_local_factory_reset_supervise(iot)) return;
             continue;
         }
         if (lived_ms > 60000) backoff_ms = 5000;   /* 会话曾健康存活,按首次失败退避 */
@@ -2544,12 +2630,18 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
         printf("[TUYA] session lost (lived %us), retry in %ums\r\n",
                lived_ms / 1000, backoff_ms);
         for (unsigned int waited_ms = 0;
-             waited_ms < backoff_ms && !tuya_cloud_reset_requested();
+             waited_ms < backoff_ms && !tuya_cloud_reset_requested() &&
+             !tuya_local_factory_reset_requested();
              waited_ms += 100) {
             msleep(100);
         }
         if (tuya_cloud_reset_requested()) {
+            s_local_factory_reset_requested = 0;
             if (tuya_cloud_reset_supervise(iot)) return;
+            continue;
+        }
+        if (tuya_local_factory_reset_requested()) {
+            if (tuya_local_factory_reset_supervise(iot)) return;
             continue;
         }
         if (backoff_ms < 60000) backoff_ms *= 2;
@@ -2842,7 +2934,7 @@ void tuya_agentic_main(void *arg)
             /* Only a corrupt/missing local provision justifies clearing it.
              * Association failures and DHCP timeouts never enter this path. */
             printf("[TUYA] invalid stored provisioning data -> reset to BLE provisioning\r\n");
-            tuya_clear_provision_and_reset();
+            tuya_clear_invalid_provision_and_reset();
             return;
         }
 
@@ -2894,6 +2986,7 @@ void tuya_agentic_main(void *arg)
 
         iot_client_t *iot = iot_client_init(&cfg);
         if (iot) {
+            s_tuya_cloud_client_ready = 1;
             /* 连 AI 之前先检查涂鸦云 OTA(此时 iot_client 活着,且 AI 会话还没起,
              * 无并发冲突;OTA 走 ATOP over HTTPS,与 MQTT 串行无妨)。
              * 有升级则下载烧写并自动重启(不返回);无升级则正常连 AI。*/
@@ -2978,6 +3071,7 @@ void tuya_agentic_main(void *arg)
         printf("[TUYA] activation returned incomplete required credentials\r\n");
         return;
     }
+    s_tuya_cloud_client_ready = 1;
     printf("[TUYA] activated, devid=%s\r\n", iot->devid);
 
     /* ---- 持久化三元组 + WiFi 凭据(下次开机直连)----
@@ -3044,25 +3138,26 @@ void tuya_agentic_main(void *arg)
     printf("===== tuya_agentic_main end =====\r\n");
 }
 
-/* 长按 KEY_PHOTO(K6) 时由 app_music 调用:使用与云端 factory reset 相同的
- * 可恢复清除状态机；复位后 tuya_agentic_main 读不到有效身份 → 自动进入 BLE 配网。
- * 给用户一个"主动重新配网"的入口(否则开机直连,没法重配)。
+/* 长按 KEY_PHOTO(K6) 时由 app_music 调用。按键上下文不拥有 iot_client_t，
+ * 因而绝不能直接做 HTTPS、VM 擦除或复位；它只请求 Agentic 主任务执行
+ * tuya.device.reset。云端确认后才复用可恢复清除状态机，确保 App 先移除设备。
  * 板上 Reset/Update 是硬件键(固件读不到),电源键是自锁拨动开关(按不出长按),
  * 故重置入口放在 K6 长按(原本是空槽位)。*/
 void tuya_clear_provision_and_reset(void)
 {
-    printf("[TUYA] >>> clear provision & reboot (re-enter BLE provisioning) <<<\r\n");
-    if (!tuya_cloud_reset_write_marker(
-            tuya_cloud_reset_marker(IOT_RESET_REMOTE_FACTORY, 0))) {
-        printf("[TUYA] local reset marker write failed; credentials retained\r\n");
+    if (!s_tuya_cloud_client_ready) {
+        /* An unbound device has no cloud identity to remove.  Do not recreate
+         * the App-residue bug by falling back to a blind local wipe. */
+        printf("[TUYA] K6 reset ignored: cloud identity is not ready\r\n");
         return;
     }
-    if (tuya_cloud_reset_clear_and_verify(IOT_RESET_REMOTE_FACTORY) != 0) {
-        printf("[TUYA] local reset verification failed; reboot for recovery\r\n");
-        tuya_cloud_reset_cpu_reboot();
+    if (s_local_factory_reset_requested) {
+        printf("[TUYA] K6 reset already pending\r\n");
         return;
     }
-    tuya_cloud_reset_cpu_reboot();
+    s_local_factory_reset_requested = 1;
+    g_exit = 1;  /* make an active TAI session return to its supervisor */
+    printf("[TUYA] K6 reset: requesting cloud device removal\r\n");
 }
 
 /* boot 自启动:系统初始化后 fork tuya_agentic_main

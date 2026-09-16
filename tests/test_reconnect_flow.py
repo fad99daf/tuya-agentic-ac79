@@ -46,7 +46,7 @@ class ReconnectFlowTests(unittest.TestCase):
     def test_only_invalid_persisted_data_enters_clear_provision_path(self) -> None:
         source = read(DEMO)
         invalid = source.index("invalid stored provisioning data")
-        clear = source.index("tuya_clear_provision_and_reset();", invalid)
+        clear = source.index("tuya_clear_invalid_provision_and_reset();", invalid)
         wait = source.index("tuya_wait_for_network_available(network_generation);", clear)
         self.assertLess(invalid, clear)
         self.assertLess(clear, wait)

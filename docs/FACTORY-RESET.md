@@ -2,17 +2,17 @@
 
 ## 结论
 
-agentic-kit 当前**没有一个一键式的 `iot_factory_reset()` API**，但恢复出厂所需的两个基础能力已经具备：
+agentic-kit 提供 `iot_client_factory_reset()`，用于设备主动请求云端解除绑定；它**不是**会擅自擦除本地数据的一键复位 API。本地凭据清理、业务数据清理和重启仍必须由产品应用在云端确认后完成。
 
 | 场景 | 现状 | 使用方式 |
 | --- | --- | --- |
 | App / 云端下发解绑、恢复出厂 | 已支持 | 注册 `reset_callback`，接收 MQTT protocol 11 通知 |
-| 设备端主动恢复出厂 | 可通过通用 ATOP 调用 | `iot_atop_call()` 调用 `tuya.device.reset` v4.0 |
+| 设备端主动恢复出厂 | 已支持 | `iot_client_factory_reset()` 调用 `tuya.device.reset` v4.0，并校验云端 `success` |
 | 清理设备本地凭据和业务数据 | SDK 不自动处理 | 由产品应用负责 |
 
-因此，杰理芯片侧可以在现有 agentic-kit 能力上完成恢复出厂流程；如果希望获得类似 TuyaOpen `tuya_iot_reset()` 的一键封装，可以在 agentic-kit 中继续增加具名接口。
+因此，杰理芯片侧可将云端解绑与自身可恢复的本地清理状态机组合，完成安全的恢复出厂流程。
 
-> 请确认客户使用的 agentic-kit 版本已包含 `reset_callback` 和 `iot_atop_call()`。旧版本需要先升级，或按同样协议自行补齐。
+> 请确认客户使用的 agentic-kit 版本已包含 `reset_callback` 和 `iot_client_factory_reset()`。旧版本需要先升级，或按同样协议自行补齐。
 
 ## 1. 云端下发解绑 / 恢复出厂
 
@@ -67,38 +67,18 @@ Version: 4.0
 Body:    {"t":<当前 Unix 时间戳，单位秒>}
 ```
 
-agentic-kit 可以通过通用 ATOP 入口直接调用：
+应用任务（不是 MQTT 回调或按键回调）调用公开接口：
 
 ```c
-#include "iot_atop.h"
-
 #include <stdio.h>
-#include <time.h>
 
 static int app_request_cloud_factory_reset(iot_client_t *client)
 {
-    char body[32];
-    snprintf(body, sizeof(body), "{\"t\":%ld}", (long)time(NULL));
-
-    iot_atop_request_t req = {
-        .api     = "tuya.device.reset",
-        .version = "4.0",
-        .data    = body,
-    };
-
-    iot_atop_response_t resp = {0};
-    int rc = iot_atop_call(client, &req, &resp);
-
-    if (rc == OPRT_ATOP_BUSINESS_ERROR) {
-        /* 已到达云端，但云端拒绝；error_code / error_msg 用于定位原因 */
-        printf("factory reset rejected: %s(%s)\n",
-               resp.error_code, resp.error_msg);
-    } else if (rc != OPRT_OK) {
-        /* DNS、TLS、HTTP 等传输层失败，可按产品策略重试 */
+    int rc = iot_client_factory_reset(client);
+    if (rc != OPRT_OK) {
+        /* 网络、TLS、时间偏差或云端拒绝时均不得清除本地凭据。 */
         printf("factory reset transport error: %d\n", rc);
     }
-
-    iot_atop_response_free(client, &resp);
     return rc;
 }
 ```
@@ -154,9 +134,9 @@ agentic-kit 不管理产品存储，恢复出厂时应用至少应清理以下�
 - **实时时钟必须可用**：`tuya.device.reset` 的请求体和 ATOP 签名都包含时间戳，设备时间偏差过大可能被云端拒绝。杰理侧需确保启动后能获取可信时间。
 - **不要在 `reset_callback` 中做网络请求**：回调只置标志，ATOP 调用和存储擦除都放到应用主流程处理。
 - **主动 reset 与远端通知要幂等**：主动调用 `tuya.device.reset` 后，设备仍可能收到 protocol 11 通知。两条路径应汇入同一个“待清理”标志，避免重复擦除或重复重启。
-- **以返回码判断云端结果**：`OPRT_OK` 表示云端接受；`OPRT_ATOP_BUSINESS_ERROR` 表示云端拒绝；不要依赖 `resp.result` 的具体形态判断成败。
+- **以返回码判断云端结果**：`iot_client_factory_reset()` 仅在 ATOP 响应明确为 `success: true` 时返回 `OPRT_OK`；其余传输或业务失败都不得清除本地凭据。
 - **保持单线程调用模型**：所有 MQTT 相关操作保持在应用所在的 IoT process 线程，不要在回调或异步 worker 中直接操作同一个 client。
 
 ## 6. 给客户的建议答复
 
-> agentic-kit 目前没有一键式恢复出厂 API，但已经提供完成该流程所需的能力：云端下发场景可注册 `reset_callback` 接收 protocol 11；设备端主动恢复出厂可通过 `iot_atop_call()` 调用 `tuya.device.reset` v4.0。收到云端成功返回后，由应用断开连接、擦除本地激活数据和业务数据，并重启或进入配网模式。若需要降低接入成本，我们可以进一步在 agentic-kit 中封装 `iot_factory_reset()`，统一处理云端通知、主动 reset 和本地清理回调。
+> agentic-kit 通过 `reset_callback` 接收云端 protocol 11，并提供 `iot_client_factory_reset()` 发起设备侧的 `tuya.device.reset` v4.0 请求。该接口确认云端成功后，产品应用再断开连接、擦除本地激活数据和业务数据，并重启或进入配网模式。
