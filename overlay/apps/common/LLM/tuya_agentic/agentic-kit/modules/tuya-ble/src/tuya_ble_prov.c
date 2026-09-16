@@ -693,7 +693,9 @@ static void tuya_ble_recv(tuya_ble_prov_state_t *state, const uint8_t *packet, u
     case FRM_DOWNLINK_TRANSPARENT_REQ:
         handle_wifi_config(state, data, data_len);
         break;
-    case FRM_DP_CMD_SEND_V4:
+    case FRM_DP_CMD_SEND_V4: {
+        int dp_ret;
+
         if (!state->bound_session || encrypt_mode != ENCRYPTION_MODE_SESSION_KEY15 || data_len < 5) {
             TUYA_BLE_HAL_LOGW("[DP] reject: bound=%d mode=0x%02X data_len=%u",
                               state->bound_session, encrypt_mode, data_len);
@@ -716,9 +718,10 @@ static void tuya_ble_recv(tuya_ble_prov_state_t *state, const uint8_t *packet, u
             TUYA_BLE_HAL_LOGW("[DP] no application bridge");
             break;
         }
-        ret = state->dp_rx_cb(data + 5, data_len - 5, state->dp_rx_ctx);
-        TUYA_BLE_HAL_LOGI("[DP] V4 dispatch ret=%d", ret);
+        dp_ret = state->dp_rx_cb(data + 5, data_len - 5, state->dp_rx_ctx);
+        TUYA_BLE_HAL_LOGI("[DP] V4 dispatch ret=%d", dp_ret);
         break;
+    }
     default:
         TUYA_BLE_HAL_LOGW("[RX] Unhandled CMD=0x%04X", cmd);
         break;
