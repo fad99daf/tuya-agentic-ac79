@@ -36,6 +36,13 @@ class McpVolumeTests(unittest.TestCase):
                            self.demo.index("static void mcp_defer_error")]
         self.assertIn("if (v > 100) return -1", getter)
 
+    def test_whole_number_json_doubles_are_accepted_without_rounding(self) -> None:
+        getter = self.demo[self.demo.index("static int mcp_get_volume"):
+                           self.demo.index("static void mcp_defer_error")]
+        self.assertIn("if (*p == '.')", getter)
+        self.assertIn("if (*p++ != '0') return -1", getter)
+        self.assertIn("if (p == fraction) return -1", getter)
+
     def test_response_keeps_json_rpc_id_and_is_sent_off_the_worker_thread(self) -> None:
         self.assertIn("mcp_copy_id(json, id, sizeof(id))", self.handler)
         self.assertIn('\\"id\\":%s', self.handler)

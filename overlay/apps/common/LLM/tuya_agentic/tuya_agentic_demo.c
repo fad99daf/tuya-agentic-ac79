@@ -662,6 +662,18 @@ static int mcp_get_volume(const char *json, int *volume)
         v = v * 10 + (*p++ - '0');
         if (v > 100) return -1;
     } while (*p >= '0' && *p <= '9');
+    /* omniClient serializes tool arguments as JSON doubles (for example 50.0)
+     * even though set_volume declares an integer schema.  Accept a fractional
+     * suffix only when it is mathematically still an integer; values such as
+     * 50.5 remain invalid rather than being silently rounded. */
+    if (*p == '.') {
+        const char *fraction = ++p;
+
+        while (*p >= '0' && *p <= '9') {
+            if (*p++ != '0') return -1;
+        }
+        if (p == fraction) return -1;
+    }
     if (*p && *p != ',' && *p != '}' && *p != ']' &&
         *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') return -1;
     *volume = v;
