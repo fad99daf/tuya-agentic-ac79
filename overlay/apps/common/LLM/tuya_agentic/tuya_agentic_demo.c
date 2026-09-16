@@ -2527,7 +2527,7 @@ static int tuya_cloud_reset_supervise(iot_client_t *iot)
         return 1;
     }
 
-    printf("[TUYA] cloud %s reset verified; reboot to BLE provisioning\r\n",
+    printf("[TUYA] local %s reset state cleared; reboot to BLE provisioning\r\n",
            type == IOT_RESET_REMOTE_FACTORY ? "factory" : "unbind");
     tuya_cloud_reset_cpu_reboot();
     return 1;

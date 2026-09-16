@@ -591,6 +591,15 @@ static int atop_response_result_parse_cjson(const uint8_t *input, size_t ilen, a
                      : OPRT_COMMUNICATION_ERROR;
       }
 
+      /* send_only deliberately closes the transport without receiving an
+       * HTTP response.  There is therefore no response body to decrypt or
+       * parse below; treating it as one produces the misleading "param
+       * error" from atop_response_result_parse_cjson(NULL, ...), even after
+       * the signed request has been written successfully. */
+      if (request->send_only) {
+          return OPRT_OK;
+      }
+
     size_t result_buffer_length = 0;
       uint8_t *result_buffer = pal->malloc(http_response.body_length + 1);
       if (NULL == result_buffer) {

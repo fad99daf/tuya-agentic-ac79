@@ -6,6 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HEADER = ROOT / "overlay/apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/include/iot_client.h"
 CLIENT = ROOT / "overlay/apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client.c"
 ATOP = ROOT / "overlay/apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop.c"
+ATOP_BASE = ROOT / "overlay/apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop_base.c"
 MESSAGE = ROOT / "overlay/apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client_message.c"
 DEMO = ROOT / "overlay/apps/common/LLM/tuya_agentic/tuya_agentic_demo.c"
 
@@ -156,6 +157,14 @@ class CloudResetStateMachineTests(unittest.TestCase):
         self.assertNotIn("HTTPClient_SendHttpHeaders(&transport,\n                                                  NULL,", send_only)
         self.assertNotIn("HTTPClient_SendHttpData(&transport,\n                                                   NULL,", send_only)
         self.assertEqual(send_only.count("http_client_get_timestamp_ms"), 2)
+
+    def test_send_only_atop_request_does_not_parse_an_absent_response(self) -> None:
+        source = read(ATOP_BASE)
+        sent = source[source.index("if (HTTP_CLIENT_SUCCESS != http_status)"):
+                      source.index("size_t result_buffer_length = 0")]
+
+        self.assertIn("if (request->send_only)", sent)
+        self.assertIn("return OPRT_OK", sent)
 
 
 if __name__ == "__main__":
