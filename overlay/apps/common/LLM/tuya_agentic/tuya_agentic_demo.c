@@ -25,6 +25,7 @@
 #include "tuya_ai.h"
 #include "tuya_ai_select.h"        /* 传输层选择:TUYA_TRANSPORT_STM_ENABLE=1 时 tai_* 重定向到 stm(UDP优先)后端 */
 #include "tuya_agentic.h"
+#include "tuya_mcp.h"
 #include "tuya_ble_prov.h"        /* tuya_ble_wifi_creds_t(BLE 配网结果类型)*/
 #ifdef TUYA_MUSIC_ENABLE
 #include "tuya_music.h"           /* 音乐 SKILL 文本流重组+解析(实现 tuya_music.c) */
@@ -141,7 +142,7 @@ static int g_audio_frame_logged;          /* 下行首帧帧长只打印一次,�
 #ifdef TUYA_SERVER_VAD_ENABLE
 static volatile int g_server_vad_stop;    /* 云端VAD(TAI_EVT_SERVER_VAD)通知停说:上行循环据此收尾。on_event 在 worker 线程置位,主循环读 */
 #endif
-#if TUYA_STM_MCP_VIA_TEXT
+#if TUYA_TRANSPORT_STM_ENABLE && TUYA_STM_MCP_VIA_TEXT
 /* STM 暂用 TEXT 承载 MCP response，云端会误把 JSON 当作一轮用户文本并生成
  * NLG/TTS。下一轮 AUDIO 前由 demo 任务 chat_break 隔离这轮污染。 */
 static volatile unsigned s_mcp_text_reply_pending;
@@ -526,7 +527,7 @@ static void on_audio(tai_ctx_t *ctx, const tai_audio_msg_t *msg, void *ud)
     if (!g_audio_ready || !msg || !msg->len) {
         return;
     }
-#if TUYA_STM_MCP_VIA_TEXT
+#if TUYA_TRANSPORT_STM_ENABLE && TUYA_STM_MCP_VIA_TEXT
     if (s_mcp_text_reply_pending) {
         /* 这次下行属于启动时的 MCP/TEXT 伪聊天轮；标记后丢弃其全部音频。
          * 实测该轮 TTS 在 chat_break 之后约 1.2s 才陆续到达，固定排空窗口
@@ -575,65 +576,26 @@ static void on_audio(tai_ctx_t *ctx, const tai_audio_msg_t *msg, void *ud)
     _device_write_voice_data((void *)msg->data, msg->len);
 }
 /* ------------------------------------------------------------------------- */
-/* MCP 回应延迟发送(防死锁,与 stm 库日志环形缓冲同一套路)                      */
+/* MCP response dispatch                                                     */
 /* ------------------------------------------------------------------------- */
-/* TAI_EVT_MCP_CMD 回调在 stm 引擎线程上下文执行(tstm_on_data_recv 直接派发)。
- * 若在回调里同步 tai_send_mcp_response → 从引擎线程再进库的发送路径,而 demo
- * 任务此刻可能正在发音频包:两条路径在库内同一会话锁上互等 → 双双永久卡死
- * (2026-08-31 第五轮实测:MCP initialize 恰在音频上行中到达,demo 任务从第 3
- * 帧起再无任何输出,无 exception,VAD 线程日志照常——轮 4 两次 MCP 都在空闲
- * 期到达所以没踩到)。对策:回调只把回应存进 pending,由 demo 任务在 20ms 级
- * 循环节拍处 mcp_resp_pump() 真正发送。TCP 模式回调同样不在 demo 任务,一并
- * 走延迟(云端对 ≤60ms 的回应延迟无感)。 */
-static char s_mcp_resp[224];
-static volatile unsigned s_mcp_resp_len;      /* 0=无待发 */
-static volatile unsigned s_mcp_resp_drops;    /* 新回应覆盖未发走旧回应的次数 */
-
-static void mcp_resp_defer(const char *resp, unsigned len)
-{
-    OS_ENTER_CRITICAL();
-    if (s_mcp_resp_len) {
-        s_mcp_resp_drops++;    /* 上一条还没发走就被覆盖:云端按序等回应,极少发生 */
-    }
-    if (len > sizeof(s_mcp_resp) - 1) {
-        len = sizeof(s_mcp_resp) - 1;
-    }
-    memcpy(s_mcp_resp, resp, len);
-    s_mcp_resp[len] = 0;
-    s_mcp_resp_len = len;
-    OS_EXIT_CRITICAL();
-}
-
-/* demo 任务循环节拍处调用(与 tai_log_flush 同批):把待发 MCP 回应真正发出 */
+/* on_event runs in the Agentic transport worker.
+ * It only queues MCP work; the existing session task calls this non-blocking
+ * service hook at its normal scheduling points.  No MCP keep-alive task or
+ * wait loop is created. */
 static void mcp_resp_pump(tai_ctx_t *ctx)
 {
-    char buf[sizeof(s_mcp_resp)];
-    unsigned len, n, drops;
-    int rc;
+    int sent = tuya_mcp_pump(ctx);
 
-    if (!s_mcp_resp_len) {
-        return;
-    }
-    OS_ENTER_CRITICAL();
-    len = s_mcp_resp_len;
-    n = (len < sizeof(buf)) ? len : sizeof(buf) - 1;
-    memcpy(buf, s_mcp_resp, n);
-    drops = s_mcp_resp_drops;
-    s_mcp_resp_drops = 0;
-    s_mcp_resp_len = 0;        /* 先取走:发送失败不重试,云端超时会重发请求 */
-    OS_EXIT_CRITICAL();
-    buf[n] = 0;
-    rc = tai_send_mcp_response(ctx, buf);
-#if TUYA_STM_MCP_VIA_TEXT
-    if (rc == TAI_OK) {
+#if TUYA_TRANSPORT_STM_ENABLE && TUYA_STM_MCP_VIA_TEXT
+    if (sent > 0) {
         s_mcp_text_reply_pending = 1;
         s_mcp_text_break_request = 0;
         s_mcp_text_break_sent = 0;
         s_mcp_text_reply_deadline = timer_get_ms() + 5000;
     }
+#else
+    (void)sent;
 #endif
-    printf("[TUYA-MCP] resp(%u B) rc=%d%s\r\n", len, rc,
-           drops ? " (pending overwritten!)" : "");
 }
 
 #define TUYA_OPUS_FRAME_LEN 1280   /* PCM 16k/16bit/mono 40ms = 1280B/帧(原 opus 180B 改 PCM) */
@@ -1062,53 +1024,13 @@ static void on_event(tai_ctx_t *ctx, const tai_event_msg_t *msg, void *ud)
         g_server_vad_stop = 1;   /* 上行中收到 = 云端VAD判停说; TTS中收到 = barge-in回执(两者都OK) */
 #endif
     } else if (msg->event_type == TAI_EVT_MCP_CMD) {
-        /* MCP 命令:云端智能体识别意图后下发(如自定义DP"运动一下")。
-         * 数据在 msg->data(JSON-RPC 格式),含 method/params 等。
-         * 这里打印完整内容,看云端有没有下发 DP 及其值。*/
-        printf("[TUYA-MCP] recv len=%u: %.*s\r\n",
+        /* Transport callbacks must never call tai_send_* or the audio server.
+         * Parse and queue only; tuya_mcp_pump() performs the scheduled board
+         * action and response send from the existing session task. */
+        printf("[TUYA-MCP] recv len=%u: %.*s\\r\\n",
                (unsigned)msg->len, (int)(msg->len < 512 ? msg->len : 512),
                msg->data ? (const char *)msg->data : "(null)");
-        /* 回应必须【原样回带请求的 id】(云端按 id 匹配响应;原实现硬编码
-         * id=1,云端 initialize 的 id 是字符串时间戳,回 id=1 会被当无关包丢弃)。
-         * 载荷可能不带 NUL 结尾,先拷进局部缓冲再解析。*/
-        char pbuf[256];
-        unsigned pl = (msg->data && msg->len) ? msg->len : 0;
-        if (pl > sizeof(pbuf) - 1) pl = sizeof(pbuf) - 1;
-        memcpy(pbuf, msg->data ? msg->data : "", pl);
-        pbuf[pl] = 0;
-        char rid[36] = "1";   /* 找不到 id 时兜底用 1 */
-        const char *idk = strstr(pbuf, "\"id\"");
-        if (idk) {
-            const char *p = idk + 4;
-            while (*p == ' ' || *p == '\t') p++;
-            if (*p == ':') {
-                p++;
-                while (*p == ' ' || *p == '\t') p++;
-                const char *e = p;
-                if (*e == '"') {            /* 字符串 id:含引号整体回带 */
-                    for (e++; *e && *e != '"' && e - p < 30; e++) {}
-                    if (*e == '"') e++;
-                } else {                    /* 数字 id */
-                    while (*e >= '0' && *e <= '9' && e - p < 30) e++;
-                }
-                if (e > p && (size_t)(e - p) < sizeof(rid)) {
-                    memcpy(rid, p, e - p);
-                    rid[e - p] = 0;
-                }
-            }
-        }
-        char resp[192];
-        int rn = snprintf(resp, sizeof(resp),
-                          "{\"jsonrpc\":\"2.0\",\"id\":%s,"
-                          "\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"\"}]}}",
-                          rid);
-        if (rn > 0 && rn < (int)sizeof(resp)) {
-            /* ★不能在这里直接 tai_send_mcp_response:本回调跑在引擎线程,
-             * 同步发包会与 demo 任务的音频上行在库内会话锁上互等卡死
-             * (见上方 mcp 回应延迟发送注释)。只存,demo 任务节拍处发。*/
-            mcp_resp_defer(resp, (unsigned)rn);
-            printf("[TUYA-MCP] resp(id=%s) deferred\r\n", rid);
-        }
+        tuya_mcp_on_command(msg->data, msg->len);
     }
 }
 static void on_disconnect(tai_ctx_t *ctx, const tai_disconnect_msg_t *msg, void *ud)
@@ -1207,7 +1129,10 @@ void tuya_agentic_demo(void *arg)
      *   内部已把 PAL/连接存到全局,deinit 才会断。不 deinit = MQTT 不断。
      *   如果出问题(SESSION_CLOSE),改回 deinit 即可。*/
     /* iot_client_deinit(iot); */
-    static const char SESSION_ATTRS[] = "{\"deviceMcp\":{\"supportCustomMCP\":true}}";
+    /* This legacy one-shot text probe blocks in its own reply wait and has no
+     * session scheduler.  Do not advertise MCP here; production MCP lives in
+     * tuya_ai_session(), whose regular voice loop services the queue. */
+    static const char SESSION_ATTRS[] = "{\"deviceMcp\":{\"supportCustomMCP\":false}}";
 #ifdef TUYA_SERVER_VAD_ENABLE
     static const char EVENT_USER_DATA[] =
         "{\"asr.enableVad\":\"true\","
@@ -1747,15 +1672,14 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
      *   开 = 请求 opus(~2KB/s,治拥挤网卡顿;云端确认支持 codec=111,帧 80B/16kbps/40ms,解码仍在调);
      *   关 = PCM(稳定能播,32KB/s)。上行 ASR 始终 PCM(opus format_mode 无标准裸包,不赌正常 ASR)。*/
 #ifdef TUYA_DOWNLINK_OPUS_ENABLE
-    /* 本 demo 没有设备侧自定义 MCP 工具，必须显式 false。NULL 也不行：协议层默认
-     * 会补 true，云端随后下发 initialize；若它恰在 AUDIO 上行中到达，TEXT 承载的
-     * response 会与语音事件重叠并阻塞 STM 任务，表现为只发出前几帧后彻底无响应。 */
+    /* 音量 MCP 已实现。MCP 回应由 mcp_resp_pump 在 demo 任务发送，不在 worker
+     * 回调内重入会话锁，因此 initialize/tools/call 可与 AUDIO 上行并存。 */
     static const char SA[] =
-        "{\"deviceMcp\":{\"supportCustomMCP\":false},"
+        "{\"deviceMcp\":{\"supportCustomMCP\":true},"
         "\"tts.order.supports\":[{\"format\":\"opus\",\"sampleRate\":16000,"
         "\"bitDepth\":\"16\",\"channels\":1}]}";
 #else
-    static const char SA[] = "{\"deviceMcp\":{\"supportCustomMCP\":false}}";
+    static const char SA[] = "{\"deviceMcp\":{\"supportCustomMCP\":true}}";
 #endif
 #ifdef TUYA_SERVER_VAD_ENABLE
     /* chatAttributes 保持 8-31 最后一次流式 ASR 成功会话的原始字节(字符串布尔,
@@ -1785,6 +1709,8 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
     tc.pal = pal; tc.on_text = on_text; tc.on_audio = on_audio;
     tc.on_event = on_event; tc.on_disconnect = on_disconnect; tc.user_data = &dc;
 
+    /* A reconnect must not send a reply that belongs to the retired session. */
+    tuya_mcp_reset();
     void *mem = pal->malloc(tai_ctx_size());
     if (!mem) return 0;
     tai_ctx_t *ctx = tai_ctx_init(mem, &tc);
@@ -1881,7 +1807,7 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
          *      之前正是这样导致云端 ASR 收到静音、回空文本。*/
         int mcp_text_poll = 0;
         g_wake_break = 0;   /* 唤醒打断标记只在本轮迭代内生效(跳过 ④ 收尾/pending 音乐) */
-#if TUYA_STM_MCP_VIA_TEXT
+#if TUYA_TRANSPORT_STM_ENABLE && TUYA_STM_MCP_VIA_TEXT
         /* MCP response 经 TEXT 发出后，必须先等伪回复并 chat_break，再允许 AUDIO。
          * 否则用户恰好开口会让两个事件重叠，复现“只回空内容、语音无 ASR”。 */
         if (s_mcp_text_reply_pending) {
@@ -2661,7 +2587,7 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
     }
 }
 
-/* 配网等待期循环播报"请配置网络",每 30s 一次,避免用户以为设备死机(tuya/小智的做法)。
+/* 配网等待期循环播报"请配置网络",每 30s 一次,避免用户以为设备死机。
  * tuya_ble_netcfg_start 阻塞,故用独立线程周期播报;配网完成/失败/超时置
  * s_prov_prompt_run=0,线程在 ~0.1s 内退出。NetCfgEnter.mp3 是 app_music 现有提示音。*/
 static volatile int s_prov_prompt_run;
@@ -2852,7 +2778,6 @@ static int tuya_vm_wifi_password_valid(const char *value, int read_len, size_t v
 /* 方案:注册自定义 log handler,用 vsnprintf 格式化到本地 buffer 后用 printf  */
 /*   输出。printf 在杰理上重定向到 UART(串口),不会崩溃。加互斥锁防多线程    */
 /*   并发(SDK 的 on_event/on_audio 回调在 worker 线程,主循环在 agentic 线程)。*/
-/*   参考 xiaozhi-esp32 的 iot_log_cb 实现(tuya_protocol.cc:102)。           */
 /* ========================================================================= */
 #include "tai_log.h"   /* log_set_handler / LOG_* 枚举 */
 

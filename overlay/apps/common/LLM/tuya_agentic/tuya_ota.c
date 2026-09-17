@@ -13,7 +13,7 @@
  *     http_ops 内部根据 URL 的 https:// 前缀自动走 TLS(mbedtls VERIFY_OPTIONAL,
  *     不配 CA 也能握手),涂鸦给的 httpsUrl / cdnUrl 都能下。
  *
- * 流程(对齐 xiaozhi-esp32 的 Ota::CheckTuyaVersion):
+ * 流程:
  *   1. check_upgrade  -> 无升级:返回 0(继续连 AI)
  *   2. report_status(UPGRADING)
  *   3. 播报"正在升级"提示音
@@ -126,7 +126,7 @@ static int tuya_ota_do_upgrade(iot_client_t *client, tuya_iot_ota_upgrade_info_t
 
     if (dl_ret == 0) {
         /* 成功:get_update_data 内部 net_fclose 已烧 boot info 并安排 2s 后 system_reset。
-         * 抢在这 2s 窗口内上报 FINI(对齐 xiaozhi-esp32:reboot 前上报成功)。
+         * 抢在这 2s 窗口内上报 FINI。
          * 版本号已在下载前写入 VM,这里不再碰 VM(避免和 reset 撞车损坏数据)。*/
         free(ver_copy);
         printf("[TUYA-OTA] flash done, report FINI & wait reboot...\r\n");

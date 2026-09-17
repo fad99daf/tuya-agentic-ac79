@@ -2,7 +2,7 @@
 
 End-side port of **Tuya agentic-kit** (AI Agent cloud voice chat) onto the **JieLi AC791N (wl82) AIoT SDK**. Communicates with the cloud AI over Tuya's tRTC realtime channel.
 
-> This repo contains **only the integration code** (the new `tuya_agentic/` plus minor edits to the official SDK). The JieLi SDK itself is **not** included and must be obtained separately. README structure inspired by [xiaozhi-esp32 (Tuya edition)](https://github.com/fad99daf/xiaozhi-esp32).
+> This repo contains **only the integration code** (the new `tuya_agentic/` plus minor edits to the official SDK). The JieLi SDK itself is **not** included and must be obtained separately.
 
 ---
 
@@ -24,7 +24,7 @@ End-side port of **Tuya agentic-kit** (AI Agent cloud voice chat) onto the **Jie
 - **Persistent credentials** — device triple (devid/secret/localkey) written to VM after activation; direct-connect on later boots
 - **K6 factory reset** — notifies cloud removal when possible, without awaiting a response, then always clears local credentials and re-enters provisioning
 
-> Note: this port does **not** include image understanding/generation or device MCP (not implemented on the device side). Cloud AI capabilities depend on the Tuya platform configuration.
+> Note: this port does not include image understanding/generation. Its device MCP server exposes the standard `self.audio_speaker.set_volume` tool, allowing the cloud agent to set TTS speaker volume from 0 to 100. The callback only queues work; the existing session task executes it without an MCP keep-alive thread. Cloud AI capabilities still depend on the Tuya platform configuration.
 
 ---
 
@@ -224,4 +224,3 @@ Integration code: Apache-2.0 (same as the JieLi SDK). Pulled-in modules under `a
 
 - [Tuya agentic-kit](https://github.com/tuya) — AI Agent device SDK
 - [JieLi AC79 AIoT SDK](https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK) — chip SDK
-- [xiaozhi-esp32 (Tuya edition)](https://github.com/fad99daf/xiaozhi-esp32) — README structure reference
