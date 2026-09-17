@@ -20,15 +20,10 @@
 #define MSG_AUDIO_RECORDER_FIRST_PLAY_NEXT_TEST   9
 #define MSG_STOP_AUDIO_RECORDER_AND_START_PLAY_TEST   10
 #define MSG_AUDIO_RECORDER_FIRST_PLAY_NEXT_STOP_PLAY_TEST   11
-#define MSG_SET_NET_AUDIO_VOLUME  12
 
 
 #define AUDIO_PLAY_VOICE_VOLUME   50    /* 下行 TTS 播放音量(0-100)。原 80 太大,改 50。要运行时调见 AUDIO_DEC_SET_VOLUME */
 #define AUDIO_RECORD_VOICE_VOLUME 100
-
-/* 由 audio_task 串行提交到 audio_server。即使当前没有播放，仍保留该值，
- * 使下一次 TTS 打开时使用用户最后一次语音设定。 */
-static volatile int g_audio_play_volume = AUDIO_PLAY_VOICE_VOLUME;
 
 #if defined CONFIG_VOLC_LLM_ENABLE
 #define AUDIO_RECORD_VOICE_UPLORD_LEN (320)
@@ -565,7 +560,7 @@ static void audio_player_net_init()
     union audio_req req = {0};
 
     req.dec.cmd             = AUDIO_DEC_OPEN;
-    req.dec.volume          = g_audio_play_volume;
+    req.dec.volume          = AUDIO_PLAY_VOICE_VOLUME;
     req.dec.output_buf_len  = 8 * 1024;
     req.dec.priority        = 1;
     req.dec.channel         = CHANNEL;  /*dac 差分输出 单路*/
@@ -698,21 +693,6 @@ void _device_net_audio_recorder(bool flag)
 
 }
 //***************************************************************
-int _device_set_play_volume(int volume)
-{
-    if (volume < 0 || volume > 100) {
-        return -1;
-    }
-
-    g_audio_play_volume = volume;
-    return _send_audio_msg(MSG_SET_NET_AUDIO_VOLUME, &volume, sizeof(volume));
-}
-
-int _device_get_play_volume(void)
-{
-    return g_audio_play_volume;
-}
-
 bool is_audio_play_open(void)
 {
     return g_audio_hdl.is_audio_play_open;
@@ -755,28 +735,6 @@ static void __audio_task(void *pArg)
             cbuf_clear(&g_audio_hdl.pcm_cbuff_r);
             g_audio_hdl.is_audio_play_open = FALSE;
             _audio_player_stop();
-        }
-        break;
-
-        case MSG_SET_NET_AUDIO_VOLUME: {
-            int volume;
-            union audio_req req = {0};
-
-            if (!msg_data->data || msg_data->data_len != sizeof(volume)) {
-                break;
-            }
-            memcpy(&volume, msg_data->data, sizeof(volume));
-            if (volume < 0 || volume > 100) {
-                break;
-            }
-
-            g_audio_play_volume = volume;
-            if (g_audio_hdl.is_audio_play_open && g_audio_hdl.dec_server) {
-                req.dec.cmd = AUDIO_DEC_SET_VOLUME;
-                req.dec.volume = volume;
-                op_ret = server_request(g_audio_hdl.dec_server, AUDIO_REQ_DEC, &req);
-                audio_debug("set net audio volume=%d err=%d", volume, op_ret);
-            }
         }
         break;
 
