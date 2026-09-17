@@ -25,6 +25,7 @@
 #include "tuya_ai.h"
 #include "tuya_ai_select.h"        /* 传输层选择:TUYA_TRANSPORT_STM_ENABLE=1 时 tai_* 重定向到 stm(UDP优先)后端 */
 #include "tuya_agentic.h"
+#include "tuya_mcp.h"
 #include "tuya_ble_prov.h"        /* tuya_ble_wifi_creds_t(BLE 配网结果类型)*/
 #ifdef TUYA_MUSIC_ENABLE
 #include "tuya_music.h"           /* 音乐 SKILL 文本流重组+解析(实现 tuya_music.c) */
@@ -56,8 +57,6 @@ int  get_recoder_state(void);
 unsigned int _device_get_voice_level(void);   /* 录音 cbuf 水位,诊断上行是否丢话头 */
 unsigned int _device_get_play_level(void);    /* 下行播放 cbuf 水位:排空≈DAC 播完 */
 void _device_net_audio_play(bool flag);       /* 停/起 TTS 网络播放器(音乐交接时让出/收回 DAC) */
-int  _device_set_play_volume(int volume);     /* 异步投递给 audio_task，范围 0-100 */
-int  _device_get_play_volume(void);
 
 /* ===== 上行延迟诊断开关(定位"打断不佳"用)=====
  * 打开后在 tai_send_audio_chunk 前后打时间戳,超 UPLINK_LAT_WARN_MS 才打印(避免刷屏)。
@@ -577,219 +576,26 @@ static void on_audio(tai_ctx_t *ctx, const tai_audio_msg_t *msg, void *ud)
     _device_write_voice_data((void *)msg->data, msg->len);
 }
 /* ------------------------------------------------------------------------- */
-/* MCP 回应延迟发送(防死锁,与 stm 库日志环形缓冲同一套路)                      */
+/* MCP response dispatch                                                     */
 /* ------------------------------------------------------------------------- */
-/* TAI_EVT_MCP_CMD 回调在 stm 引擎线程上下文执行(tstm_on_data_recv 直接派发)。
- * 若在回调里同步 tai_send_mcp_response → 从引擎线程再进库的发送路径,而 demo
- * 任务此刻可能正在发音频包:两条路径在库内同一会话锁上互等 → 双双永久卡死
- * (2026-08-31 第五轮实测:MCP initialize 恰在音频上行中到达,demo 任务从第 3
- * 帧起再无任何输出,无 exception,VAD 线程日志照常——轮 4 两次 MCP 都在空闲
- * 期到达所以没踩到)。对策:回调只把回应存进 pending,由 demo 任务在 20ms 级
- * 循环节拍处 mcp_resp_pump() 真正发送。TCP 模式回调同样不在 demo 任务,一并
- * 走延迟(云端对 ≤60ms 的回应延迟无感)。 */
-/* tools/list 的 JSON schema 比普通 text 回应长；保留完整响应，避免云端认为
- * MCP server 不支持自定义工具。 */
-static char s_mcp_resp[768];
-static volatile unsigned s_mcp_resp_len;      /* 0=无待发 */
-static volatile unsigned s_mcp_resp_drops;    /* 新回应覆盖未发走旧回应的次数 */
-static void mcp_resp_defer(const char *resp, unsigned len);
-
-static const char *mcp_value_after_key(const char *json, const char *key)
-{
-    const char *p = json;
-    size_t key_len = strlen(key);
-
-    while ((p = strstr(p, key)) != NULL) {
-        p += key_len;
-        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-        if (*p == ':') {
-            p++;
-            while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-            return p;
-        }
-    }
-    return NULL;
-}
-
-static int mcp_copy_string(const char *json, const char *key, char *out, unsigned out_size)
-{
-    const char *p = mcp_value_after_key(json, key);
-    unsigned n = 0;
-
-    if (!p || *p++ != '"' || out_size == 0) return -1;
-    while (*p && *p != '"') {
-        /* MCP method/tool names are ASCII identifiers. Refuse escape sequences
-         * rather than interpreting a malformed request as a known tool. */
-        if (*p == '\\' || n + 1 >= out_size) return -1;
-        out[n++] = *p++;
-    }
-    if (*p != '"') return -1;
-    out[n] = 0;
-    return 0;
-}
-
-static int mcp_copy_id(const char *json, char *out, unsigned out_size)
-{
-    const char *p = mcp_value_after_key(json, "\"id\"");
-    const char *start;
-    unsigned n;
-
-    if (!p || out_size < 2) return -1;
-    start = p;
-    if (*p == '"') {
-        p++;
-        while (*p && *p != '"' && *p != '\\') p++;
-        if (*p != '"') return -1;
-        p++;
-    } else {
-        while (*p >= '0' && *p <= '9') p++;
-        if (p == start) return -1;
-    }
-    n = (unsigned)(p - start);
-    if (n + 1 > out_size) return -1;
-    memcpy(out, start, n);
-    out[n] = 0;
-    return 0;
-}
-
-static int mcp_get_volume(const char *json, int *volume)
-{
-    const char *p = mcp_value_after_key(json, "\"volume\"");
-    int v = 0;
-
-    if (!p || *p < '0' || *p > '9') return -1;
-    do {
-        v = v * 10 + (*p++ - '0');
-        if (v > 100) return -1;
-    } while (*p >= '0' && *p <= '9');
-    /* omniClient serializes tool arguments as JSON doubles (for example 50.0)
-     * even though set_volume declares an integer schema.  Accept a fractional
-     * suffix only when it is mathematically still an integer; values such as
-     * 50.5 remain invalid rather than being silently rounded. */
-    if (*p == '.') {
-        const char *fraction = ++p;
-
-        while (*p >= '0' && *p <= '9') {
-            if (*p++ != '0') return -1;
-        }
-        if (p == fraction) return -1;
-    }
-    if (*p && *p != ',' && *p != '}' && *p != ']' &&
-        *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') return -1;
-    *volume = v;
-    return 0;
-}
-
-static void mcp_defer_error(const char *id, int code, const char *message)
-{
-    char resp[sizeof(s_mcp_resp)];
-    int n = snprintf(resp, sizeof(resp),
-                     "{\"jsonrpc\":\"2.0\",\"id\":%s,\"error\":{\"code\":%d,\"message\":\"%s\"}}",
-                     id, code, message);
-    if (n > 0 && n < (int)sizeof(resp)) mcp_resp_defer(resp, (unsigned)n);
-}
-
-/* Device-side custom MCP server. The cloud discovers set_volume through
- * tools/list and invokes it with {"name":"set_volume","arguments":{"volume":N}}.
- * Also accept a direct set_volume method for the older device-MCP examples. */
-static void mcp_handle_request(const char *json)
-{
-    char id[40] = "1";
-    char method[40];
-    char tool_name[40];
-    char resp[sizeof(s_mcp_resp)];
-    int n;
-    int volume;
-
-    (void)mcp_copy_id(json, id, sizeof(id));
-    if (mcp_copy_string(json, "\"method\"", method, sizeof(method)) != 0) {
-        mcp_defer_error(id, -32600, "invalid request");
-        return;
-    }
-    if (!strcmp(method, "initialize") || !strcmp(method, "mcp/initialize")) {
-        n = snprintf(resp, sizeof(resp),
-                     "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{"
-                     "\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},"
-                     "\"serverInfo\":{\"name\":\"ac79-volume\",\"version\":\"1.0\"}}}", id);
-    } else if (!strcmp(method, "tools/list")) {
-        n = snprintf(resp, sizeof(resp),
-                     "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"tools\":[{"
-                     "\"name\":\"set_volume\",\"description\":\"Set the device TTS speaker volume from 0 to 100 percent.\","
-                     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"volume\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":100}},\"required\":[\"volume\"]}}]}}", id);
-    } else if (!strcmp(method, "set_volume") ||
-               (!strcmp(method, "tools/call") &&
-                mcp_copy_string(json, "\"name\"", tool_name, sizeof(tool_name)) == 0 &&
-                !strcmp(tool_name, "set_volume"))) {
-        if (mcp_get_volume(json, &volume) != 0) {
-            mcp_defer_error(id, -32602, "volume must be an integer from 0 to 100");
-            return;
-        }
-        if (_device_set_play_volume(volume) != 0) {
-            mcp_defer_error(id, -32603, "could not queue volume change");
-            return;
-        }
-        n = snprintf(resp, sizeof(resp),
-                     "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\":[{\"type\":\"text\","
-                     "\"text\":\"Volume set to %d%%\"}],\"structuredContent\":{\"volume\":%d}}}",
-                     id, _device_get_play_volume(), _device_get_play_volume());
-        printf("[TUYA-MCP] set_volume=%d queued\r\n", volume);
-    } else {
-        mcp_defer_error(id, -32601, "method not found");
-        return;
-    }
-
-    if (n > 0 && n < (int)sizeof(resp)) {
-        mcp_resp_defer(resp, (unsigned)n);
-    } else {
-        mcp_defer_error(id, -32603, "response too large");
-    }
-}
-
-static void mcp_resp_defer(const char *resp, unsigned len)
-{
-    OS_ENTER_CRITICAL();
-    if (s_mcp_resp_len) {
-        s_mcp_resp_drops++;    /* 上一条还没发走就被覆盖:云端按序等回应,极少发生 */
-    }
-    if (len > sizeof(s_mcp_resp) - 1) {
-        len = sizeof(s_mcp_resp) - 1;
-    }
-    memcpy(s_mcp_resp, resp, len);
-    s_mcp_resp[len] = 0;
-    s_mcp_resp_len = len;
-    OS_EXIT_CRITICAL();
-}
-
-/* demo 任务循环节拍处调用(与 tai_log_flush 同批):把待发 MCP 回应真正发出 */
+/* on_event runs in the Agentic transport worker.  As in xiaozhi-esp32,
+ * it only queues MCP work; the existing session task calls this non-blocking
+ * service hook at its normal scheduling points.  No MCP keep-alive task or
+ * wait loop is created. */
 static void mcp_resp_pump(tai_ctx_t *ctx)
 {
-    char buf[sizeof(s_mcp_resp)];
-    unsigned len, n, drops;
-    int rc;
+    int sent = tuya_mcp_pump(ctx);
 
-    if (!s_mcp_resp_len) {
-        return;
-    }
-    OS_ENTER_CRITICAL();
-    len = s_mcp_resp_len;
-    n = (len < sizeof(buf)) ? len : sizeof(buf) - 1;
-    memcpy(buf, s_mcp_resp, n);
-    drops = s_mcp_resp_drops;
-    s_mcp_resp_drops = 0;
-    s_mcp_resp_len = 0;        /* 先取走:发送失败不重试,云端超时会重发请求 */
-    OS_EXIT_CRITICAL();
-    buf[n] = 0;
-    rc = tai_send_mcp_response(ctx, buf);
 #if TUYA_STM_MCP_VIA_TEXT
-    if (rc == TAI_OK) {
+    if (sent > 0) {
         s_mcp_text_reply_pending = 1;
         s_mcp_text_break_request = 0;
         s_mcp_text_break_sent = 0;
         s_mcp_text_reply_deadline = timer_get_ms() + 5000;
     }
+#else
+    (void)sent;
 #endif
-    printf("[TUYA-MCP] resp(%u B) rc=%d%s\r\n", len, rc,
-           drops ? " (pending overwritten!)" : "");
 }
 
 #define TUYA_OPUS_FRAME_LEN 1280   /* PCM 16k/16bit/mono 40ms = 1280B/帧(原 opus 180B 改 PCM) */
@@ -1218,17 +1024,13 @@ static void on_event(tai_ctx_t *ctx, const tai_event_msg_t *msg, void *ud)
         g_server_vad_stop = 1;   /* 上行中收到 = 云端VAD判停说; TTS中收到 = barge-in回执(两者都OK) */
 #endif
     } else if (msg->event_type == TAI_EVT_MCP_CMD) {
-        /* MCP JSON-RPC 到达于引擎 worker。这里只做有界复制、校验和投递：
-         * 音量更新由 audio_task 串行执行，回应仍由 demo 主循环异步发送。 */
-        printf("[TUYA-MCP] recv len=%u: %.*s\r\n",
+        /* Transport callbacks must never call tai_send_* or the audio server.
+         * Parse and queue only; tuya_mcp_pump() performs the scheduled board
+         * action and response send from the existing session task. */
+        printf("[TUYA-MCP] recv len=%u: %.*s\\r\\n",
                (unsigned)msg->len, (int)(msg->len < 512 ? msg->len : 512),
                msg->data ? (const char *)msg->data : "(null)");
-        char pbuf[512];
-        unsigned pl = (msg->data && msg->len) ? msg->len : 0;
-        if (pl > sizeof(pbuf) - 1) pl = sizeof(pbuf) - 1;
-        memcpy(pbuf, msg->data ? msg->data : "", pl);
-        pbuf[pl] = 0;
-        mcp_handle_request(pbuf);
+        tuya_mcp_on_command(msg->data, msg->len);
     }
 }
 static void on_disconnect(tai_ctx_t *ctx, const tai_disconnect_msg_t *msg, void *ud)
@@ -1327,7 +1129,10 @@ void tuya_agentic_demo(void *arg)
      *   内部已把 PAL/连接存到全局,deinit 才会断。不 deinit = MQTT 不断。
      *   如果出问题(SESSION_CLOSE),改回 deinit 即可。*/
     /* iot_client_deinit(iot); */
-    static const char SESSION_ATTRS[] = "{\"deviceMcp\":{\"supportCustomMCP\":true}}";
+    /* This legacy one-shot text probe blocks in its own reply wait and has no
+     * session scheduler.  Do not advertise MCP here; production MCP lives in
+     * tuya_ai_session(), whose regular voice loop services the queue. */
+    static const char SESSION_ATTRS[] = "{\"deviceMcp\":{\"supportCustomMCP\":false}}";
 #ifdef TUYA_SERVER_VAD_ENABLE
     static const char EVENT_USER_DATA[] =
         "{\"asr.enableVad\":\"true\","
@@ -1904,6 +1709,8 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
     tc.pal = pal; tc.on_text = on_text; tc.on_audio = on_audio;
     tc.on_event = on_event; tc.on_disconnect = on_disconnect; tc.user_data = &dc;
 
+    /* A reconnect must not send a reply that belongs to the retired session. */
+    tuya_mcp_reset();
     void *mem = pal->malloc(tai_ctx_size());
     if (!mem) return 0;
     tai_ctx_t *ctx = tai_ctx_init(mem, &tc);

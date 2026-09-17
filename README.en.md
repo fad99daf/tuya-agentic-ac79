@@ -24,7 +24,7 @@ End-side port of **Tuya agentic-kit** (AI Agent cloud voice chat) onto the **Jie
 - **Persistent credentials** — device triple (devid/secret/localkey) written to VM after activation; direct-connect on later boots
 - **K6 factory reset** — notifies cloud removal when possible, without awaiting a response, then always clears local credentials and re-enters provisioning
 
-> Note: this port does not include image understanding/generation. Its device MCP server exposes `set_volume`, allowing the cloud agent to set TTS speaker volume from 0 to 100. Cloud AI capabilities still depend on the Tuya platform configuration.
+> Note: this port does not include image understanding/generation. Its device MCP server exposes the standard `self.audio_speaker.set_volume` tool, allowing the cloud agent to set TTS speaker volume from 0 to 100. The callback only queues work; the existing session task executes it without an MCP keep-alive thread. Cloud AI capabilities still depend on the Tuya platform configuration.
 
 ---
 
