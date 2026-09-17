@@ -2,7 +2,7 @@
 
 把 **涂鸦 agentic-kit**(AI Agent 云端语音对话)移植到 **杰理 AC791N (wl82) AIoT SDK** 的端侧对接代码。底层通过涂鸦 tRTC 实时通道与云端 AI 交互。
 
-> 本仓只含 **对接代码**(新增的 `tuya_agentic/` + 对官方 SDK 的少量改动),**不含杰理 SDK 本体**,需配合官方 SDK 使用。README 写法参考了 [xiaozhi-esp32 涂鸦版](https://github.com/fad99daf/xiaozhi-esp32)。
+> 本仓只含 **对接代码**(新增的 `tuya_agentic/` + 对官方 SDK 的少量改动),**不含杰理 SDK 本体**,需配合官方 SDK 使用。
 
 ---
 
@@ -233,4 +233,3 @@ tuya-agentic-ac79/
 
 - [涂鸦 agentic-kit](https://github.com/tuya) — AI Agent 端侧 SDK
 - [杰理 AC79 AIoT SDK](https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK) — 芯片 SDK
-- [xiaozhi-esp32 涂鸦版](https://github.com/fad99daf/xiaozhi-esp32) — README 结构参考

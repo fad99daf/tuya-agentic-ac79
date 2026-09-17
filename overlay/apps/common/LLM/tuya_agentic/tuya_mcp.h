@@ -7,8 +7,7 @@
  * Device MCP bridge.
  *
  * The transport callback only parses and enqueues work.  tuya_mcp_pump() is
- * called by the already-running Agentic session task and never waits; this is
- * equivalent to xiaozhi-esp32's Application::Schedule() handoff.
+ * called by the already-running Agentic session task and never waits.
  */
 void tuya_mcp_reset(void);
 void tuya_mcp_on_command(const void *data, unsigned int len);

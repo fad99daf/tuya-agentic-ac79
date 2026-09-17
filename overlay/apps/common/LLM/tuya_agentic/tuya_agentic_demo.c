@@ -578,8 +578,8 @@ static void on_audio(tai_ctx_t *ctx, const tai_audio_msg_t *msg, void *ud)
 /* ------------------------------------------------------------------------- */
 /* MCP response dispatch                                                     */
 /* ------------------------------------------------------------------------- */
-/* on_event runs in the Agentic transport worker.  As in xiaozhi-esp32,
- * it only queues MCP work; the existing session task calls this non-blocking
+/* on_event runs in the Agentic transport worker.
+ * It only queues MCP work; the existing session task calls this non-blocking
  * service hook at its normal scheduling points.  No MCP keep-alive task or
  * wait loop is created. */
 static void mcp_resp_pump(tai_ctx_t *ctx)
@@ -2587,7 +2587,7 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
     }
 }
 
-/* 配网等待期循环播报"请配置网络",每 30s 一次,避免用户以为设备死机(tuya/小智的做法)。
+/* 配网等待期循环播报"请配置网络",每 30s 一次,避免用户以为设备死机。
  * tuya_ble_netcfg_start 阻塞,故用独立线程周期播报;配网完成/失败/超时置
  * s_prov_prompt_run=0,线程在 ~0.1s 内退出。NetCfgEnter.mp3 是 app_music 现有提示音。*/
 static volatile int s_prov_prompt_run;
@@ -2778,7 +2778,6 @@ static int tuya_vm_wifi_password_valid(const char *value, int read_len, size_t v
 /* 方案:注册自定义 log handler,用 vsnprintf 格式化到本地 buffer 后用 printf  */
 /*   输出。printf 在杰理上重定向到 UART(串口),不会崩溃。加互斥锁防多线程    */
 /*   并发(SDK 的 on_event/on_audio 回调在 worker 线程,主循环在 agentic 线程)。*/
-/*   参考 xiaozhi-esp32 的 iot_log_cb 实现(tuya_protocol.cc:102)。           */
 /* ========================================================================= */
 #include "tai_log.h"   /* log_set_handler / LOG_* 枚举 */
 

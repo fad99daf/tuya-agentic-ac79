@@ -53,7 +53,7 @@ class McpVolumeTests(unittest.TestCase):
         self.assertNotIn("os_q_pend", self.mcp)
         self.assertNotIn("os_time_dly", self.mcp)
         self.assertNotIn("msleep", self.mcp)
-        self.assertIn("equivalent to xiaozhi-esp32's Application::Schedule() handoff", self.header)
+        self.assertIn("called by the already-running Agentic session task and never waits.", self.header)
 
     def test_text_fallback_is_isolated_from_tcp_mcp_events(self) -> None:
         """TCP emits MCP responses as events, never through the STM TEXT fallback."""

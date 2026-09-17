@@ -203,8 +203,7 @@ void tuya_mcp_on_command(const void *data, unsigned int len)
         } else if (mcp_get_volume(request, &volume) != 0) {
             mcp_enqueue_error(id, -32602, "volume must be an integer from 0 to 100");
         } else {
-            /* Defer the actual board operation to the session task.  This is
-             * the AC79 equivalent of xiaozhi's scheduled tool callback. */
+            /* Defer the actual board operation to the session task. */
             mcp_enqueue_result(id, "{\"content\":[{\"type\":\"text\",\"text\":\"Volume change queued\"}]}", volume);
         }
     } else {
