@@ -55,6 +55,17 @@ class McpVolumeTests(unittest.TestCase):
         self.assertNotIn("msleep", self.mcp)
         self.assertIn("equivalent to xiaozhi-esp32's Application::Schedule() handoff", self.header)
 
+    def test_text_fallback_is_isolated_from_tcp_mcp_events(self) -> None:
+        """TCP emits MCP responses as events, never through the STM TEXT fallback."""
+        text_fallback_guard = "#if TUYA_TRANSPORT_STM_ENABLE && TUYA_STM_MCP_VIA_TEXT"
+        self.assertEqual(self.demo.count(text_fallback_guard), 4)
+        self.assertNotIn("\n#if TUYA_STM_MCP_VIA_TEXT\n", self.demo)
+
+        audio = self.demo[self.demo.index("static void on_audio"):self.demo.index("/* ------------------------------------------------------------------------- */\n/* MCP response dispatch")]
+        pump = self.demo[self.demo.index("static void mcp_resp_pump"):self.demo.index("#define TUYA_OPUS_FRAME_LEN")]
+        self.assertIn(text_fallback_guard, audio)
+        self.assertIn(text_fallback_guard, pump)
+
     def test_volume_validation_accepts_integer_json_doubles_only(self) -> None:
         getter = self.mcp[self.mcp.index("static int mcp_get_volume"):self.mcp.index("static void mcp_enqueue")]
         self.assertIn("if (v > 100) return -1", getter)

@@ -142,7 +142,7 @@ static int g_audio_frame_logged;          /* 下行首帧帧长只打印一次,�
 #ifdef TUYA_SERVER_VAD_ENABLE
 static volatile int g_server_vad_stop;    /* 云端VAD(TAI_EVT_SERVER_VAD)通知停说:上行循环据此收尾。on_event 在 worker 线程置位,主循环读 */
 #endif
-#if TUYA_STM_MCP_VIA_TEXT
+#if TUYA_TRANSPORT_STM_ENABLE && TUYA_STM_MCP_VIA_TEXT
 /* STM 暂用 TEXT 承载 MCP response，云端会误把 JSON 当作一轮用户文本并生成
  * NLG/TTS。下一轮 AUDIO 前由 demo 任务 chat_break 隔离这轮污染。 */
 static volatile unsigned s_mcp_text_reply_pending;
@@ -527,7 +527,7 @@ static void on_audio(tai_ctx_t *ctx, const tai_audio_msg_t *msg, void *ud)
     if (!g_audio_ready || !msg || !msg->len) {
         return;
     }
-#if TUYA_STM_MCP_VIA_TEXT
+#if TUYA_TRANSPORT_STM_ENABLE && TUYA_STM_MCP_VIA_TEXT
     if (s_mcp_text_reply_pending) {
         /* 这次下行属于启动时的 MCP/TEXT 伪聊天轮；标记后丢弃其全部音频。
          * 实测该轮 TTS 在 chat_break 之后约 1.2s 才陆续到达，固定排空窗口
@@ -586,7 +586,7 @@ static void mcp_resp_pump(tai_ctx_t *ctx)
 {
     int sent = tuya_mcp_pump(ctx);
 
-#if TUYA_STM_MCP_VIA_TEXT
+#if TUYA_TRANSPORT_STM_ENABLE && TUYA_STM_MCP_VIA_TEXT
     if (sent > 0) {
         s_mcp_text_reply_pending = 1;
         s_mcp_text_break_request = 0;
@@ -1807,7 +1807,7 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
          *      之前正是这样导致云端 ASR 收到静音、回空文本。*/
         int mcp_text_poll = 0;
         g_wake_break = 0;   /* 唤醒打断标记只在本轮迭代内生效(跳过 ④ 收尾/pending 音乐) */
-#if TUYA_STM_MCP_VIA_TEXT
+#if TUYA_TRANSPORT_STM_ENABLE && TUYA_STM_MCP_VIA_TEXT
         /* MCP response 经 TEXT 发出后，必须先等伪回复并 chat_break，再允许 AUDIO。
          * 否则用户恰好开口会让两个事件重叠，复现“只回空内容、语音无 ASR”。 */
         if (s_mcp_text_reply_pending) {
