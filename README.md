@@ -2,7 +2,7 @@
 
 把 **涂鸦 agentic-kit**(AI Agent 云端语音对话)移植到 **杰理 AC791N (wl82) AIoT SDK** 的端侧对接代码。底层通过涂鸦 tRTC 实时通道与云端 AI 交互。
 
-> 本仓只含 **对接代码**(新增的 `tuya_agentic/` + 对官方 SDK 的少量改动),**不含杰理 SDK 本体**,需配合官方 SDK 使用。README 写法参考了 [xiaozhi-esp32 涂鸦版](https://github.com/fad99daf/xiaozhi-esp32)。
+> 本仓只含 **对接代码**(新增的 `tuya_agentic/` + 对官方 SDK 的少量改动),**不含杰理 SDK 本体**,需配合官方 SDK 使用。
 
 ---
 
@@ -24,7 +24,7 @@
 - **凭据掉电保存** — 设备三元组(devid/secret/localkey)激活后写入 VM,后续开机直连
 - **K6 长按恢复出厂** — 在线时尽力通知云端移除设备；不等待响应，始终清除本地凭据并重新进入配网
 
-> 说明:本端侧不包含图片理解/生成；设备 MCP 已提供 `set_volume`，可让云端智能体把“音量调到 30”转换为 TTS 扬声器音量 0–100。云端 AI 能力仍以涂鸦平台配置为准。
+> 说明:本端侧不包含图片理解/生成；设备 MCP 提供标准工具 `self.audio_speaker.set_volume`，可让云端智能体把“音量调到 30”转换为 TTS 扬声器音量 0–100。MCP 回调仅入队，由现有会话任务非阻塞执行，不创建保活线程。云端 AI 能力仍以涂鸦平台配置为准。
 
 ---
 
@@ -233,4 +233,3 @@ tuya-agentic-ac79/
 
 - [涂鸦 agentic-kit](https://github.com/tuya) — AI Agent 端侧 SDK
 - [杰理 AC79 AIoT SDK](https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK) — 芯片 SDK
-- [xiaozhi-esp32 涂鸦版](https://github.com/fad99daf/xiaozhi-esp32) — README 结构参考
