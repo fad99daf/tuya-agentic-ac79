@@ -1027,9 +1027,9 @@ static void on_event(tai_ctx_t *ctx, const tai_event_msg_t *msg, void *ud)
         /* Transport callbacks must never call tai_send_* or the audio server.
          * Parse and queue only; tuya_mcp_pump() performs the scheduled board
          * action and response send from the existing session task. */
-        printf("[TUYA-MCP] recv len=%u: %.*s\\r\\n",
-               (unsigned)msg->len, (int)(msg->len < 512 ? msg->len : 512),
-               msg->data ? (const char *)msg->data : "(null)");
+        /* STM 引擎线程会进入本回调。这里不能 printf：杰理串口输出非
+         * 线程安全，且 JSON 本身不适合在日志中暴露。执行结果仍由会话
+         * 任务中的 tuya_mcp_pump() 输出。 */
         tuya_mcp_on_command(msg->data, msg->len);
     }
 }

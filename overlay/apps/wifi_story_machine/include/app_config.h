@@ -256,7 +256,11 @@
  * 三轮现象闭环:3=云端不认→静默;111 无帧参数=切帧失败→8/31 乱码;
  * 101=PCM 自描述→全通。适配层已改 111+bitrate/fd/fs(tuya_stm_ai.c),
  * 失败注释下一行即回 PCM。*/
-#define TUYA_UPLINK_OPUS_ENABLE
+/* STM MCP 取证期间固定走 PCM。11:32 补充日志显示每次在
+ * `audio start codec=111` 后约 20--60ms 就发生 axi_rd_inv；而本项目的
+ * Opus 编码器说明已将“说话即崩”列为回退到 PCM 的条件。先去掉这个变量，
+ * 让传输/MCP 取证不再混入本地 Opus 编码器风险；STM 稳定后再单独恢复评估。 */
+/* #define TUYA_UPLINK_OPUS_ENABLE */
 
 /* ===== 涂鸦 barge-in(用户打断 TTS)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
  * 不定义(默认)= 不支持打断:TTS 期间不上行,简单稳定。

@@ -10,6 +10,8 @@ MCP = ROOT / "overlay/apps/common/LLM/tuya_agentic/tuya_mcp.c"
 MCP_HEADER = ROOT / "overlay/apps/common/LLM/tuya_agentic/tuya_mcp.h"
 AUDIO = ROOT / "overlay/apps/common/LLM/audio/audio_input.c"
 MAKEFILE = ROOT / "overlay/apps/wifi_story_machine/board/wl82/Makefile"
+STM = ROOT / "overlay/apps/common/LLM/tuya_agentic/stm/tuya_stm_ai.c"
+APP_CONFIG = ROOT / "overlay/apps/wifi_story_machine/include/app_config.h"
 
 
 class McpVolumeTests(unittest.TestCase):
@@ -19,6 +21,8 @@ class McpVolumeTests(unittest.TestCase):
         self.header = MCP_HEADER.read_text(encoding="utf-8")
         self.audio = AUDIO.read_text(encoding="utf-8")
         self.makefile = MAKEFILE.read_text(encoding="utf-8")
+        self.stm = STM.read_text(encoding="utf-8")
+        self.app_config = APP_CONFIG.read_text(encoding="utf-8")
 
     def test_mcp_module_is_built_and_advertised(self) -> None:
         self.assertIn("tuya_mcp.c", self.makefile)
@@ -79,6 +83,20 @@ class McpVolumeTests(unittest.TestCase):
         self.assertIn("g_audio_hdl.is_audio_play_open", task)
         self.assertIn("volume < 0 || volume > 100", task)
         self.assertNotIn("AUDIO_DEC_SET_VOLUME", self.mcp)
+
+    def test_stm_engine_callbacks_do_not_write_uart_or_enable_opus_probe_noise(self) -> None:
+        """STM engine callbacks must not concurrently use the non-thread-safe JL UART."""
+        data_cb = self.stm[self.stm.index("static void tstm_on_data_recv"):
+                           self.stm.index("static void tstm_on_state")]
+        state_cb = self.stm[self.stm.index("static void tstm_on_state"):
+                            self.stm.index("/* ------------------------------------------------------------------------- */\n/* 上行")]
+        event = self.demo[self.demo.index("} else if (msg->event_type == TAI_EVT_MCP_CMD)"):]
+        event = event[:event.index("\n    }\n}")]
+        self.assertNotIn("printf(", data_cb)
+        self.assertNotIn("printf(", state_cb)
+        self.assertNotIn("printf(", event)
+        self.assertNotIn("\n#define TUYA_UPLINK_OPUS_ENABLE\n", self.app_config)
+        self.assertIn("#define TUYA_STM_MCP_INSTR_TYPE       1000", self.app_config)
 
 
 if __name__ == "__main__":

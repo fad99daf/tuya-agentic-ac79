@@ -439,15 +439,10 @@ static void tstm_on_data_recv(stm_open_session_t *session,
         return;
     }
 
-    /* OPEN wrapper currently exposes only data_type/cmd_type.  Keep this
-     * compact trace on the application side, and pair it with libstm DEBUG
-     * output to recover the original command-frame instruction type.  Do not
-     * dump payload: session attributes and future tool results may be secret. */
-    printf("[TSTM] recv data=%u cmd=%u fin=%d eid=%s len=%u\r\n",
-           (unsigned)d->data_type, (unsigned)d->cmd_params.cmd_type,
-           (int)fin,
-           (d->event_id && d->event_id[0]) ? d->event_id : "-",
-           (unsigned)d->payload_length);
+    /* libstm 在引擎线程调用本回调。JL printf 不是多线程安全的，不能在此
+     * 直接打印；库的 DEBUG 日志已先入延迟缓冲、再由 demo 任务统一刷出，
+     * 其中的 `open session recv: instruction|type:<N>` 是取证原始类型的
+     * 唯一日志来源。 */
 
     switch (d->data_type) {
     case STM_DATA_TYPE_AUDIO: {
@@ -525,18 +520,12 @@ static void tstm_on_data_recv(stm_open_session_t *session,
         } else if (d->payload && d->payload_length > 2 &&
                    d->payload[0] == '{' &&
                    tstm_payload_contains(d->payload, d->payload_length, "jsonrpc", 7)) {
-            /* MCP 命令。★打出 cmd_type:上行回应该用哪个 instruction type,
-             * 云端下发用的类型号就是权威答案(README 待确认#4/#5;2026-08-31
-             * 实测:发完 type=1000 的回应后云端全沉默,疑似类型号猜错)。*/
-            printf("[TSTM] mcp downlink cmd_type=%u len=%u\r\n",
-                   (unsigned)d->cmd_params.cmd_type, (unsigned)d->payload_length);
+            /* MCP 命令。原始 instruction type 由延迟库日志记录，OPEN
+             * wrapper 传入的 cmd_type 对非 BREAK 指令恒为 0。 */
             m.event_type = TAI_EVT_MCP_CMD;
             m.data = d->payload;
             m.len = d->payload_length;
         } else {
-            printf("[TSTM] unknown cmd(type=%u len=%u)\r\n",
-                   (unsigned)d->cmd_params.cmd_type,
-                   (unsigned)d->payload_length);
             break;
         }
         if (ctx->cfg.on_event) {
@@ -546,9 +535,6 @@ static void tstm_on_data_recv(stm_open_session_t *session,
     }
 
     default:
-        printf("[TSTM] recv type=%u fin=%d len=%u (ignored)\r\n",
-               (unsigned)d->data_type, (int)fin,
-               (unsigned)d->payload_length);
         break;
     }
 }
@@ -563,7 +549,6 @@ static void tstm_on_state(stm_open_session_t *session, uint16_t state, void *use
     }
     if (state == 1) {                /* STM_SESSION_STATE_NEW:会话就绪 */
         ctx->ready = 1;
-        printf("[TSTM] session ready\r\n");
         return;
     }
     if (state == 2) {                /* STM_SESSION_STATE_CLOSE */
@@ -619,6 +604,9 @@ static int tstm_send_instruction(struct tai_ctx *ctx, uint16_t type,
     stm_ret r;
 
     if (!ctx->session || !ctx->ready) {
+        /* 仅由 demo 会话任务调用，安全记录一次发送被会话状态拒绝的原因。 */
+        printf("[TSTM] instr %u rejected session=%p ready=%d\r\n",
+               (unsigned)type, ctx->session, ctx->ready);
         return TAI_ERR_NET;
     }
     sid = (stm_sid_t *)((char *)ctx->session + TSTM_SESSION_SID_OFFSET);
