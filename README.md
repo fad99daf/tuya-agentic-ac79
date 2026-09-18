@@ -10,13 +10,13 @@
 
 - **语音对话** — 实时语音交互(ASR + LLM + TTS)
 - **唤醒词"你好涂鸦"+"嘿涂鸦"** — 涂鸦闭源 KWS 引擎(`kws/audio_subsys.a` v2 算法包,默认模型 fsmn_v8_0515_avg)常开识别,官方 token 注册双唤醒词:你好涂鸦={23,4,27,9,22,5,38,1}(主)、嘿涂鸦={27,8,22,5,38,1},阈值均 0.7。命中播"我在"应答并开 15s 唤醒窗,窗内本地 VAD 才起轮;同句双命中拦截、跨句拼装防护;引擎初始化失败自动回退"常听"。参数速查/调参指南见 [`docs/WAKEWORD.md`](docs/WAKEWORD.md)
-- **上行 ASR** — opus(默认,本地 libopus 1.4 定点软编码,16k/mono/CBR 16kbps/40ms,~2KB/s 仅为 PCM 的 1/16)/ PCM(可选,32KB/s)。mic 管线保持 PCM(VAD/AEC/能量门/barge-in 全不受影响),仅在发送前逐帧编码;编码器初始化失败自动回退 PCM。TCP / UDP 两种传输下均已实测调通
+- **上行 ASR** — PCM(默认,32KB/s,codec=101;2026-09-17 声学测试定稿:opus 下云端 ASR 偶发语种误判/乱码,切 PCM 后消失)/ opus(可选,本地 libopus 1.4 定点软编码,16k/mono/CBR 16kbps/40ms,~2KB/s 仅为 PCM 的 1/16)。mic 管线保持 PCM(VAD/AEC/能量门/barge-in 全不受影响),仅在发送前逐帧编码;编码器初始化失败自动回退 PCM。TCP / UDP 两种传输下均已实测调通
 - **下行 TTS** — opus(默认,~2KB/s 治拥挤网络卡顿)/ PCM(可选,稳定)。opus 已调通:CBR + `sample_rate=0` 自动重采样
 - **传输层可选(TCP / UDP)** — 默认 TCP(`rtc-tcp-client` 源码直连,行为与历史版本一致);可切涂鸦团队预编译的 STM OPEN SDK(`stm/libstm_tuya.a`,UDP/DTLS 与 TCP 竞速、UDP 优先、不通自动回落),`TUYA_TRANSPORT_STM_ENABLE` 一个开关切换,两个后端同时编译共存。切换细节与已知差异见 `stm/README.md`
 - **DNS 降噪强化** — 嘈杂环境 ASR 优化:强制开 DNS 位(不受 flash 旧配置影响)+ 降噪强度 over_drive=3,实测底噪基线 9k~64k → 3k~6k;若小声说话被吃,在 `user_cfg.c` 覆盖块回调 2.0~2.5
-- **打断 (barge-in)** — AEC + VAD + 多帧能量确认,用户可随时打断 TTS(依赖 AEC)。空闲起轮与播报中打断用两道独立能量门(`BARGE_MIN_ENERGY` 10 万 / `BARGE_CONFIRM_ENERGY` 60 万),后者专门抗 TTS 回声的 AEC 残留误触发(实测残留确认帧 <40 万、真人插话 >110 万,取 60 万居中)
+- **打断 (barge-in)** — AEC + VAD + 多帧能量确认,用户可随时打断 TTS(依赖 AEC)。空闲起轮与播报中打断用两道独立能量门(`BARGE_MIN_ENERGY` 10 万 / `BARGE_CONFIRM_ENERGY` 60 万),后者专门抗 TTS 回声的 AEC 残留误触发(实测残留确认帧 <40 万、真人插话 >110 万,取 60 万居中)。TTS 音频断续下发的"孤儿"片段同样可被 VAD+3 帧能量确认打断;停说收尾前冲刷 mic 缓冲尾音(≤320ms),防句尾字被掐
 - **音乐播放** — "播放XXX的歌":云端音乐 SKILL 回试听 mp3 URL,设备解析后走杰理网络解码链播放(https 自动 TLS);TTS 报幕后让出 DAC、播完自动恢复,播放中说话可打断停乐(VAD+3 帧能量门)。⚠️ 试听片段 ~30s,完整歌曲需在涂鸦平台购买音乐高级能力授权
-- **云端 VAD 停说判定** — 开口永远本地 VAD;停说由云端事件决定(TAI 2.1 协议经 ChatBreak 通知停说,代码兼容处理 ServerVad),带本地 2s 静音超时兜底(TCP 通道)。STM/UDP 通道下该事件暂不可区分,自动退化为本地静音兜底,见 `stm/README.md`
+- **云端 VAD 停说判定** — 开口永远本地 VAD;停说由云端事件决定(TAI 2.1 协议经 ChatBreak 通知停说,代码兼容处理 ServerVad),带本地 VAD 兜底(云端停说事件丢失时本地判停收尾,TCP 通道)。STM/UDP 通道下该事件暂不可区分,自动退化为本地静音兜底,见 `stm/README.md`
 - **MQTT 常驻 + DP 下行** — MQTT 与 AI 的 TLS 各自独立连接并存,`tuya_mqtt_ka` 线程维持心跳收 DP 下行(10ms 轮询,下发延迟毫秒级);App 里设备保持在线,云端下发的 DP/MCP 命令实时可收(`on_dp_downlink` / `on_event`)
 - **TTS 首字预蓄水** — 每轮 TTS 开头先攒 ~160ms 音频再喂解码器,治首帧短包 underrun 卡顿
 - **涂鸦云 OTA** — 开机连 AI 前检查升级,有新固件则下载烧写自动重启(双备份方式)
@@ -135,8 +135,8 @@ make ac791n_wifi_story_machine
 | `TUYA_BARGE_IN_ENABLE` | 用户打断 TTS(强依赖 AEC,实验性) | 开 |
 | `TUYA_KWS_ENABLE` | 唤醒词"你好涂鸦"(主)+"嘿涂鸦"门控(闭源引擎常开识别,失败自动回退常听)。**默认关=常听模式**;要启用把 `app_config.h` 里该行整行注释去掉(⚠️`#ifdef` 语义,置 0 无效),详见 `docs/WAKEWORD.md` | **关(常听)** |
 | `TUYA_DOWNLINK_OPUS_ENABLE` | 下行 TTS 用 opus(治卡顿);注释则用 PCM | 开 |
-| `TUYA_UPLINK_OPUS_ENABLE` | 上行 ASR 用本地 libopus 定点软编码(~2KB/s);注释则 PCM(32KB/s) | 开 |
-| `TUYA_SERVER_VAD_ENABLE` | 云端 VAD 停说判定(开口仍本地 VAD;本地 2s 静音兜底) | 开 |
+| `TUYA_UPLINK_OPUS_ENABLE` | 上行 ASR 用本地 libopus 定点软编码(~2KB/s);注释则 PCM(32KB/s,codec=101,声学测试定稿) | 关(PCM) |
+| `TUYA_SERVER_VAD_ENABLE` | 云端 VAD 停说判定(开口仍本地 VAD;本地 VAD 兜底) | 开 |
 | `TUYA_MUSIC_ENABLE` | 音乐技能:解析音乐 SKILL 交网络解码链播放,支持说话停乐 | 开 |
 | `TUYA_OTA_ENABLE` / `TUYA_FIRMWARE_VERSION` | 涂鸦云 OTA;版本号为手动方案(发版前改宏与平台一致) | 1 / "1.0.11" |
 

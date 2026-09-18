@@ -255,8 +255,11 @@
  * STM/UDP 官方 demo(udp_chat_demo,Mac 实测可用)audio_params 全填。
  * 三轮现象闭环:3=云端不认→静默;111 无帧参数=切帧失败→8/31 乱码;
  * 101=PCM 自描述→全通。适配层已改 111+bitrate/fd/fs(tuya_stm_ai.c),
- * 失败注释下一行即回 PCM。*/
-#define TUYA_UPLINK_OPUS_ENABLE
+ * 失败注释下一行即回 PCM。
+ * 2026-09-17 晚:声学测试期 ASR 频繁不准(语种误判 ar/fr/de、乱码、播报原文转写),
+ * 疑上行 Opus(2KB/s)下云端 ASR 质量——注释宏回 PCM(32KB/s,codec=101)重测;
+ * 09-03 定论 PCM=101 全链路验证通过。恢复 Opus 取消注释即可。*/
+/* #define TUYA_UPLINK_OPUS_ENABLE */
 
 /* ===== 涂鸦 barge-in(用户打断 TTS)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
  * 不定义(默认)= 不支持打断:TTS 期间不上行,简单稳定。
@@ -268,12 +271,41 @@
 /* ===== 涂鸦云端 VAD(停说判定)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
  * 涂鸦语音对话的"开口"永远由本地 VAD(get_recoder_state)负责(云端无法做开口检测)。
  * 这里控制的是"停说"判定:
- * 定义(默认)= 云端 VAD:本地VAD开口后持续上行,云端ASR+VAD分析,云端检测到停说
- *   下发 TAI_EVT_SERVER_VAD 事件 → 设备结束上行。云端模型更强,停说更准。
- *   带"本地超时兜底":云端事件丢失时,本地VAD持续判静音超2秒则强制收尾。
+ * 定义(默认)= 纯云端 VAD:本地VAD开口后持续上行,云端ASR+VAD分析,云端检测到停说
+ *   下发 TAI_EVT_SERVER_VAD(或开了 asr.enableVad 时以 chat_break 表达)→ 设备
+ *   结束上行。本地 VAD 完全不参与停说(TCP 传输时)。
+ *   仅保留与 VAD 无关的纯计时护栏:单轮上行超 10s(云端事件整体丢失时)强制收尾,
+ *   正常测试不会触发(事件正常话尾后 ~1s 到达)。
+ *   ⚠️ STM/UDP 传输时云端停说事件在库层不可达,自动退化为本地判停(库限制)。
  * 不定义 = 本地 VAD:本地VAD直接判停说(get_recoder_state 由1变0即收尾)。
- *   简单但易误判(话没说好就触发→ASR收空文本)。*/
+ *   简单但易误判(话没说好就触发→ASR收空文本)。
+ * 2026-09-16 应声学测试要求改纯云端:TCP 下删除本地静音兜底(此前 2s 静音兜底
+ *   在云端事件晚到时会抢先收尾,污染云端 VAD 测量)。*/
 #define TUYA_SERVER_VAD_ENABLE
+
+/* ===== 涂鸦云端开口检测试验开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
+ * 背景:协议下行事件集里没有"云端开口"信号,设备不推流云端就看不到音频——
+ * 严格的纯云端开口在现协议上不可实现。本开关做的是"哑门+云端裁决":
+ *   本地完全退出开口决策(本地 VAD 状态、KWS 唤醒窗、turn-start 能量复核都
+ *   不再拦截起轮),空闲排空帧能量只要过 TUYA_OPEN_ENERGY_MIN(只拦绝对
+ *   静音)就起轮上行;是否有效语音、何时停说全部由云端 ASR/VAD 裁定。
+ *   打断(barge-in)仍本地:云端看不到开口前的音频,架构上无法替代。
+ * 空轮回收:纯噪声轮云端不下发停说,~3-4s 直接 END 本轮,设备收到就地上行
+ *   收尾;云端偶发对垃圾触发 LLM 的回话(实测回过 😐 表情 TTS)按"空 ASR"
+ *   标记整轮丢弃(TTS 不播、3s 等 TTS 跳过)。
+ * MQTT protocol-9000 asrInterrupt(云端下发的停说)与 TAI 通道 chat_break
+ *   双通道停说,谁先到谁停。
+ * 依赖:TUYA_SERVER_VAD_ENABLE + TCP(TUYA_TRANSPORT_STM_ENABLE=0)
+ *   + TUYA_BARGE_IN_ENABLE(onset 补发复用其 prebuf),不满足编译报错。
+ * ⚠️ 试验关注:AEC 自触发回环(喇叭声过门限→自起轮)、空轮翻滚率与流量
+ *   (~16kbps 持续推流)、双通道停说的错拍(迟到 asrInterrupt 由 speak-start
+ *   复位兜底)。测试完注释掉 TUYA_CLOUD_OPEN_ENABLE 即回纯云端停说基线。
+ * 2026-09-18:试验结束,demo.c 侧引用已全部移除(定稿=本地VAD+能量门开口、
+ *   云端server-vad判停+本地兜底,实测通过),宏无代码引用,注释存档。*/
+/* #define TUYA_CLOUD_OPEN_ENABLE */
+/* 开口门限(试验存档):Σ|int16|/40ms 帧。文档化静音底噪 avg|sample|<50(即 sum<32k),
+ * 取 40k = 平均|sample|≈62,只拦绝对静音;要更灵敏可降到 32k。 */
+/* #define TUYA_OPEN_ENERGY_MIN   40000u */
 
 /* ===== 涂鸦语音通道传输层开关(TCP / UDP)(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
  * 0(默认)= TCP:走原 rtc-tcp-client 源码(tai_*,agentic-kit/modules/rtc-tcp-client),
@@ -292,8 +324,9 @@
  *      上行打断/MCP 回应走库未公开底层接口(有 sid 校验兜底)。*/
 #define TUYA_TRANSPORT_STM_ENABLE     0
 /* 2026-09-04:STM/UDP 联调已通(上行 Opus codec=111+帧参数,中文 ASR/NLG/TTS
- * 正常;上行带宽降为 PCM 的 1/16)。默认仍回 TCP:行为与历史版本完全一致、
- * 云端 VAD 事件原生可用。要体验 UDP 改回 1 即可,证据链见 stm/README.md。 */
+ * 正常;上行带宽降为 PCM 的 1/16)。2026-09-15:UDP 端到端复测通过;再次切 1
+ * 验证 overlay 同步后(MYWO-15/16/17)的 UDP 版本。2026-09-16:验证完毕改回 0
+ * (TCP,行为与历史版本完全一致、云端 VAD 事件原生可用),证据链见 stm/README.md。 */
 
 /* ★唤醒词"你好涂鸦"+"嘿涂鸦"(2026-09-07 声学团队 v2 算法包):
  * 定义  = 启用: 空闲排空帧喂 KWS 引擎(kws/audio_subsys.a,涂鸦闭源),命中

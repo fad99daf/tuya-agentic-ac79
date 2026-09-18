@@ -383,3 +383,31 @@ VM_OPT=0;//单备份...(原样不动)
 - **范围限定**:只作用于默认 TCP 后端;`TUYA_TRANSPORT_STM_ENABLE=1` 走预编译 `libstm_tuya.a`,此补丁不生效。
 - **验证**:SDK 开发树全量 make 编译通过、无告警、固件正常生成。真机复测建议:联网静置 ≥2 小时,串口每 30 分钟应出现 `worker: conn-refresh sent` 与 `CONNECTION_REFRESH_RESP: code=... latest_expire_ts=...`,且 1 小时处不再触发 `on_disconnect`(待真机验证)。
 - **同步范围**:SDK 开发树与 overlay 两份 `rtc-tcp-client/src/{tai_client.c,tai_internal.h,tai_protocol.c}` 已同步(覆盖前 diff 确认 overlay 即改动前版本);`patches/`/`apply` 脚本不涉及(同 R 条目惯例)。
+
+---
+
+## 2026-09-18 增量改动(声学联调定稿:组合 VAD 形态/打断链路修复/上行回 PCM)
+
+### T. `tuya_agentic_demo.c` 打断与收尾链路修复 + 能量门定稿
+
+- **组合 VAD 形态定稿(真机实测通过)**:开口=本地 VAD + 起轮能量门(`BARGE_MIN_ENERGY` 10 万);停说=云端 server-vad 主判 + 本地 VAD 兜底(`LOCAL_SILENCE_TIMEOUT_FRAMES`=1 帧,云端停说事件丢失时收尾);打断确认门恢复 60 万(09-17 噪音实验曾放宽 0/50 万,实验后回退)。
+- **孤儿 TTS 打断**:TTS 音频断续下发时的"孤儿"片段(09-17 晚天气轮实测空洞)——空闲轮 VAD+3 帧能量确认即 chat_break + 清 rbuf,`start_turn` 条件加入 `orphan_tts_stopped`。
+- **prefill 能量回看**:barge-in 历史帧→prefill 增加 `BARGE_PREFILL_CAP`(20 帧)上限,回声段丢弃并打印丢弃计数(旧版整段 hist 塞入,回声会随话音一起上行污染 ASR)。
+- **尾音冲刷**:VAD 判停后立即 audio_end 会把 mic cbuf 里还压着的尾音留在本地,实测"你好涂鸦"被掐成"你好。"——audio_end 前把已缓冲帧冲完(上限 8 帧=320ms)。
+- **验证**:SDK 开发树 clang 单文件编译通过;真机对话/打断/噪音场景实测通过(09-18)。
+
+### U. 上行回 PCM(`TUYA_UPLINK_OPUS_ENABLE` 注释)
+
+- **现象**:声学测试期 ASR 频繁不准——语种误判(ar/fr/de)、乱码、播报原文转写,疑上行 opus(2KB/s)下云端 ASR 质量。
+- **改动**:注释宏回 PCM(32KB/s,codec=101,09-03 已全链路验证);恢复 opus 取消注释即可。
+
+### V. `TUYA_CLOUD_OPEN_ENABLE` 试验存档
+
+- 纯云端开口试验(哑门+云端裁决)结束,demo.c 侧试验代码已移除;宏与 `TUYA_OPEN_ENERGY_MIN` 注释存档,已无代码引用。定稿=本地 VAD 开口 + 云端停说的组合形态。
+
+### 同步范围
+
+- SDK 开发树与 overlay 两份 `tuya_agentic_demo.c` 已同步(凭据占位符惯例不变);`app_config.h`(上行回 PCM、试验宏存档、注释更新)与 `AC791N_WIFI_STORY_MACHINE.cbp`(补上 Makefile 已有而 .cbp 缺失的 `tuya_mcp.c` unit)同步。
+- `patches/tuya-agentic-v1.2.0.patch` 的 app_config.h 与 .cbp 两段已按 V1.2.12 基线(tag `AC79NN_SDK_V1.2.12_2026-03-07`)重新生成,临时原始树 `git apply --check` 全 11 段通过。
+- README.md / README.en.md 口径更新:上行默认 PCM、云端停说本地兜底描述、打断条目补孤儿打断/尾音冲刷、宏表默认列。
+- docs/ 新增《声学测试问题分析与解决方案_20260915.md》《误打断与尾音处理说明_AEC参数.md》。

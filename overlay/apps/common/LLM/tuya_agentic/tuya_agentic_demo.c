@@ -91,12 +91,16 @@ void _device_net_audio_play(bool flag);       /* 停/起 TTS 网络播放器(音
 #define TUYA_WAIT_MS    60000
 #define TUYA_BARGE_COOLDOWN_MS  1000   /* barge-in 后冷却(ms):此窗口内忽略老轮 chat_break 后在途 TTS 残响引起的二次触发(竞态) */
 /* 起轮单帧能量门:Σ|int16|/帧。仅用于空闲起轮(无 TTS,底噪低),100k 够用;
- * 真话音 onset 实测 110万~220万,回声/噪音远低于此。 */
+ * 真话音 onset 实测 110万~220万,回声/噪音远低于此。
+ * (2026-09-17 噪音实验曾置 0=全交云端判定,实验后恢复原值。) */
 #define BARGE_MIN_ENERGY        100000u
-/* 播放中 barge-in 3帧确认门(每帧都要≥此值)。2026-09-04 深圳天气轮日志:
+/* 播放中 barge-in 3帧确认门(每帧都要≥此值),TTS/排空/音乐停播共用。
+ * 2026-09-04 深圳天气轮日志:
  * AEC 残留骗过 3/3 确认三次(各帧 sum 最高仅 38.4万)→ 天气播报被掐、碎片
  * 轮错乱;真人插话确认帧全部 ≥115.9万。取 60万:误触发余量 1.6×,真人余量
- * 1.9×。贴耳小声插话若失灵,降到 50万;TTS 仍被误掐则升到 80万。 */
+ * 1.9×。贴耳小声插话若失灵,降到 50万;TTS 仍被误掐则升到 80万。
+ * (2026-09-17 噪音实验曾降 50万,实验后恢复原值。不能置 0:喇叭回声 3 帧
+ * 即"确认",播放会自杀循环——播放期全开需云端回声判别,端侧无解。) */
 #define BARGE_CONFIRM_ENERGY    600000u
 
 extern const pal_t *tai_pal_ac791n(void);
@@ -610,7 +614,17 @@ static void opus_frame_stat(const unsigned char *p, int len,    /* 定义在后,
  * 补发,云端才能听到完整命令。push 每帧 memmove 57KB@25Hz≈1.4MB/s,可承受;
  * 线性化只在 barge 命中(罕见)时执行一次。*/
 #define BARGE_HIST_FRAMES   45    /* 45*40ms=1.8s 滚动窗口 */
-#define BARGE_PREBUF_FRAMES 60    /* prebuf 容量:hist45+确认3+裕量 */
+#define BARGE_PREFILL_CAP   20    /* hist→prefill 帧数上限(20*40ms=800ms,含确认3帧+话音onset)。
+                                   * 2026-09-17 晚两轮实测:纯 cap12 时"你好涂鸦"8 次中 5 次丢字
+                                   * (丢"好"×3——抢在 TTS 刚响就插话,onset 落在回声区深处,
+                                   * 12 帧窗够不着)。改为能量回溯+上限 20:回声被能量闸切断,
+                                   * 话音 onset 保住。⚠ 音乐期回采 AEC 未消(实测 sum 可达
+                                   * 77万),音乐打断轮回溯会走满 20 帧上限,等同无能量闸
+                                   * (仍好于旧的整段 45 帧)。*/
+#define BARGE_PREFILL_ENERGY 80000u /* 能量回溯门:Σ|int16|/帧。TTS 期自身播报的 AEC 残留
+                                   * 实测 sum≤6.5万(常态<1万),取 8万 切断;正常说话 onset
+                                   * ≥10万。仅作用于历史补发段,不碰实时上行。*/
+#define BARGE_PREBUF_FRAMES 60    /* prebuf 容量:cap20+确认3+裕量 */
 static unsigned char g_barge_prebuf[1280 * BARGE_PREBUF_FRAMES] __attribute__((aligned(4)));   /* 转 short* 进 opus 编码,align 1 全局无偶地址保证,同 abuf */
 static unsigned int g_barge_prefill;
 static unsigned char s_barge_hist[1280 * BARGE_HIST_FRAMES] __attribute__((aligned(4)));
@@ -628,19 +642,33 @@ static void barge_hist_push(const unsigned char *frame)
     }
 }
 
-/* 历史整体(旧→新)作为上行 prefill,接在 prebuf 已有帧(确认帧)之后,复位历史。
- * 调用点:barge-in 确认命中后、停乐排空后——下一轮上行把它们补在最前。*/
+/* 历史最新段(旧→新)作为上行 prefill,接在 prebuf 已有帧(确认帧)之后,复位历史。
+ * 调用点:barge-in 确认命中后、停乐排空后——下一轮上行把它们补在最前。
+ * 取法(2026-09-17 晚 B 方案):窗口=最新 BARGE_PREFILL_CAP 帧,从窗口最旧帧起
+ * 逐帧砍掉头部的低能量帧(<BARGE_PREFILL_ENERGY,回声/静音),首个达话音能量的
+ * 帧起整段保留(话音中间的短暂停顿不切断)。确认 3 帧恒≥50万在尾部,不会被砍光。*/
 static void barge_hist_to_prefill(void)
 {
-    if (s_barge_hist_cnt == 0) {
+    unsigned int cnt = s_barge_hist_cnt, take, sum, act;
+
+    if (cnt == 0) {
         return;
     }
-    memmove(g_barge_prebuf + s_barge_hist_cnt * 1280, g_barge_prebuf,
+    take = (cnt > BARGE_PREFILL_CAP) ? BARGE_PREFILL_CAP : cnt;
+    while (take > 3) {                 /* 尾部 3 帧确认帧永不为 0,循环不掏空 */
+        opus_frame_stat(s_barge_hist + (cnt - take) * 1280, 1280, &sum, &act);
+        if (sum >= BARGE_PREFILL_ENERGY) {
+            break;                     /* 碰到话音能量:从这里起整段保留 */
+        }
+        take--;                        /* 窗口头部是回声/静音:丢弃继续砍 */
+    }
+    memmove(g_barge_prebuf + take * 1280, g_barge_prebuf,
             g_barge_prefill * 1280);
-    memcpy(g_barge_prebuf, s_barge_hist, s_barge_hist_cnt * 1280);
-    g_barge_prefill += s_barge_hist_cnt;
+    memcpy(g_barge_prebuf, s_barge_hist + (cnt - take) * 1280, take * 1280);
+    g_barge_prefill += take;
     s_barge_hist_cnt = 0;
-    printf("[TUYA] barge history -> prefill %u frames\r\n", g_barge_prefill);
+    printf("[TUYA] barge history -> prefill %u frames (hist %u, echo dropped %u)\r\n",
+           g_barge_prefill, cnt, cnt - take);
 }
 
 /* TTS barge-in 确认命中收尾:确认帧已在 barge_in_energy_confirmed 读帧时喂 KWS
@@ -1836,12 +1864,34 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
 #ifdef TUYA_BARGE_IN_ENABLE
         /* barge-in:TTS 期间也听(不再被 g_tts_playing 门控),靠 AEC 去回声保证 VAD 不被喇叭误触发。
          * AEC 不行时这里会让回声触发 VAD→TTS 动辄自断,误触发多就关 TUYA_BARGE_IN_ENABLE 先调 AEC。*/
+        /* ★ 孤儿 TTS 打断(2026-09-17 晚 20:13 天气轮实测空洞):TTS 音频断续下发时,
+         *   首包播完缓冲排空会把主循环晾回 idle,后续音频仍在边到边播。idle 分支原本
+         *   既不起轮(下面 play_level 门,防回声幽灵轮)也没有 barge-in 轮询——"喇叭
+         *   在播+循环在 idle"期间用户说话被 idle drain 直接倒掉(实测平均 137万 的
+         *   真人声整段丢弃,天气播报 9s 完全打不断)。补:喇叭仍在播且 VAD 开时跑与
+         *   ④/排空期同款的 3/3 能量确认;确认即 chat_break+清 rbuf 停播+转 barge-in
+         *   轮(下面 start_turn 对刚停播的轮放行,g_barge_in 使其跳过起轮能量门)。*/
+        int orphan_tts_stopped = 0;
+        if (_device_get_play_level() >= 640 && get_recoder_state() && barge_cooldown_expired()) {
+            if (!barge_in_energy_confirmed()) {
+                printf("[TUYA] barge-in (orphan TTS): VAD fired but energy low, ignored\r\n");
+            } else {
+                printf("[TUYA] barge-in (orphan TTS): VAD while idle-playing → chat_break + stop\r\n");
+                tai_chat_break(ctx);          /* 老轮流可能未 END(还在滴),照 ④ 通知云端中止 */
+                _device_rbuf_clear();         /* 清播放 cbuf,立刻停喇叭 */
+                g_tts_playing = 0;
+                g_barge_in = 1;
+                barge_in_prefill_arm();       /* 确认帧已在历史,打断话音从历史补发 */
+                g_barge_cooldown_until = timer_get_ms() + TUYA_BARGE_COOLDOWN_MS;
+                orphan_tts_stopped = 1;
+            }
+        }
         /* ★ 播放缓冲非空(孤儿 TTS:旧轮 END 把等待骗退/兜底恢复后音频晚到)时不起轮:
          * 喇叭还在播,AEC 劣化态回声就能把 VAD 顶开→幽灵上行轮把故事回声发给云端
          * (2026-09-06 实测 [TTS!] 标记)。唤醒词不受影响(idle 排空照喂引擎),缓冲
          * 排空即恢复起轮;带 g_barge_in 的抢答轮必已清 rbuf,不会被此门误拦。*/
         int start_turn = mcp_text_poll ? 0 :
-                         (get_recoder_state() && _device_get_play_level() < 640);
+                         (get_recoder_state() && (orphan_tts_stopped || _device_get_play_level() < 640));
         /* 普通轮 turn-start 能量门:无唤醒词+单麦开麦,任何持续声响都触发 VAD→设备自言自语。
          * VAD 触发后再核 1 帧能量(近场话音够响),达标才起轮并把这帧作 onset 补发;否则当噪音丢弃。
          * barge-in 轮(g_barge_in)已在 ④/drain 做过能量确认,这里跳过直接起轮。*/
@@ -2155,6 +2205,29 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                 break;
             }
 #endif
+        }
+        /* 尾部冲刷(2026-09-17 晚):VAD 判停后立刻 audio_end 会把 mic cbuf 里还压着
+         * 的尾音(≤0.5s)留在本地——实测"你好涂鸦"被掐成"你好。"(丢"涂鸦")、"你
+         * 说什么"掐成"你对"。audio_end 前把已缓冲的帧冲完(上限 8 帧=320ms;纯冲
+         * 已录音、不等待新帧、无能量判定),云端拿到完整句尾再收 payloads-end。*/
+        if (!g_link_broken && !g_exit) {
+            unsigned char _tb[TUYA_OPUS_FRAME_LEN];
+            unsigned int _tn = 0;
+            while (_tn < 8 && _device_get_voice_level() >= TUYA_OPUS_FRAME_LEN) {
+                if (_device_get_voice_data(_tb, sizeof(_tb)) != TUYA_OPUS_FRAME_LEN) {
+                    break;
+                }
+                if (tai_send_audio_chunk(ctx, _tb, TUYA_OPUS_FRAME_LEN) != TAI_OK) {
+                    printf("[TUYA] tail flush send fail\r\n");
+                    g_link_broken = 1;
+                    break;
+                }
+                _tn++;
+            }
+            if (_tn) {
+                uplink_frames += _tn;
+                printf("[TUYA] tail flush: %u frames\r\n", _tn);
+            }
         }
         {
             int end_rc = tai_send_audio_end(ctx);
