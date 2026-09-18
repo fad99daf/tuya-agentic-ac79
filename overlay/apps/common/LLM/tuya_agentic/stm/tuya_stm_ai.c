@@ -271,7 +271,7 @@ static int tstm_wrap_attr(char *out, size_t outsz, const char *key, const char *
  * 并发打印轻则整行交错、重则内部状态写坏→axi_rd_inv(2026-08-31 轮B实测:
  * DEBUG 洪流下音频首包必崩,寄存器两次逐位一致;日志中有两条整行字符级
  * 交错的实锤)。溢出策略:丢最旧,打一条提示。 */
-#define TSTM_LOG_RING_LINES   16
+#define TSTM_LOG_RING_LINES   64
 #define TSTM_LOG_LINE_MAX     160
 static char s_log_ring[TSTM_LOG_RING_LINES][TSTM_LOG_LINE_MAX];
 static volatile unsigned s_log_w;    /* 只在临界区内改 */
@@ -438,6 +438,16 @@ static void tstm_on_data_recv(stm_open_session_t *session,
     if (!ctx || !d) {
         return;
     }
+
+    /* OPEN wrapper currently exposes only data_type/cmd_type.  Keep this
+     * compact trace on the application side, and pair it with libstm DEBUG
+     * output to recover the original command-frame instruction type.  Do not
+     * dump payload: session attributes and future tool results may be secret. */
+    printf("[TSTM] recv data=%u cmd=%u fin=%d eid=%s len=%u\r\n",
+           (unsigned)d->data_type, (unsigned)d->cmd_params.cmd_type,
+           (int)fin,
+           (d->event_id && d->event_id[0]) ? d->event_id : "-",
+           (unsigned)d->payload_length);
 
     switch (d->data_type) {
     case STM_DATA_TYPE_AUDIO: {
@@ -625,6 +635,8 @@ static int tstm_send_instruction(struct tai_ctx *ctx, uint16_t type,
         printf("[TSTM] instr %u err=%d\r\n", (unsigned)type, (int)r);
         return tstm_map_err(r);
     }
+    printf("[TSTM] instr sent type=%u len=%u\r\n",
+           (unsigned)type, (unsigned)len);
     return TAI_OK;
 }
 #else
@@ -985,7 +997,11 @@ int tstm_send_mcp_response(tai_ctx_t *ctx, const char *json_rpc_response)
         return tstm_send_data(c, &d, 1);
     }
 #else
-    /* 轮 A(对照):私有指令 type=TUYA_STM_MCP_INSTR_TYPE,已实测云端零反应 */
+    /* 取证构建：用候选 instruction 发送与 TCP 相同的 JSON-RPC。不要将
+     * `rc=0` 误判为云端已路由；须在后续下行和云端日志中确认 MCP 语义。 */
+    printf("[TSTM] mcp response via instruction type=%u len=%u\r\n",
+           (unsigned)TUYA_STM_MCP_INSTR_TYPE,
+           (unsigned)strlen(json_rpc_response));
     return tstm_send_instruction(c, TUYA_STM_MCP_INSTR_TYPE,
                                  (const uint8_t *)json_rpc_response,
                                  (uint32_t)strlen(json_rpc_response));

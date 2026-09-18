@@ -290,10 +290,10 @@
  *   ⚠️ 已知行为差异(详见 stm/README.md):云端 VAD 事件(TAI_EVT_SERVER_VAD)
  *      在 stm 下行无法区分表达 → 云端 VAD 模式实际退化为本地静音兜底;
  *      上行打断/MCP 回应走库未公开底层接口(有 sid 校验兜底)。*/
-#define TUYA_TRANSPORT_STM_ENABLE     0
-/* 2026-09-04:STM/UDP 联调已通(上行 Opus codec=111+帧参数,中文 ASR/NLG/TTS
- * 正常;上行带宽降为 PCM 的 1/16)。默认仍回 TCP:行为与历史版本完全一致、
- * 云端 VAD 事件原生可用。要体验 UDP 改回 1 即可,证据链见 stm/README.md。 */
+#define TUYA_TRANSPORT_STM_ENABLE     1
+/* 2026-09-18 STM MCP instruction 映射取证固件：启用 STM OPEN SDK（库内
+ * UDP 优先、失败自动回落 TCP）。本构建只用于真机验证 MCP 上/下行
+ * instruction 类型；取证结束应恢复为 0，除非 STM 路径通过完整回归。 */
 
 /* ★唤醒词"你好涂鸦"+"嘿涂鸦"(2026-09-07 声学团队 v2 算法包):
  * 定义  = 启用: 空闲排空帧喂 KWS 引擎(kws/audio_subsys.a,涂鸦闭源),命中
@@ -314,14 +314,16 @@
  * 回调 printf × demo 任务 printf 无锁撞车,2026-08-31 轮B实测;现库日志已改
  * 环形缓冲延迟打印由 demo 任务统一刷出,崩溃源已除,但 DEBUG 串口量仍大)。*/
 #define TUYA_STM_LOG_PRINT_LEVEL      1
+/* 与上面的应用侧过滤配套：把 libstm 本身也开到 DEBUG。日志先入环形缓冲，
+ * 仅由 demo 任务打印，避免在引擎回调中并发 printf。 */
+#define TUYA_STM_LIB_LOG_LEVEL        1
 /* MCP 回应通道/上行 codec 两项实验 2026-08-31 已定论(证据详见 stm/README.md 第5节):
  * ① codec:轮换实验证明 3=正确(ASR 正常),111=乱码/空 → 已定死 3
  *   (tuya_stm_ai.c TUYA_STM_CODEC_ALTERNATE=0),此处无需再配。
- * ② MCP 回应:必须走 TEXT(TUYA_STM_MCP_VIA_TEXT=1)——2026-09-02 反证实验:
- *   改私有指令 type=1000 后云端对语音全程零响应(管线不激活,三次独立开机
- *   同现象);TEXT 虽被云端当用户聊天输入(开机答非所问一句),但管线能激活。
- *   官方回应通道的类型号待云端 FAE 确认后改 TUYA_STM_MCP_INSTR_TYPE 替换。 */
-#define TUYA_STM_MCP_VIA_TEXT         1
+ * ② MCP 回应:本次取证禁用 TEXT fallback，统一走 instruction。1000 是 TCP
+ *   MCP event 号，仅作为待验证候选；日志必须记录 STM 下行 instruction 信息
+ *   以及对应的上行发送结果，不能据此把 1000 当作已确认的正式类型。 */
+#define TUYA_STM_MCP_VIA_TEXT         0
 #define TUYA_STM_MCP_INSTR_TYPE       1000
 
 /* ===== 涂鸦音乐技能(音乐播放)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
