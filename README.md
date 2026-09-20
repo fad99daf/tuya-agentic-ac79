@@ -10,7 +10,7 @@
 
 - **语音对话** — 实时语音交互(ASR + LLM + TTS)
 - **唤醒词"你好涂鸦"+"嘿涂鸦"** — 涂鸦闭源 KWS 引擎(`kws/audio_subsys.a` v2 算法包,默认模型 fsmn_v8_0515_avg)常开识别,官方 token 注册双唤醒词:你好涂鸦={23,4,27,9,22,5,38,1}(主)、嘿涂鸦={27,8,22,5,38,1},阈值均 0.7。命中播"我在"应答并开 15s 唤醒窗,窗内本地 VAD 才起轮;同句双命中拦截、跨句拼装防护;引擎初始化失败自动回退"常听"。参数速查/调参指南见 [`docs/WAKEWORD.md`](docs/WAKEWORD.md)
-- **上行 ASR** — PCM(默认,32KB/s,codec=101;2026-09-17 声学测试定稿:opus 下云端 ASR 偶发语种误判/乱码,切 PCM 后消失)/ opus(可选,本地 libopus 1.4 定点软编码,16k/mono/CBR 16kbps/40ms,~2KB/s 仅为 PCM 的 1/16)。mic 管线保持 PCM(VAD/AEC/能量门/barge-in 全不受影响),仅在发送前逐帧编码;编码器初始化失败自动回退 PCM。TCP / UDP 两种传输下均已实测调通
+- **上行 ASR** — opus(默认,杰理闭源编码库 `lib_opus_enc.a`/`lib_opus_stenc.a` 经 SDK audio_server "virtual" 源通道驱动,16k/mono/CBR 16kbps/40ms → 恰 80B/包,~2KB/s 仅为 PCM 的 1/16;2026-09-20 定稿,编码任务 CPU 2-3%)/ PCM(可选,32KB/s,codec=101;注释 `TUYA_UPLINK_OPUS_ENABLE` 即回退)。mic 管线保持 PCM(VAD/AEC/能量门/barge-in 全不受影响),仅在发送前逐帧编码;编码器初始化失败自动回退 PCM。TCP 传输实测调通;方案详见 `docs/上行Opus编码_杰理闭源库方案.md`
 - **下行 TTS** — opus(默认,~2KB/s 治拥挤网络卡顿)/ PCM(可选,稳定)。opus 已调通:CBR + `sample_rate=0` 自动重采样
 - **传输层可选(TCP / UDP)** — 默认 TCP(`rtc-tcp-client` 源码直连,行为与历史版本一致);可切涂鸦团队预编译的 STM OPEN SDK(`stm/libstm_tuya.a`,UDP/DTLS 与 TCP 竞速、UDP 优先、不通自动回落),`TUYA_TRANSPORT_STM_ENABLE` 一个开关切换,两个后端同时编译共存。切换细节与已知差异见 `stm/README.md`
 - **DNS 降噪强化** — 嘈杂环境 ASR 优化:强制开 DNS 位(不受 flash 旧配置影响)+ 降噪强度 over_drive=3,实测底噪基线 9k~64k → 3k~6k;若小声说话被吃,在 `user_cfg.c` 覆盖块回调 2.0~2.5
@@ -102,7 +102,7 @@ make ac791n_wifi_story_machine
 
 - overlay **覆盖 10 个 SDK 文件** + **新增 `tuya_agentic/` 整目录**。
 - patch 只改那 10 个文件(新增目录仍需 overlay 复制)。
-- 新增目录含自带 libopus 定点编码器与**预编译好的 `libopus_tuya.a`**——正常使用**无需**本地重编;只有修改了 `libopus/` 下源码才需重跑其 `build_tuya_libopus.sh`(需杰理 LLVM 工具链 `/c/JL/pi32/bin`)再编工程。`stm/` 下的 `libstm.a`(涂鸦原厂库)/`libstm_tuya.a`(平台适配补丁版)同理为预编译库,仅换涂鸦新版原厂库时才需重跑 `patch_libstm.sh`
+- 上行 opus 用**杰理闭源编码库**(`cpu/wl82/liba/lib_opus_enc.a`/`lib_opus_stenc.a`,固件链接清单本就含),经 audio_server "virtual" 源通道驱动,方案见 `docs/上行Opus编码_杰理闭源库方案.md`。仓内 `tuya_agentic/libopus/`(本地 libopus 1.4 定点移植版)自 2026-09-20 起**不再参与构建**(Makefile/.cbp 已摘除链接,目录保留作历史/回退参考);若要回退本地编码:恢复 Makefile/.cbp 的 libopus 链接,且只有修改了 `libopus/` 下源码才需重跑其 `build_tuya_libopus.sh`(需杰理 LLVM 工具链 `/c/JL/pi32/bin`)再编工程。`stm/` 下的 `libstm.a`(涂鸦原厂库)/`libstm_tuya.a`(平台适配补丁版)同理为预编译库,仅换涂鸦新版原厂库时才需重跑 `patch_libstm.sh`
 
 > ⚠ **重跑 apply 会覆盖 `demo.c`,把你填的凭证盖回占位符**。若已填过凭证,后续改动请直接手改目标文件,或重跑后再填一次。
 
@@ -135,7 +135,7 @@ make ac791n_wifi_story_machine
 | `TUYA_BARGE_IN_ENABLE` | 用户打断 TTS(强依赖 AEC,实验性) | 开 |
 | `TUYA_KWS_ENABLE` | 唤醒词"你好涂鸦"(主)+"嘿涂鸦"门控(闭源引擎常开识别,失败自动回退常听)。**默认关=常听模式**;要启用把 `app_config.h` 里该行整行注释去掉(⚠️`#ifdef` 语义,置 0 无效),详见 `docs/WAKEWORD.md` | **关(常听)** |
 | `TUYA_DOWNLINK_OPUS_ENABLE` | 下行 TTS 用 opus(治卡顿);注释则用 PCM | 开 |
-| `TUYA_UPLINK_OPUS_ENABLE` | 上行 ASR 用本地 libopus 定点软编码(~2KB/s);注释则 PCM(32KB/s,codec=101,声学测试定稿) | 关(PCM) |
+| `TUYA_UPLINK_OPUS_ENABLE` | 上行 ASR 用杰理闭源 opus 库(audio_server 通道,~2KB/s);注释则 PCM(32KB/s,codec=101) | 开(opus) |
 | `TUYA_SERVER_VAD_ENABLE` | 云端 VAD 停说判定(开口仍本地 VAD;本地 VAD 兜底) | 开 |
 | `TUYA_MUSIC_ENABLE` | 音乐技能:解析音乐 SKILL 交网络解码链播放,支持说话停乐 | 开 |
 | `TUYA_OTA_ENABLE` / `TUYA_FIRMWARE_VERSION` | 涂鸦云 OTA;版本号为手动方案(发版前改宏与平台一致) | 1 / "1.0.11" |
@@ -179,7 +179,7 @@ make ac791n_wifi_story_machine
 ## 7. 已知问题 / 注意
 
 - **下行 opus 已调通**(CBR + `sample_rate=0` 让解码器自动输出 48k 重采样到 DAC),默认开启。早期 `sample_rate=16000` 强制对齐会致慢速低沉音、去掉 CBR 会致解码器卡死,均已修复。
-- **上行 opus 为本地 libopus 定点软编码**(符号全 `topus_` 前缀隔离,与杰理闭源 opus 库零冲突;仓内带预编译 `libopus_tuya.a`)。曾在另一场景记录过 clang+LTO 对本地 libopus **浮点解码**的崩溃(已弃用解码,仅保留定点**编码**);若上电/说话再现异常,注释 `TUYA_UPLINK_OPUS_ENABLE` 回 PCM 上行排查。修改 libopus 源码需重跑 `build_tuya_libopus.sh` 再编工程。
+- **上行 opus 现走杰理闭源编码库**(2026-09-20 定稿):`tuya_opus_enc.c` 开 audio_server "virtual" 源编码通道,`lib_opus_enc.a`/`lib_opus_stenc.a` 在编码任务线程编码,demo 线程注入 1280B PCM、取回 80B CBR 包,云端契约不变(历史:09-17 曾因 ASR 语种误判切 PCM,09-20 换闭源库并修复尾部冲刷 bug 后复测定稿 opus)。原本地 libopus 1.4 定点移植版(符号 `topus_` 前缀、预编译 `libopus_tuya.a`)已摘除链接——高压声学测试中它把 CPU 推到 ~95%,杰理库针对 pi32v2 优化后降至 2-3%;曾记录过 clang+LTO 对本地 libopus 浮点解码的崩溃(当时已弃用解码);目录保留作回退参考。若上电/说话再现异常,注释 `TUYA_UPLINK_OPUS_ENABLE` 回 PCM 上行排查。
 - **音乐打断是"停乐后听"**:打断的那句话与音乐混叠、不作数(不补发 ASR),音乐停了再说下一句。若出现"音乐自己把自己打断",按 `[MUSIC-DBG]` 日志调高 `BARGE_CONFIRM_ENERGY`(AEC 对连续音乐的效果未验证)。
 - **OTA 版本号为手动方案**:`TUYA_FIRMWARE_VERSION` 每次发版前要改成与涂鸦平台填的一致。跨 OTA 自动持久化版本号(VM/USER/BTIF/RTC)经验证全部不可靠,故不采用。
 - **barge-in 强依赖 AEC**,单麦环境下属实验性功能,调参细节见 [`docs/CHANGES.md`](docs/CHANGES.md)。播报中被 TTS 回声"自打断"(回复错乱、频繁掐断)时,调高 `BARGE_CONFIRM_ENERGY`(默认 60 万,2026-09-04 实测残留确认帧 <40 万、真人插话 >110 万)。
@@ -192,7 +192,7 @@ make ac791n_wifi_story_machine
 
 完整清单见 [`docs/CHANGES.md`](docs/CHANGES.md)。摘要:
 
-- **新增** `apps/common/LLM/tuya_agentic/`:`tuya_agentic_demo.c`(主流程)、`pal_ac791n.c`(PAL)、`le_net_cfg_tuya.c/.h`(BLE 配网)、`tuya_music.c/.h`(音乐技能解析)、`tuya_ota.c/.h`(OTA)、`tuya_opus_enc.c/.h` + `libopus/`(上行 opus 编码,含预编译库)、`stm/`(涂鸦 STM OPEN SDK 适配层:UDP 传输可选后端,`tuya_stm_ai.c` + `stm_port_ac79_shim.c` + 预编译库 + 重打补丁脚本)、`kws/`(唤醒词"你好涂鸦"+"嘿涂鸦":闭源引擎 `audio_subsys.a` 声学团队 v2 包 + 逆向 API 头 + C++ 垫片 + 薄封装,见 `docs/WAKEWORD.md`)、bool 兼容补丁、引入的 `agentic-kit/`
+- **新增** `apps/common/LLM/tuya_agentic/`:`tuya_agentic_demo.c`(主流程)、`pal_ac791n.c`(PAL)、`le_net_cfg_tuya.c/.h`(BLE 配网)、`tuya_music.c/.h`(音乐技能解析)、`tuya_ota.c/.h`(OTA)、`tuya_opus_enc.c/.h`(上行 opus 编码封装,杰理闭源库经 audio_server 通道)+ `libopus/`(本地 libopus 移植版,已弃用不链接,历史保留)、`stm/`(涂鸦 STM OPEN SDK 适配层:UDP 传输可选后端,`tuya_stm_ai.c` + `stm_port_ac79_shim.c` + 预编译库 + 重打补丁脚本)、`kws/`(唤醒词"你好涂鸦"+"嘿涂鸦":闭源引擎 `audio_subsys.a` 声学团队 v2 包 + 逆向 API 头 + C++ 垫片 + 薄封装,见 `docs/WAKEWORD.md`)、bool 兼容补丁、引入的 `agentic-kit/`
 - **改动 SDK**(10 个文件):`audio_input.c/.h`、`user_cfg.c`(AEC)、`app_music.c`(K6 + 音乐播放导出 + 唤醒应答提示音)、`Makefile`、`AC791N_WIFI_STORY_MACHINE.cbp`、`app_config.h`、`wifi_app_task.c`、`app_main.c`(btstack 栈 768→2048)
 - **新增资源** `cpu/wl82/tools/audlogo/WakeHeyTuya.mp3`(唤醒应答提示音,overlay 直拷;不覆盖 audlogo 下其余库存文件)
 - **可选调试改动**:`board_7916A.c`(串口波特率,只为看日志)
@@ -227,7 +227,7 @@ tuya-agentic-ac79/
 
 ## License
 
-对接代码遵循 Apache-2.0(与杰理 SDK 一致)。`agentic-kit/` 下引入的涂鸦开源模块、AWS coreHTTP / coreMQTT 遵循各自原始许可;`tuya_agentic/libopus/`(libopus 1.4 子集,含预编译 `libopus_tuya.a`)遵循 BSD-3-Clause(见其 `COPYING`);`tuya_agentic/stm/` 下的 `libstm.a` / `libstm_tuya.a` 为涂鸦团队提供的预编译库,版权归涂鸦所有,随本仓仅为方便适配该 SDK 使用。
+对接代码遵循 Apache-2.0(与杰理 SDK 一致)。`agentic-kit/` 下引入的涂鸦开源模块、AWS coreHTTP / coreMQTT 遵循各自原始许可;`tuya_agentic/libopus/`(libopus 1.4 子集,含预编译 `libopus_tuya.a`;2026-09-20 起不再链接,目录保留)遵循 BSD-3-Clause(见其 `COPYING`);`tuya_agentic/stm/` 下的 `libstm.a` / `libstm_tuya.a` 为涂鸦团队提供的预编译库,版权归涂鸦所有,随本仓仅为方便适配该 SDK 使用。
 
 ## 致谢
 

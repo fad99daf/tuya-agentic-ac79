@@ -73,7 +73,6 @@
 <Add option="-D_GNU_SOURCE" />
 <Add option="-D__ELF__" />
 <Add directory="../../../../apps/common/LLM/tuya_agentic/tuya_inc" />
-			<Add directory="../../../../apps/common/LLM/tuya_agentic/libopus" />
 <Add directory="../../../../apps/common/LLM/tuya_agentic" />
 <Add directory="../../../../apps/common/LLM/tuya_agentic/kws" />
 <Add directory="../../../../apps/common/LLM/tuya_agentic/stm" />
@@ -161,10 +160,6 @@
 <Add directory="../../../../apps/common/LLM/onesdk" />
 <Add directory="../../../../include_lib/net/web_socket" />
 <Add directory="../../../../include_lib/net/network_download" />
-			<Add directory="../../../../apps/common/LLM/tuya_agentic/libopus/include" />
-			<Add directory="../../../../apps/common/LLM/tuya_agentic/libopus/celt" />
-			<Add directory="../../../../apps/common/LLM/tuya_agentic/libopus/silk" />
-			<Add directory="../../../../apps/common/LLM/tuya_agentic/libopus/silk/fixed" />
 <Add option="-DHTTP_DO_NOT_USE_CUSTOM_CONFIG" />
 <Add option="-DMQTT_DO_NOT_USE_CUSTOM_CONFIG" />
 <Add option="-DIOT_DO_NOT_USE_CUSTOM_CONFIG" />
@@ -225,7 +220,6 @@
 <Add option="../../../../cpu/wl82/liba/lib_wav_dec.a" />
 <Add option="../../../../cpu/wl82/liba/lib_dts_dec.a" />
 <Add option="../../../../cpu/wl82/liba/lib_opus_dec.a" />
-			<Add option="../../../../apps/common/LLM/tuya_agentic/libopus/libopus_tuya.a" />
 			<Add option="../../../../apps/common/LLM/tuya_agentic/stm/libstm_tuya.a" />
 			<Add option="../../../../apps/common/LLM/tuya_agentic/kws/audio_subsys.a" />
 <Add option="../../../../cpu/wl82/liba/lib_amr_dec.a" />

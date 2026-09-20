@@ -518,15 +518,14 @@ index acba599d..883f89f1 100644
      if (__this->call_flag && (key->value != KEY_UP && key->value != KEY_DOWN && key->value != KEY_VOLUME_DEC && key->value != KEY_VOLUME_INC && key->value != KEY_OK && key->value != KEY_ENC)) {
          return true;	//通话模式下只有音量键和暂停键能起作用
 diff --git a/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp b/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp
-index 53b90818..58ab0408 100644
+index 53b9081..d20daac 100644
 --- a/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp
 +++ b/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp
-@@ -72,6 +72,23 @@
+@@ -72,6 +72,22 @@
  <Add option="-D_XOPEN_SOURCE=700" />
  <Add option="-D_GNU_SOURCE" />
  <Add option="-D__ELF__" />
 +<Add directory="../../../../apps/common/LLM/tuya_agentic/tuya_inc" />
-+			<Add directory="../../../../apps/common/LLM/tuya_agentic/libopus" />
 +<Add directory="../../../../apps/common/LLM/tuya_agentic" />
 +<Add directory="../../../../apps/common/LLM/tuya_agentic/kws" />
 +<Add directory="../../../../apps/common/LLM/tuya_agentic/stm" />
@@ -545,7 +544,7 @@ index 53b90818..58ab0408 100644
  <Add directory="../../../../include_lib/c++" />
  <Add directory="../../../../include_lib/c++/include" />
  <Add directory="../../../../include_lib/newlib/include" />
-@@ -132,7 +149,6 @@
+@@ -132,7 +148,6 @@
  <Add directory="../../../../include_lib/utils/btmesh" />
  <Add directory="../../../../include_lib/utils/btmesh/adaptation" />
  <Add directory="../../../../apps/common/LLM/audio" />
@@ -553,7 +552,7 @@ index 53b90818..58ab0408 100644
  <Add directory="../../../../apps/common/LLM/volc" />
  <Add directory="../../../../apps/common/LLM/extra" />
  <Add directory="../../../../include_lib/net/cJSON_common" />
-@@ -142,24 +158,16 @@
+@@ -142,24 +157,12 @@
  <Add directory="../../../../include_lib/system/os" />
  <Add directory="../../../../include_lib/net/libwebsockets/include" />
  <Add directory="../../../../include_lib/net/libwebsockets/include/libwebsockets" />
@@ -575,27 +574,22 @@ index 53b90818..58ab0408 100644
  <Add directory="../../../../include_lib/net/network_download" />
 -<Add directory="../../../../apps/common/LLM/tc_iot_twetalk/qcloud_iot_explorer_sdk/inc" />
 -<Add directory="../../../../apps/common/LLM/tc_iot_twetalk/twetalk_ws" />
-+			<Add directory="../../../../apps/common/LLM/tuya_agentic/libopus/include" />
-+			<Add directory="../../../../apps/common/LLM/tuya_agentic/libopus/celt" />
-+			<Add directory="../../../../apps/common/LLM/tuya_agentic/libopus/silk" />
-+			<Add directory="../../../../apps/common/LLM/tuya_agentic/libopus/silk/fixed" />
 +<Add option="-DHTTP_DO_NOT_USE_CUSTOM_CONFIG" />
 +<Add option="-DMQTT_DO_NOT_USE_CUSTOM_CONFIG" />
 +<Add option="-DIOT_DO_NOT_USE_CUSTOM_CONFIG" />
  </Compiler>
  <Linker>
  <Add option="--plugin-opt=-pi32v2-always-use-itblock=false" />
-@@ -217,6 +225,9 @@
+@@ -217,6 +220,8 @@
  <Add option="../../../../cpu/wl82/liba/lib_wav_dec.a" />
  <Add option="../../../../cpu/wl82/liba/lib_dts_dec.a" />
  <Add option="../../../../cpu/wl82/liba/lib_opus_dec.a" />
-+			<Add option="../../../../apps/common/LLM/tuya_agentic/libopus/libopus_tuya.a" />
 +			<Add option="../../../../apps/common/LLM/tuya_agentic/stm/libstm_tuya.a" />
 +			<Add option="../../../../apps/common/LLM/tuya_agentic/kws/audio_subsys.a" />
  <Add option="../../../../cpu/wl82/liba/lib_amr_dec.a" />
  <Add option="../../../../cpu/wl82/liba/lib_amr_enc.a" />
  <Add option="../../../../cpu/wl82/liba/lib_amrwb_enc.a" />
-@@ -267,25 +278,18 @@
+@@ -267,25 +272,18 @@
  <Add option="../../../../cpu/wl82/liba/https_cli.a" />
  <Add option="../../../../cpu/wl82/liba/http_server.a" />
  <Add option="../../../../cpu/wl82/liba/json.a" />
@@ -621,7 +615,7 @@ index 53b90818..58ab0408 100644
  <Add option="../../../../cpu/wl82/liba/cJSON.a" />
  <Add option="../../../../cpu/wl82/liba/ftpserver_new.a" />
  <Add option="../../../../cpu/wl82/liba/http_server.a " />
-@@ -302,18 +306,13 @@
+@@ -302,18 +300,13 @@
  <Add option="../../../../cpu/wl82/liba/res.a" />
  <Add option="../../../../cpu/wl82/liba/font.a" />
  <Add option="../../../../cpu/wl82/liba/ui_draw.a" />
@@ -640,7 +634,7 @@ index 53b90818..58ab0408 100644
  <Add option="-T../../../../cpu/wl82/sdk.ld" />
  <Add option="-M=../../../../cpu/wl82/tools/sdk.map" />
  <Add option="--end-group " />
-@@ -332,351 +331,10 @@
+@@ -332,351 +325,10 @@
  </ExtraCommands>
  </Target>
  </Build>
@@ -992,7 +986,7 @@ index 53b90818..58ab0408 100644
  <Unit filename="../../../../apps/common/asr/aisp/aisp.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/common/asr/jlkws/jlkws.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/common/asr/jlkws/jlsp_far_keyword.h" />
-@@ -701,18 +359,11 @@
+@@ -701,18 +353,11 @@
  <Unit filename="../../../../apps/common/ble/include/le_hogp.h" />
  <Unit filename="../../../../apps/common/ble/include/le_net_central.h" />
  <Unit filename="../../../../apps/common/ble/include/le_net_cfg.h" />
@@ -1011,7 +1005,7 @@ index 53b90818..58ab0408 100644
  <Unit filename="../../../../apps/common/ble/le_trans_data.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/common/ble/mesh/examples/AliGenie_fan.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/common/ble/mesh/examples/AliGenie_light.c"><Option compilerVer="CC"/></Unit>
-@@ -938,8 +589,6 @@
+@@ -938,8 +583,6 @@
  <Unit filename="../../../../apps/common/usb/usb_std_class_def.h" />
  <Unit filename="../../../../apps/wifi_story_machine/app_main.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/wifi_story_machine/app_music.c"><Option compilerVer="CC"/></Unit>
@@ -1020,7 +1014,7 @@ index 53b90818..58ab0408 100644
  <Unit filename="../../../../apps/wifi_story_machine/board/wl82/board_7911B.c"><Option compilerVer="CC"/></Unit>
  <Unit filename="../../../../apps/wifi_story_machine/board/wl82/board_7911B0_cfg.h" />
  <Unit filename="../../../../apps/wifi_story_machine/board/wl82/board_7911B8_cfg.h" />
-@@ -1456,7 +1105,6 @@
+@@ -1456,7 +1099,6 @@
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/FreeRTOS.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/FreeRTOSConfig.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/deprecated_definitions.h" />
@@ -1028,7 +1022,7 @@ index 53b90818..58ab0408 100644
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/list.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/mpu_wrappers.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/pi32v2/portmacro.h" />
-@@ -1465,7 +1113,6 @@
+@@ -1465,7 +1107,6 @@
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/queue.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/semphr.h" />
  <Unit filename="../../../../include_lib/system/os/FreeRTOS/task.h" />
@@ -1036,7 +1030,7 @@ index 53b90818..58ab0408 100644
  <Unit filename="../../../../include_lib/system/os/os_api.h" />
  <Unit filename="../../../../include_lib/system/os/os_cpu.h" />
  <Unit filename="../../../../include_lib/system/os/os_error.h" />
-@@ -1571,5 +1218,47 @@
+@@ -1571,5 +1212,47 @@
  <Unit filename="../../../../lib/net/version.z.S" />
  <Unit filename="../../../../lib/server/version.z.S" />
  <Unit filename="../../../../lib/utils/version.z.S" />
@@ -1085,10 +1079,10 @@ index 53b90818..58ab0408 100644
  </Project>
  </CodeBlocks_project_file>
 diff --git a/apps/wifi_story_machine/board/wl82/Makefile b/apps/wifi_story_machine/board/wl82/Makefile
-index 2012bf8a..65859337 100644
+index 2012bf8..411d244 100644
 --- a/apps/wifi_story_machine/board/wl82/Makefile
 +++ b/apps/wifi_story_machine/board/wl82/Makefile
-@@ -148,9 +148,12 @@ DEFINES := \
+@@ -148,9 +148,11 @@ DEFINES := \
  
  
  DEFINES += $(EXT_CFLAGS) # 额外的一些定义
@@ -1097,11 +1091,10 @@ index 2012bf8a..65859337 100644
  # 头文件搜索路径
  INCLUDES := \
 +	-I../../../../apps/common/LLM/tuya_agentic/tuya_inc \
-+    ../../../../apps/common/LLM/tuya_agentic/libopus \
  	-I../../../../include_lib/c++ \
  	-I../../../../include_lib/c++/include \
  	-I../../../../include_lib/newlib/include \
-@@ -211,8 +214,6 @@ INCLUDES := \
+@@ -211,8 +213,6 @@ INCLUDES := \
  	-I../../../../include_lib/utils/btmesh \
  	-I../../../../include_lib/utils/btmesh/adaptation \
  	-I../../../../apps/common/LLM/audio \
@@ -1110,7 +1103,7 @@ index 2012bf8a..65859337 100644
  	-I../../../../apps/common/LLM/extra \
  	-I../../../../include_lib/net/cJSON_common \
  	-I../../../../include_lib/net/curl/include \
-@@ -221,199 +222,33 @@ INCLUDES := \
+@@ -221,199 +221,29 @@ INCLUDES := \
  	-I../../../../include_lib/system/os \
  	-I../../../../include_lib/net/libwebsockets/include \
  	-I../../../../include_lib/net/libwebsockets/include/libwebsockets \
@@ -1147,10 +1140,6 @@ index 2012bf8a..65859337 100644
 +	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/include \
 +	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/interface \
 +	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya-ble/include \
-+	-I../../../../apps/common/LLM/tuya_agentic/libopus/include \
-+	-I../../../../apps/common/LLM/tuya_agentic/libopus/celt \
-+	-I../../../../apps/common/LLM/tuya_agentic/libopus/silk \
-+	-I../../../../apps/common/LLM/tuya_agentic/libopus/silk/fixed \
  
  
  # 需要编译的 .c 文件
@@ -1329,7 +1318,7 @@ index 2012bf8a..65859337 100644
  	../../../../apps/common/asr/aisp/aisp.c \
  	../../../../apps/common/asr/jlkws/jlkws.c \
  	../../../../apps/common/asr/roobo/roobo.c \
-@@ -432,10 +267,6 @@ c_SRC_FILES := \
+@@ -432,10 +262,6 @@ c_SRC_FILES := \
  	../../../../apps/common/ble/le_hogp.c \
  	../../../../apps/common/ble/le_net_central.c \
  	../../../../apps/common/ble/le_net_cfg.c \
@@ -1340,7 +1329,7 @@ index 2012bf8a..65859337 100644
  	../../../../apps/common/ble/le_trans_data.c \
  	../../../../apps/common/ble/mesh/examples/AliGenie_fan.c \
  	../../../../apps/common/ble/mesh/examples/AliGenie_light.c \
-@@ -585,8 +416,6 @@ c_SRC_FILES := \
+@@ -585,8 +411,6 @@ c_SRC_FILES := \
  	../../../../apps/common/usb/usb_host_config.c \
  	../../../../apps/wifi_story_machine/app_main.c \
  	../../../../apps/wifi_story_machine/app_music.c \
@@ -1349,7 +1338,7 @@ index 2012bf8a..65859337 100644
  	../../../../apps/wifi_story_machine/board/wl82/board_7911B.c \
  	../../../../apps/wifi_story_machine/board/wl82/board_7911D.c \
  	../../../../apps/wifi_story_machine/board/wl82/board_7912D.c \
-@@ -618,6 +447,44 @@ c_SRC_FILES := \
+@@ -618,6 +442,45 @@ c_SRC_FILES := \
  	../../../../cpu/wl82/key/rdec.c \
  	../../../../cpu/wl82/port_waked_up.c \
  	../../../../cpu/wl82/setup.c \
@@ -1385,6 +1374,7 @@ index 2012bf8a..65859337 100644
 +	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/core_mqtt_state.c \
 +	../../../../apps/common/LLM/tuya_agentic/pal_ac791n.c \
 +	../../../../apps/common/LLM/tuya_agentic/tuya_agentic_demo.c \
++	../../../../apps/common/LLM/tuya_agentic/tuya_mcp.c \
 +	../../../../apps/common/LLM/tuya_agentic/tuya_music.c \
 +	../../../../apps/common/LLM/tuya_agentic/tuya_ota.c \
 +	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya-ble/src/tuya_ble_prov.c \
@@ -1394,7 +1384,7 @@ index 2012bf8a..65859337 100644
  
  
  # 需要编译的 .S 文件
-@@ -646,7 +513,8 @@ cpp_SRC_FILES := \
+@@ -646,7 +509,8 @@ cpp_SRC_FILES := \
  
  
  # 需要编译的 .cc 文件
@@ -1404,17 +1394,16 @@ index 2012bf8a..65859337 100644
  
  
  # 需要编译的 .cxx 文件
-@@ -710,6 +578,9 @@ LFLAGS := \
+@@ -710,6 +574,8 @@ LFLAGS := \
  	../../../../cpu/wl82/liba/lib_wav_dec.a \
  	../../../../cpu/wl82/liba/lib_dts_dec.a \
  	../../../../cpu/wl82/liba/lib_opus_dec.a \
-+	../../../../apps/common/LLM/tuya_agentic/libopus/libopus_tuya.a \
 +	../../../../apps/common/LLM/tuya_agentic/stm/libstm_tuya.a \
 +	../../../../apps/common/LLM/tuya_agentic/kws/audio_subsys.a \
  	../../../../cpu/wl82/liba/lib_amr_dec.a \
  	../../../../cpu/wl82/liba/lib_amr_enc.a \
  	../../../../cpu/wl82/liba/lib_amrwb_enc.a \
-@@ -760,25 +631,18 @@ LFLAGS := \
+@@ -760,25 +626,18 @@ LFLAGS := \
  	../../../../cpu/wl82/liba/https_cli.a \
  	../../../../cpu/wl82/liba/http_server.a \
  	../../../../cpu/wl82/liba/json.a \
@@ -1440,7 +1429,7 @@ index 2012bf8a..65859337 100644
  	../../../../cpu/wl82/liba/cJSON.a \
  	../../../../cpu/wl82/liba/ftpserver_new.a \
  	../../../../cpu/wl82/liba/http_server.a  \
-@@ -795,18 +659,13 @@ LFLAGS := \
+@@ -795,18 +654,13 @@ LFLAGS := \
  	../../../../cpu/wl82/liba/res.a \
  	../../../../cpu/wl82/liba/font.a \
  	../../../../cpu/wl82/liba/ui_draw.a \
@@ -1482,7 +1471,7 @@ index 2b69d8d3..196777e8 100644
  #if CONFIG_AUDIO_ENC_SAMPLE_SOURCE == AUDIO_ENC_SAMPLE_SOURCE_PLNK0
      .output_channel = OUTPUT_CHANNEL3,
 diff --git a/apps/wifi_story_machine/include/app_config.h b/apps/wifi_story_machine/include/app_config.h
-index f3cd60cb..13d9faa0 100644
+index f3cd60c..378529f 100644
 --- a/apps/wifi_story_machine/include/app_config.h
 +++ b/apps/wifi_story_machine/include/app_config.h
 @@ -115,10 +115,10 @@
@@ -1498,7 +1487,7 @@ index f3cd60cb..13d9faa0 100644
  #define CONFIG_AUDIO_PACKRES_ADR ((__FLASH_SIZE__) - CONFIG_AUDIO_PACKRES_LEN - 0x1000)
  #endif
  #else
-@@ -226,6 +226,160 @@
+@@ -226,6 +226,162 @@
  // #define CONFIG_HTTP_SERVER_ENABLE            //HTTP服务器
  // #define CONFIG_FTP_SERVER_ENABLE             //FTP服务器
  // #define CONFIG_VOLC_LLM_ENABLE               //火山大模型
@@ -1518,13 +1507,11 @@ index f3cd60cb..13d9faa0 100644
 +
 +/* ===== 涂鸦上行 ASR 编码开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下生效)=====
 + * 不定义(默认)= PCM:mic 管线直出 1280B/40ms 上行(32KB/s),拥挤网络易卡。
-+ * 定义 = opus:本地 libopus 1.4【定点】软编码(移植在 tuya_agentic/libopus/,
-+ *   封装 tuya_opus_enc.c),16k/mono/VOIP/CBR 16kbps/40ms → 每包 ~80B(~2KB/s,1/16 带宽)。
-+ *   mic 管线保持 PCM 不动(VAD/AEC/能量门/barge-in 全不受影响),只在上行发送处
-+ *   逐帧编码;编码器初始化失败自动回退 PCM,不废会话。
-+ *   ⚠️ 工具链风险(记录在案):clang 4.0.1+LTO 曾对本地 libopus 浮点解码产生
-+ *   axi_wr_inv 崩溃(2026-08-28 回退),故本编码器走定点;若上电/说话再现崩溃,
-+ *   注释掉本宏即回 PCM 上行。参数对齐 agentic-kit audio_chat_demo(云端验证过)。*/
++ * 定义 = opus:【杰理闭源编码库】(lib_opus_enc/stenc.a 经 audio_server virtual 源
++ *   通道驱动,封装 tuya_opus_enc.c),16k/mono/format_mode=0(裸CBR)/16kbps/40ms
++ *   → 每包恰 80B(~2KB/s,1/16 带宽)。mic 管线保持 PCM 不动(VAD/AEC/能量门/
++ *   barge-in 全不受影响),demo 线程注入 PCM 帧、audio_server 线程编码;
++ *   编码器初始化失败自动回退 PCM,不废会话。回退路径:注释本宏即回 PCM 上行。*/
 +/* 2026-09-03 定论:PCM=101 全链路验证通过(ASR/NLG/TTS/音乐/多轮)。
 + * 2026-09-04 定位 Opus 静默根因:对照 D:\code\agentic-kit 最新官方源码,
 + * TCP 协议 OPUS=111 且上行必带帧参数(80B/帧→40ms/16000bps,从帧长推导);
@@ -1534,8 +1521,12 @@ index f3cd60cb..13d9faa0 100644
 + * 失败注释下一行即回 PCM。
 + * 2026-09-17 晚:声学测试期 ASR 频繁不准(语种误判 ar/fr/de、乱码、播报原文转写),
 + * 疑上行 Opus(2KB/s)下云端 ASR 质量——注释宏回 PCM(32KB/s,codec=101)重测;
-+ * 09-03 定论 PCM=101 全链路验证通过。恢复 Opus 取消注释即可。*/
-+/* #define TUYA_UPLINK_OPUS_ENABLE */
++ * 09-03 定论 PCM=101 全链路验证通过。恢复 Opus 取消注释即可。
++ * 2026-09-20:编码器换杰理闭源库(原本地 libopus 1.4 定点移植版已摘除):高压声学
++ * 测试中本地库把 CPU 推到 95%,杰理库针对 pi32v2 优化且固件本就链有(audio_server
++ * 引用)。同因摘除 libopus_tuya.a(链接清单)与 topus_ 符号。云端契约不变:
++ * 80B CBR/40ms/16kbps,tuya_opus_enc.c 有包长核对日志。*/
++#define TUYA_UPLINK_OPUS_ENABLE
 +
 +/* ===== 涂鸦 barge-in(用户打断 TTS)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
 + * 不定义(默认)= 不支持打断:TTS 期间不上行,简单稳定。
@@ -1659,7 +1650,7 @@ index f3cd60cb..13d9faa0 100644
  // #define CONFIG_ONESDK_LLM_ENABLE
  // #define CONFIG_SXY_QYAI_ENABLE
  // #define CONFIG_DUER_LC_DEMO_ENABLE           //小度澜川AI对话DEMO
-@@ -341,7 +495,7 @@
+@@ -341,7 +497,7 @@
  
  #ifdef CONFIG_AEC_ENC_ENABLE
  #define CONFIG_USB_AUDIO_AEC_ENABLE          //usb mic使能回声消除功能
@@ -1668,7 +1659,7 @@ index f3cd60cb..13d9faa0 100644
  // #define CONFIG_AEC_USE_PLAY_MUSIC_ENABLE       //播歌时需要使用AEC
  
  // #define CONFIG_AEC_USE_SMS_TDE   //使用tde算法, 编码参数req.enc.aec_enable设置为2
-@@ -413,7 +567,7 @@
+@@ -413,7 +569,7 @@
  #endif
  #endif
  

@@ -1,10 +1,11 @@
 #ifndef TUYA_OPUS_ENC_H
 #define TUYA_OPUS_ENC_H
 
-/* 涂鸦上行 opus 编码封装(libopus 1.4 定点,见 libopus/config.h)。
+/* 涂鸦上行 opus 编码封装(杰理闭源 lib_opus_enc/stenc.a,经 audio_server virtual
+ * 源通道驱动,实现见 tuya_opus_enc.c)。
  * 参数对齐 agentic-kit audio_chat_demo(涂鸦云端验证过的组合):
- *   16kHz / mono / VOIP / CBR 16kbps / DTX off / complexity 0 / 40ms 帧 = 640 采样。
- * CBR 16kbps × 40ms ⇒ 每包恰 80 字节(opus_encode 实际返回值为准)。*/
+ *   16kHz / mono / format_mode=0(裸 CBR) / 16kbps / 40ms 帧 = 640 采样。
+ * CBR 16kbps × 40ms ⇒ 每包恰 80 字节(frame() 实际返回值为准,不符有日志)。*/
 
 #define TUYA_OPUS_PKT_MAX   128     /* 单包上限:80B 预期,留余量 */
 #define TUYA_OPUS_SAMPLES   640     /* 16k × 40ms */

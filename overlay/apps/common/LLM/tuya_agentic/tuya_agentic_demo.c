@@ -37,7 +37,7 @@ int  app_music_tuya_music_busy(void);   /* 网络音乐仍占用(下载/解码�
 void app_music_tuya_play_wake_prompt(void); /* "嘿tuya"唤醒应答提示音(WakeHeyTuya.mp3) */
 #endif
 #ifdef TUYA_UPLINK_OPUS_ENABLE
-#include "tuya_opus_enc.h"        /* 上行 opus 软编码(libopus 1.4 定点,实现 tuya_opus_enc.c) */
+#include "tuya_opus_enc.h"        /* 上行 opus 编码(杰理闭源库经 audio_server virtual 通道,实现 tuya_opus_enc.c) */
 #endif
 
 /* 阶段3 用的音频流接口(实现见 apps/common/LLM/audio/audio_input.c)。
@@ -606,13 +606,15 @@ static void mcp_resp_pump(tai_ctx_t *ctx)
 static void opus_frame_stat(const unsigned char *p, int len,    /* 定义在后,先声明给 music_handoff 用 */
                             unsigned int *out_sum, unsigned int *out_act);
 
-/* ---- barge-in 话音历史:播放循环滚动缓存最近 ~1.8s 已消费帧 ----
+/* ---- barge-in 话音历史:排空循环滚动缓存最近 ~1.8s 已消费帧 ----
  * TTS/音乐播放期间循环必须持续读帧防 cbuf 溢出(只喂 KWS/丢弃),而能量
  * barge-in 确认只要 3 帧(~120ms)——用户从开口到确认之间的命令头部全丢在
  * 循环里。2026-09-05 实测:音乐中喊"给我放一首周杰伦的歌",云端只收到尾部
  * "伦的歌。"。barge-in 命中时把历史线性化进 g_barge_prebuf 作上行 prefill
  * 补发,云端才能听到完整命令。push 每帧 memmove 57KB@25Hz≈1.4MB/s,可承受;
- * 线性化只在 barge 命中(罕见)时执行一次。*/
+ * 线性化只在 barge 命中(罕见)时执行一次。
+ * 2026-09-20 起idle 排空同样喂历史:空闲起轮的 VAD 判定窗(~100ms)话音头
+ * 也靠它留底回溯,治上行音频首字缺声母。*/
 #define BARGE_HIST_FRAMES   45    /* 45*40ms=1.8s 滚动窗口 */
 #define BARGE_PREFILL_CAP   20    /* hist→prefill 帧数上限(20*40ms=800ms,含确认3帧+话音onset)。
                                    * 2026-09-17 晚两轮实测:纯 cap12 时"你好涂鸦"8 次中 5 次丢字
@@ -630,7 +632,7 @@ static unsigned int g_barge_prefill;
 static unsigned char s_barge_hist[1280 * BARGE_HIST_FRAMES] __attribute__((aligned(4)));
 static unsigned int  s_barge_hist_cnt;    /* 有效帧数(≤45, newest 在尾部) */
 
-/* 播放循环每读一帧调一次:进历史环形窗(满则挤掉最旧) */
+/* 排空循环(idle/TTS/音乐)每读一帧调一次:进历史环形窗(满则挤掉最旧) */
 static void barge_hist_push(const unsigned char *frame)
 {
     if (s_barge_hist_cnt < BARGE_HIST_FRAMES) {
@@ -643,7 +645,8 @@ static void barge_hist_push(const unsigned char *frame)
 }
 
 /* 历史最新段(旧→新)作为上行 prefill,接在 prebuf 已有帧(确认帧)之后,复位历史。
- * 调用点:barge-in 确认命中后、停乐排空后——下一轮上行把它们补在最前。
+ * 调用点:barge-in 确认命中后、停乐排空后、idle 起轮能量门过门后——下一轮上行
+ * 把它们补在最前。
  * 取法(2026-09-17 晚 B 方案):窗口=最新 BARGE_PREFILL_CAP 帧,从窗口最旧帧起
  * 逐帧砍掉头部的低能量帧(<BARGE_PREFILL_ENERGY,回声/静音),首个达话音能量的
  * 帧起整段保留(话音中间的短暂停顿不切断)。确认 3 帧恒≥50万在尾部,不会被砍光。*/
@@ -671,8 +674,9 @@ static void barge_hist_to_prefill(void)
            g_barge_prefill, cnt, cnt - take);
 }
 
-/* TTS barge-in 确认命中收尾:确认帧已在 barge_in_energy_confirmed 读帧时喂 KWS
- * +入历史(成功/失败都进,保语音流连续),这里只剩历史→prefill 的线性化。*/
+/* barge-in 确认命中/idle 起轮过门后的收尾:确认帧已在 barge_in_energy_confirmed
+ * 读帧时喂 KWS+入历史、idle 门帧在能量门处入历史(成功/失败都进,保语音流连续),
+ * 这里只剩历史→prefill 的线性化。*/
 static void barge_in_prefill_arm(void)
 {
     barge_hist_to_prefill();
@@ -1893,16 +1897,22 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
         int start_turn = mcp_text_poll ? 0 :
                          (get_recoder_state() && (orphan_tts_stopped || _device_get_play_level() < 640));
         /* 普通轮 turn-start 能量门:无唤醒词+单麦开麦,任何持续声响都触发 VAD→设备自言自语。
-         * VAD 触发后再核 1 帧能量(近场话音够响),达标才起轮并把这帧作 onset 补发;否则当噪音丢弃。
+         * VAD 触发后再核 1 帧能量(近场话音够响),达标才起轮;否则当噪音丢弃。
+         * ★ 话音头回溯(2026-09-20):VAD 判定窗(~100ms)+轮询间隔内开口的话音帧
+         *   已被 idle 排空消费,旧实现只回补本帧 1 帧 onset→上行音频首字缺声母。
+         *   现在 idle 排空帧进 barge 滚动历史(见下方 idle drain),门帧也先入历史,
+         *   过门后走 barge_in_prefill_arm() 按 8 万能量门回溯,把判定窗内话音头整段
+         *   捞回 prefill 补发——与 barge-in 同一机制。门帧先入历史再判能量,不过门
+         *   也留在历史里(后续被能量闸砍掉),保历史连续。
          * barge-in 轮(g_barge_in)已在 ④/drain 做过能量确认,这里跳过直接起轮。*/
         if (start_turn && !g_barge_in) {
             unsigned char _p[TUYA_OPUS_FRAME_LEN];
             unsigned int _s, _a;
             if (_device_get_voice_data(_p, sizeof(_p)) == TUYA_OPUS_FRAME_LEN) {
+                barge_hist_push(_p);   /* 门帧入历史:过门即成回溯窗的最新帧 */
                 opus_frame_stat(_p, TUYA_OPUS_FRAME_LEN, &_s, &_a);
                 if (_s >= BARGE_MIN_ENERGY) {
-                    memcpy(g_barge_prebuf, _p, TUYA_OPUS_FRAME_LEN);
-                    g_barge_prefill = 1;
+                    barge_in_prefill_arm();   /* 历史能量回溯→prefill(含门帧,替代旧的单帧 onset) */
 #ifdef TUYA_KWS_ENABLE
                     tuya_kws_feed(_p, TUYA_OPUS_FRAME_LEN);   /* onset 帧在进 prebuf 后
                                             不再经过任何喂音点,这里补上保 KWS 流连续 */
@@ -1982,13 +1992,18 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                 continue;   /* 播完/被打断后回循环顶,保持 idle 节奏 */
             }
 #endif
-            unsigned char _trash[TUYA_OPUS_FRAME_LEN];
-            int tn = _device_get_voice_data(_trash, sizeof(_trash));   /* 丢弃,保持缓冲新鲜 */
+            unsigned char _drain[TUYA_OPUS_FRAME_LEN];
+            int tn = _device_get_voice_data(_drain, sizeof(_drain));   /* 排空 mic 缓冲,不排会积压旧音频 */
             /* MQTT 心跳由独立线程维持(见 tuya_ai_run 入口的 tuya_mqtt_keepalive_task),
              * 不在这里调 iot_client_process——它内部的 TLS recv 会阻塞语音循环线程。*/
             if (tn == TUYA_OPUS_FRAME_LEN) {   /* 攒够整帧才统计,得到稳定的静音底噪基线 */
                 unsigned int s, a;
-                opus_frame_stat(_trash, TUYA_OPUS_FRAME_LEN, &s, &a);
+                opus_frame_stat(_drain, TUYA_OPUS_FRAME_LEN, &s, &a);
+                /* ★ 帧进 barge 滚动历史(2026-09-20):VAD 判定窗内被排空的话音头帧由此
+                 *   留底,起轮能量门过门后回溯补发(见 turn-start 能量门),治空闲起轮
+                 *   首字缺声母。成本与 TTS/音乐期排空相同(memmove 57KB@25Hz≈1.4MB/s),
+                 *   空闲 CPU ~77% 余量充足;静音帧后续被 8 万能量闸砍掉,不进上行。*/
+                barge_hist_push(_drain);
                 idle_cnt++; idle_sum += s; idle_act_sum += a;
                 if (idle_cnt >= 16) {   /* 16帧≈1s,汇总打印一次 */
                     printf("[TUYA] idle drain: %u frames, avg_sum=%u avg_act=%u%%\r\n",
@@ -1996,7 +2011,7 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                     idle_cnt = 0; idle_sum = 0; idle_act_sum = 0;
                 }
 #ifdef TUYA_KWS_ENABLE
-                tuya_kws_feed(_trash, tn);   /* 排空的 40ms 帧喂唤醒词引擎 */
+                tuya_kws_feed(_drain, tn);   /* 排空的 40ms 帧喂唤醒词引擎 */
 #endif
             }
             tai_log_flush();   /* idle 排空节拍:顺带刷出 stm 库延迟日志(唯一 printf 出口在本任务) */
@@ -2079,11 +2094,9 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                     tai_send_audio_chunk(ctx, &g_barge_prebuf[k * 1280], 1280);
                 }
             }
-            if (g_barge_prefill == 1) {
-                printf("[TUYA] turn-start: prepended 1 onset frame\r\n");
-            } else {
-                printf("[TUYA] barge-in: prepended %u confirm frames\r\n", g_barge_prefill);
-            }
+            /* 2026-09-20 起两条路径同源:空闲起轮与 barge-in 的补发帧都来自历史回溯
+             * (上方的 barge history -> prefill 打印),此处只报总数,不再按帧数猜路径。*/
+            printf("[TUYA] turn-start: prepended %u frame(s)\r\n", g_barge_prefill);
             g_barge_prefill = 0;
         }
 #endif
@@ -2209,7 +2222,10 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
         /* 尾部冲刷(2026-09-17 晚):VAD 判停后立刻 audio_end 会把 mic cbuf 里还压着
          * 的尾音(≤0.5s)留在本地——实测"你好涂鸦"被掐成"你好。"(丢"涂鸦")、"你
          * 说什么"掐成"你对"。audio_end 前把已缓冲的帧冲完(上限 8 帧=320ms;纯冲
-         * 已录音、不等待新帧、无能量判定),云端拿到完整句尾再收 payloads-end。*/
+         * 已录音、不等待新帧、无能量判定),云端拿到完整句尾再收 payloads-end。
+         * ★ 2026-09-20 opus 上行漏改点修复:此处曾直发 1280B 裸 PCM,云 libopus 报
+         *   corrupted stream(gRPC INVALID_ARGUMENT)废掉整轮 ASR——音乐打断轮 cbuf
+         *   有积压时是全场唯一走到此处的路径,实测 21 包话音全好、却死在这 8 帧裸包。*/
         if (!g_link_broken && !g_exit) {
             unsigned char _tb[TUYA_OPUS_FRAME_LEN];
             unsigned int _tn = 0;
@@ -2217,7 +2233,13 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                 if (_device_get_voice_data(_tb, sizeof(_tb)) != TUYA_OPUS_FRAME_LEN) {
                     break;
                 }
-                if (tai_send_audio_chunk(ctx, _tb, TUYA_OPUS_FRAME_LEN) != TAI_OK) {
+#ifdef TUYA_UPLINK_OPUS_ENABLE
+                int _tr = use_opus_uplink ? tuya_uplink_send_frame(ctx, _tb)
+                                          : tai_send_audio_chunk(ctx, _tb, TUYA_OPUS_FRAME_LEN);
+#else
+                int _tr = tai_send_audio_chunk(ctx, _tb, TUYA_OPUS_FRAME_LEN);
+#endif
+                if (_tr != TAI_OK) {
                     printf("[TUYA] tail flush send fail\r\n");
                     g_link_broken = 1;
                     break;
@@ -2431,10 +2453,19 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
 #endif
                 }
             }
-            if (!g_wake_break) {   /* 唤醒打断:词尾由吞咽窗在 idle 排,这里不再白排 300ms */
-                unsigned char _trash[TUYA_OPUS_FRAME_LEN];
+            /* 唤醒打断:词尾由吞咽窗在 idle 排;barge-in 打断:confirm 后 cbuf 里压的正是
+             * 抢答正文(此路径 break 只跳出排空循环,拦不到这里之前就起轮),此处再吞
+             * 8 帧 ≈320ms 会把句中话音吃掉——2026-09-20 实测"给我讲个故事吧"被打断
+             * 路径吞成"给我故事吧"(speak-start cbuf=0、arm→起轮 273ms 即此吞咽窗)。*/
+            if (!g_wake_break && !g_barge_in) {
+                unsigned char _pd[TUYA_OPUS_FRAME_LEN];
                 for (int i = 0; i < 8 && !g_exit; i++) {  /* 8 × ~40ms ≈ 300ms 排空 mic */
-                    _device_get_voice_data(_trash, sizeof(_trash));
+                    /* ★ 帧进 barge 历史(2026-09-20):用户在 TTS 刚结束的这 300ms 里
+                     *   追问的话音头会落在此窗——只丢不存则追问轮同样缺首字,回溯
+                     *   留底逻辑与 idle 排空一致(静音/残响帧被 8 万能量闸砍掉)。*/
+                    if (_device_get_voice_data(_pd, sizeof(_pd)) == TUYA_OPUS_FRAME_LEN) {
+                        barge_hist_push(_pd);
+                    }
                 }
 #ifdef TUYA_KWS_ENABLE
                 tuya_kws_window_kick();   /* 答毕(TTS 播完)续窗:短时间内可直接追问 */

@@ -411,3 +411,39 @@ VM_OPT=0;//单备份...(原样不动)
 - `patches/tuya-agentic-v1.2.0.patch` 的 app_config.h 与 .cbp 两段已按 V1.2.12 基线(tag `AC79NN_SDK_V1.2.12_2026-03-07`)重新生成,临时原始树 `git apply --check` 全 11 段通过。
 - README.md / README.en.md 口径更新:上行默认 PCM、云端停说本地兜底描述、打断条目补孤儿打断/尾音冲刷、宏表默认列。
 - docs/ 新增《声学测试问题分析与解决方案_20260915.md》《误打断与尾音处理说明_AEC参数.md》。
+
+## 2026-09-20 增量改动(上行 opus 定稿:换杰理闭源编码库 + 尾部冲刷修复)
+
+### W. 上行编码器换杰理闭源库(`tuya_opus_enc.c` 全重写)
+
+- **现象**:声学高压测试中本地 libopus 1.4 定点软编码把 CPU 推到 ~95%(`opus_encoder` 任务),有整机降载风险。
+- **改动**:不再直链 `libopus_tuya.a`(topus_ 符号),改开一条 audio_server 的 "virtual" 源 opus 编码通道,由杰理闭源库(`cpu/wl82/liba/lib_opus_enc.a`/`lib_opus_stenc.a`,固件链接清单本就含)在 audio_server 任务线程编码:demo 线程注入 1280B PCM → `read_input` 回调拉取 → 编码结果经 vfs `fwrite` 写回输出 cbuf → `tuya_opus_enc_frame()` 取包。参数 `format_mode=0`(裸 CBR)/16k/mono/16kbps/40ms → 恰 80B/包,云端契约不变(opus=111,80B/帧→40ms/16kbps 由帧长推导)。`tuya_opus_enc.h` 帧常量整理(`TUYA_OPUS_PCM_BYTES`=1280、`TUYA_OPUS_FRAME_LEN` 预期 80)。
+- **Makefile/.cbp**:摘除 libopus 源目录/头路径/`libopus_tuya.a` 链接(本地移植版不再参与构建;`libopus/` 目录保留作历史/回退参考)。`app_config.h` 打开 `TUYA_UPLINK_OPUS_ENABLE`,注释块同步重写。
+- **回退**:注释 `TUYA_UPLINK_OPUS_ENABLE` 即回 PCM 上行(编码器文件整体空编译);初始化失败时 demo 会话内自动回退 PCM。
+
+### X. 尾部冲刷 opus 会话下发 raw PCM 的致命 bug(`tuya_agentic_demo.c`)
+
+- **现象**:opus 上行下,一轮结束后下一轮 gRPC `INVALID_ARGUMENT`,该轮 ASR/TTS 全无("死轮",音乐打断场景复现)。根因:尾部冲刷循环在 opus 会话里仍走 `tai_send_audio_chunk` 直发 1280B raw PCM,云端解码器流被打断破坏。
+- **改动**:冲刷循环改走 `tuya_uplink_send_frame()`(逐帧编码后发送),并打印 `tail flush: N frames`。
+
+### Y. settle 排水不再抢 barge 预填数据(`tuya_agentic_demo.c`)
+
+- 静音判定排水循环条件加 `&& !g_barge_in`:barge-in 进行中不排水,避免吞掉预填队列头部(话音开头丢失)。
+
+### Z. 其他
+
+- `stm/tuya_stm_ai.c` 仅注释更新(上行编码契约注释与闭源库实现对齐)。
+- **已知开放项(非链路问题)**:音乐播放中打断说话的轮次,云端 ASR 质量受声学影响(话音头部混音乐/AEC 残留,偶发语种漂移 zh→fr),待声学侧继续优化。
+
+### 验证(2026-09-20 真机 + 云端双侧)
+
+- 10 轮对话(含 2 轮音乐播放中打断)全部正常出 ASR/LLM/TTS;云端零解码错误。
+- 上行完整性逐包核对:OSS 全轮音频包数与设备侧精确匹配(50 包 = 13 预填 + 35 实时 + 2 冲刷;23 包 = 14 + 1 + 8),逐包 Hamming 距离分析零丢失零重复,TOC 单字节 = 干净 CBR 流。
+- CPU:`opus_encoder` 任务 2-3%(原 ~95%),aec 68%,agentic ~2%。
+
+### 同步范围
+
+- SDK 开发树(0cec78fc 之后的工作区改动)→ overlay 同步 7 文件:`tuya_agentic_demo.c`(凭据占位符惯例不变)、`tuya_opus_enc.c/.h`、`stm/tuya_stm_ai.c`、`Makefile`、`AC791N_WIFI_STORY_MACHINE.cbp`、`app_config.h`。
+- `patches/tuya-agentic-v1.2.0.patch` 的 .cbp/Makefile/app_config.h 三段按 V1.2.12 基线(tag `AC79NN_SDK_V1.2.12_2026-03-07`)重新生成,临时原始树 `git apply --check` 全 11 段通过。
+- README.md / README.en.md 口径更新:上行默认 opus(杰理闭源库)、libopus 目录弃用说明、宏表默认列。
+- docs/ 新增《上行Opus编码_杰理闭源库方案.md》。

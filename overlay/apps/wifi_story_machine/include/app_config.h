@@ -242,13 +242,11 @@
 
 /* ===== 涂鸦上行 ASR 编码开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下生效)=====
  * 不定义(默认)= PCM:mic 管线直出 1280B/40ms 上行(32KB/s),拥挤网络易卡。
- * 定义 = opus:本地 libopus 1.4【定点】软编码(移植在 tuya_agentic/libopus/,
- *   封装 tuya_opus_enc.c),16k/mono/VOIP/CBR 16kbps/40ms → 每包 ~80B(~2KB/s,1/16 带宽)。
- *   mic 管线保持 PCM 不动(VAD/AEC/能量门/barge-in 全不受影响),只在上行发送处
- *   逐帧编码;编码器初始化失败自动回退 PCM,不废会话。
- *   ⚠️ 工具链风险(记录在案):clang 4.0.1+LTO 曾对本地 libopus 浮点解码产生
- *   axi_wr_inv 崩溃(2026-08-28 回退),故本编码器走定点;若上电/说话再现崩溃,
- *   注释掉本宏即回 PCM 上行。参数对齐 agentic-kit audio_chat_demo(云端验证过)。*/
+ * 定义 = opus:【杰理闭源编码库】(lib_opus_enc/stenc.a 经 audio_server virtual 源
+ *   通道驱动,封装 tuya_opus_enc.c),16k/mono/format_mode=0(裸CBR)/16kbps/40ms
+ *   → 每包恰 80B(~2KB/s,1/16 带宽)。mic 管线保持 PCM 不动(VAD/AEC/能量门/
+ *   barge-in 全不受影响),demo 线程注入 PCM 帧、audio_server 线程编码;
+ *   编码器初始化失败自动回退 PCM,不废会话。回退路径:注释本宏即回 PCM 上行。*/
 /* 2026-09-03 定论:PCM=101 全链路验证通过(ASR/NLG/TTS/音乐/多轮)。
  * 2026-09-04 定位 Opus 静默根因:对照 D:\code\agentic-kit 最新官方源码,
  * TCP 协议 OPUS=111 且上行必带帧参数(80B/帧→40ms/16000bps,从帧长推导);
@@ -258,8 +256,12 @@
  * 失败注释下一行即回 PCM。
  * 2026-09-17 晚:声学测试期 ASR 频繁不准(语种误判 ar/fr/de、乱码、播报原文转写),
  * 疑上行 Opus(2KB/s)下云端 ASR 质量——注释宏回 PCM(32KB/s,codec=101)重测;
- * 09-03 定论 PCM=101 全链路验证通过。恢复 Opus 取消注释即可。*/
-/* #define TUYA_UPLINK_OPUS_ENABLE */
+ * 09-03 定论 PCM=101 全链路验证通过。恢复 Opus 取消注释即可。
+ * 2026-09-20:编码器换杰理闭源库(原本地 libopus 1.4 定点移植版已摘除):高压声学
+ * 测试中本地库把 CPU 推到 95%,杰理库针对 pi32v2 优化且固件本就链有(audio_server
+ * 引用)。同因摘除 libopus_tuya.a(链接清单)与 topus_ 符号。云端契约不变:
+ * 80B CBR/40ms/16kbps,tuya_opus_enc.c 有包长核对日志。*/
+#define TUYA_UPLINK_OPUS_ENABLE
 
 /* ===== 涂鸦 barge-in(用户打断 TTS)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
  * 不定义(默认)= 不支持打断:TTS 期间不上行,简单稳定。

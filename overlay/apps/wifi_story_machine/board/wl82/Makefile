@@ -153,7 +153,6 @@ DEFINES += -DHTTP_DO_NOT_USE_CUSTOM_CONFIG -DMQTT_DO_NOT_USE_CUSTOM_CONFIG -DIOT
 # 头文件搜索路径
 INCLUDES := \
 	-I../../../../apps/common/LLM/tuya_agentic/tuya_inc \
-    ../../../../apps/common/LLM/tuya_agentic/libopus \
 	-I../../../../include_lib/c++ \
 	-I../../../../include_lib/c++/include \
 	-I../../../../include_lib/newlib/include \
@@ -239,10 +238,6 @@ INCLUDES := \
 	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/include \
 	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/interface \
 	-I../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/tuya-ble/include \
-	-I../../../../apps/common/LLM/tuya_agentic/libopus/include \
-	-I../../../../apps/common/LLM/tuya_agentic/libopus/celt \
-	-I../../../../apps/common/LLM/tuya_agentic/libopus/silk \
-	-I../../../../apps/common/LLM/tuya_agentic/libopus/silk/fixed \
 
 
 # 需要编译的 .c 文件
@@ -579,7 +574,6 @@ LFLAGS := \
 	../../../../cpu/wl82/liba/lib_wav_dec.a \
 	../../../../cpu/wl82/liba/lib_dts_dec.a \
 	../../../../cpu/wl82/liba/lib_opus_dec.a \
-	../../../../apps/common/LLM/tuya_agentic/libopus/libopus_tuya.a \
 	../../../../apps/common/LLM/tuya_agentic/stm/libstm_tuya.a \
 	../../../../apps/common/LLM/tuya_agentic/kws/audio_subsys.a \
 	../../../../cpu/wl82/liba/lib_amr_dec.a \

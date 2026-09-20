@@ -812,7 +812,7 @@ int tstm_send_audio_start(tai_ctx_t *ctx, uint8_t codec, uint8_t channels,
     c->a_frame_duration = 0;
     c->a_frame_size = 0;
     if (codec == TAI_AUDIO_OPUS) {
-        /* 对齐本地 libopus 配置:16k/mono/CBR 16kbps/40ms → 80B/帧 */
+        /* 上行编码契约(编码器换杰理闭源库后不变):16k/mono/CBR 16kbps/40ms → 80B/帧 */
         c->a_bitrate = 16000;
         c->a_frame_duration = 40;
         c->a_frame_size = 80;
