@@ -360,6 +360,8 @@ char *iot_region_to_host(iot_region_t region, iot_env_t env)
                         return IOT_EU_PRE_HOST;
                     case WEAZ:
                         return IOT_WEAZ_PRE_HOST;
+                    case SG:
+                        return IOT_SG_HOST;
                     case IN:
                         return IOT_IN_PRE_HOST;
                     default:
@@ -377,6 +379,8 @@ char *iot_region_to_host(iot_region_t region, iot_env_t env)
                     return IOT_EU_HOST;
                 case WEAZ:
                     return IOT_WEAZ_HOST;
+                case SG:
+                    return IOT_SG_HOST;
                 case IN:
                     return IOT_IN_HOST;
                 default:
