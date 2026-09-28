@@ -447,3 +447,48 @@ VM_OPT=0;//单备份...(原样不动)
 - `patches/tuya-agentic-v1.2.0.patch` 的 .cbp/Makefile/app_config.h 三段按 V1.2.12 基线(tag `AC79NN_SDK_V1.2.12_2026-03-07`)重新生成,临时原始树 `git apply --check` 全 11 段通过。
 - README.md / README.en.md 口径更新:上行默认 opus(杰理闭源库)、libopus 目录弃用说明、宏表默认列。
 - docs/ 新增《上行Opus编码_杰理闭源库方案.md》。
+
+---
+
+## 2026-09-28 增量改动(长流模式 v3 定稿:播放期回声闸 + 打断链路修复 + AEC 官方配方)
+
+> 覆盖主仓工作区 2026-09-21 ~ 09-24 的演进(上次同步 85740c6 之后)。默认形态从"组合 VAD(本地开口+云端停说)"切换为**长流模式 v3 + TTS 播放期回声闸**。
+
+### AA. 打断回执对冲 + 上行窗 END 判属(`tuya_agentic_demo.c`/`tuya_ai.h`/`tai_client.c`,09-21)
+
+- **chat_break 回执对冲**:本地 `tai_chat_break` 统一经 `tuya_break_send()` 出口,发送成功才计数(`g_local_break_pend`,封顶 3 防回执丢失残留);`on_event` 收到 CHAT_BREAK 先对冲,对冲干净才算云端判停。此前本地 barge-in 的回执(0.3~3s 后到,常落在新轮上行中)被当判停——9.21 一天误杀 523 轮。
+- **上行窗 END 判属**:`g_uplinking` 标记 audio_start 成功→audio_end 发出之间的上行窗口,窗内 END 只有命中本轮自己的 event-id(`g_turn_event_id`,新 API `tai_current_event_id()` 读回)才生效,其余判旧轮残留。**替换**旧 `g_stale_end_bizid` 快照机制——旧机制在 barge 链下系统性失效(回执自带旧轮 event-id 改写协议层锁存,TEXT 继承错 id→快照存错,比对必不中);协议层已同步跳过 CHAT_BREAK 的 latch 根治投毒。
+
+### AB. 自适应开口门限(`tuya_agentic_demo.c`,09-22 噪声专项)
+
+- 固定 4万 哑门按安静底噪标定,稳态噪声下空闲底噪中位数 17.7万(10dB SNR)直接泡死门限→26min 开出 96 个空轮(58%)。改为跟踪空闲底噪:`gate = clip(TUYA_OPEN_ENERGY_MIN 4万, 1.8×底噪中位数, 上限 60万)`,底噪在 idle drain 处采样(8批×16帧≈5s 中位数,TTS 期不入样防回声抬底)。安静环境门恒=4万,行为与固定门一致(20dB 实测 99.31% 不伤)。
+
+### AC. 长流模式 v3(`TUYA_STREAM_MODE`,09-23 定稿,完全对齐小智)
+
+- 会话建立即 `audio_start` 开流、此后永不主动收流——开口/停说/话音段切分/打断判定 100% 云端,设备侧零信号判定、零计时器、零能量门(TTS 播放期照常逐帧上传,上行成本已明确不考虑)。唯一事件切换=云端 END:audio_end 善后旧事件后立刻 audio_start 开新事件,流不断。
+- 决策依据:轮次制下噪声轮吃掉云端 VAD 事件(噪声持续无静默隙,VAD 钉在触发态)→10dB 检出率钉死 72%;竞品同涂鸦云长流实测 90.3%(乐鑫)/87.5%(T5)。
+- 配套修复:下行 START 帧=新轮回话,落在 `g_tts_drop_until` 丢弃窗内也不能丢(ASR+LLM ~1.3s 回话撞进 3s 窗,丢帧顺延会把窗口越续越长,整段回答被吃——"问了没声音"第二轮根因);云端 VAD 每轮在同一条上行流上生成新 vcd-event(event-id 每轮变),旧 id 判属在本模式必然失配,改按上行窗判属(见 AA)。
+- `TUYA_CLOUD_OPEN_ENABLE` 加 `#error` 依赖守卫(纯云开口硬依赖:云端判停+TCP+barge-in 预填)。
+- **一键切回轮次制(方案C)**:注释 app_config.h 的 `TUYA_STREAM_MODE` 重新编译,轮次代码在 demo.c 的 `#else` 分支原样保留。
+
+### AD. TTS 播放期回声闸(方案2 v2,`TUYA_STREAM_PLAYBACK_GATE`,09-24)
+
+- **根因(箱测自说自话)**:长流上行常开,AEC 残差直达云 VAD;最后 10min 闸零误开门仍出 32 轮——泄漏 100% 走 `g_tts_playing=0` 窗口。`g_tts_playing` 是下行流标志(TAI_STREAM_END 即清),下载跑赢实时播放,流 END 后喇叭还压着数秒缓冲尾巴,残差续上云→云听了自己刚说的话→接话→循环。
+- **v2 机制**:播放判据 `g_tts_playing || cbuf 水位≥640`(排空≈DAC 播完);播放期扣帧进 barge 历史,起播 8 帧盲窗(≈320ms,AEC 未收敛爆发期,上一帧≥60万 则不盲防剪真人话头);连续 3 帧≥60万 判真人插话→`barge_in_prefill_arm` 按 8万 闸回溯补发话音头→开门实时上行;开门后连续 25 帧(≈1s)<40万(`TUYA_PLAY_GATE_REGATE_ENERGY`)重新扣帧;真播完归位。非播放期零改动。
+- **9.24 声学专项实测**(10dB 噪声+65dB 语句,26min/144 标记):自说自话循环未再现(216 轮全由外部声源驱动);门被骗开=0。日志关键字:`play-gate: hold/voice confirmed/re-close/TTS over`。
+- 注释本宏=回纯长流基线;调门只动 60万(误掐→80万,失灵→50万)。
+
+### AE. AEC 参数官方配方定稿(`user_cfg.c`)
+
+- 09-23 全量调整(官方 Qwen 全双工 demo + 外接功放推荐配方):`AEC_DT_AggressiveFactor 2.0→1.0`、`ES_AggressFactor −6.0→−4.0`、`ES_MinSuppress 2.0→6.0`(`ES_Unconverge_OverDrive` 显式同步——它在上方早于本块赋值,只改 MinSuppress 会留 flash 旧值;09-24 对齐官方 story demo 再上 6.0)、DNS `over_drive 3.0→1.5`/`gain_floor 0.1→0.05`、`ANS_NoiseLevel=2.2e3` 显式补设({0} 初始化不设即 0,ANS 收敛慢)。
+- **不动**(实测定罪):AGC(BIT4,AEC 后级数字放大+单工控制器,检测到远端讲话就把近端淡出→上行永久静音,与 barge-in 根本冲突)、BIT(2)(闭源库输出路径一环)。
+- **dac_ref_sr 排雷注释**:改 48000(匹配 DAC 实跑率)会刷屏 `[AUDIO_DAC]read len > fifo len`(库按声明率 48000/125=384 算读取量,驱动产出粒度固定 320)——闭源库不支持 48000;且 DAC=44100 时 AEC 仍正常消音乐,证明库按声明率内部重采样,16000 即正确值。
+
+### app_config.h 宏状态
+
+- 启用:`TUYA_CLOUD_OPEN_ENABLE`、`TUYA_OPEN_ENERGY_MIN 40000u`(现为自适应门下限)、`TUYA_STREAM_MODE`、`TUYA_STREAM_PLAYBACK_GATE`,附 09-20~09-24 纯云/组合 A/B 完整决策注释链。
+
+### 同步范围
+
+- SDK 开发树 → overlay 同步 5 文件:`tuya_agentic_demo.c`(凭据占位符惯例不变,全仓已扫描零真实三元组)、`tuya_ai.h`、`tai_client.c`、`user_cfg.c`、`app_config.h`。`iot_dns.c`/`tuya_stm_ai.c`/`tuya_opus_enc.c/.h`/Makefile/.cbp 已与主仓一致(85740c6/71ffd76 已含),本次未动。
+- `patches/tuya-agentic-v1.2.0.patch` 的 app_config.h 段与 README.md/README.en.md 宏表口径仍为 09-20 版,待补。

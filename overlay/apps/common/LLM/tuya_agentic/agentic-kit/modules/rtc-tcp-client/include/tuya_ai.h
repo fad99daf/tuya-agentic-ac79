@@ -373,6 +373,10 @@ int tai_send_image_with_text(tai_ctx_t *ctx,
 
 int tai_chat_break(tai_ctx_t *ctx);
 
+/* Current uplink turn id (client-generated per tai_send_audio_start; stamps
+ * every uplink packet of the turn).  Empty string before the first start. */
+const char *tai_current_event_id(tai_ctx_t *ctx);
+
 int tai_send_mcp_response(tai_ctx_t *ctx, const char *json_rpc_response);
 
 /* =========================================================================

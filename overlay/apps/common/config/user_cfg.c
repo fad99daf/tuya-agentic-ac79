@@ -254,7 +254,14 @@ void get_cfg_file_aec_config(struct aec_s_attr *aec_param)
     aec_param->EnableBit &= ~BIT(5);
 #endif
 
-    aec_param->dac_ref_sr = 16000; //aec软件回采的dac参考采样率，8k或16k的整数倍
+    /* aec软件回采的dac参考采样率,须为AEC编码率(8k/16k)的整数倍
+     * ★ 2026-09-24 实测排雷:改 48000(匹配DAC实跑率)会刷屏报错
+     *   [AUDIO_DAC]read len > fifo len : 384-320(每DAC中断一次,库按声明率算
+     *   读取量48000/125=384,驱动产出粒度固定320)→闭源库不支持 48000。
+     *   且 9.23 晚场音乐 DAC=44100(非16k整数倍)时 AEC 仍正常消音乐,
+     *   证明库按声明率内部重采样、DAC 实际率自适应——16000 即正确值,
+     *   TTS 回声根因不在参考采样率,待 4 通道诊断定位。 */
+    aec_param->dac_ref_sr = 16000;
 
     aec_param->AGC_NDT_fade_in_step  = aec_config.ndt_fade_in;
     aec_param->AGC_NDT_fade_out_step = aec_config.ndt_fade_out;
@@ -281,31 +288,44 @@ void get_cfg_file_aec_config(struct aec_s_attr *aec_param)
     aec_param->ES_Unconverge_OverDrive = aec_param->ES_MinSuppress;
 
     /* === AEC 参数调优覆盖(syscfg 读取之后,覆盖 flash 值)==
-     * 默认参数可能不适配我们的喇叭/麦声学环境,试调激进:
-     * - AEC_DT_AggressiveFactor: 原值(通常1.0)→2.0,回声消除更激进
-     * - ES_AggressFactor: 原值(通常-3)→-6,非线性残留抑制更深
-     * - ES_MinSuppress: 原值(通常4)→2,允许更深的抑制
-     * 配合 tuya_agentic_demo.c 的 [AEC-DBG] 诊断日志验证效果(act 高=没消,低=消了)。*/
-    aec_param->AEC_DT_AggressiveFactor = 2.0f;
-    aec_param->ES_AggressFactor      = -6.0f;
-    aec_param->ES_MinSuppress        =  2.0f;
-    /* ★ 强制开 DNS(EnableBit BIT(5)):CONFIG_DNS_ENC_ENABLE 虽已定义,但 aec_mode 实际值
-     *   读自 flash syscfg——里面存的旧值可能没有 BIT(5)(mode=7 而非 39),DNS 等于没开。
-     *   在这里 |= 保证无论 flash 存了什么都开着(2026-08-28 嘈杂环境 ASR 误识别优化)。*/
-    aec_param->EnableBit |= BIT(5);
-    /* DNS 降噪:1.0→2.0 是为压 TTS 回声;这次 2.0→3.0 为嘈杂环境 ASR(实测说话帧 act 0~2%,
-     *   与底噪同量级,SNR 不足云端捞字困难)。over_drive 越大压得越狠(0~6):
-     *   调参看串口 [TUYA] idle drain avg_sum(底噪基线,应明显下降)与说话帧 act%(应相对升高);
-     *   若出现"小声说话被吃/识别反而更差"(过压制)回调到 2.0~2.5。
-     *   gain_floor 显式钉在 0.1(默认):允许的最大降噪深度,再小易压语音。*/
-    aec_param->DNS_over_drive        =  3.0f;
-    aec_param->DNS_gain_floor        =  0.1f;
-    log_info("AEC override: enablebit=%d dt_aggr=%.1f es_aggr=%.1f es_min_supp=%.1f dns_od=%.1f\n",
+     * ★ 2026-09-23 10dB 噪声专项全量调整(官方 Qwen 全双工 demo + 外接功放推荐配方):
+     *   依据 9.23 实测:382 轮云判决中 137 轮空轮(36%,底噪 17.7万顶开云 VAD 门限);
+     *   245 非空轮中 28 轮 TTS 回声被当输入(11%,含"正在播放"自循环)。
+     *   - ES_MinSuppress 2.0→4.0 恢复 SDK 默认:9.22 那轮 4.0→2.0 方向搞反了,
+     *     此参数越大静态压制越强(官方 demo/外接功放文档均用 6.0,先回默认,
+     *     不足再加到 5.0~6.0)。Unconverge_OverDrive 必须显式同步——它在上方
+     *     281 行赋值早于本块,只改 MinSuppress 会留下 flash 旧值。
+     *   - ES_AggressFactor -6.0→-4.0、DT_Aggr 2.0→1.0:外接功放推荐组合,
+     *     太激进在功放非线性下估计会发散。
+     *   - DNS 回开(BIT5),od=1.5/floor=0.05 抄官方 Qwen demo(9.21 的 od=3.0
+     *     已证太猛:音乐噪声伪影)。主攻 137 空轮:把底噪压到云 VAD 门限之下。
+     *   - ANS_NoiseLevel=2.2e3 显式补设:aec_param 在 audio_input.c 是 {0} 零初始化,
+     *     不设即 0,ANS 噪声估计收敛慢。官方 demo 均显式设此值。
+     *   不动:AGC(BIT4,单工杀上行已定罪)、BIT(2)(关掉上行哑)、音量、回采方式。
+     *   实测排雷记录(2026-09-22 方案A/B):方案A(=19,BIT2也关)与方案B(=23,
+     *   BIT2恢复)两版上行全部哑掉(idle sum 178~340,基线~15000)——差集只剩
+     *   AGC,官方文档闭环定罪:AGC 是"AEC 后级数字放大+单工控制器",检测到远端
+     *   讲话就把近端淡出→上行永久静音,与 barge-in 根本冲突,不可用于本产品;
+     *   BIT(2) 是闭源库输出路径一环,同样不能关。两者均不再触碰。*/
+    aec_param->AEC_DT_AggressiveFactor = 1.0f;
+    aec_param->ES_AggressFactor      = -4.0f;
+    /* ★ 2026-09-24 4.0→6.0:对齐官方 wifi_story demo 配方(D_QWEN_ES_MIN_SUPPRESS=6.0),
+     *   加大静态压制以配合 dac_ref_sr 修正,进一步压 TTS 回声残留。 */
+    aec_param->ES_MinSuppress        =  6.0f;
+    aec_param->ES_Unconverge_OverDrive = aec_param->ES_MinSuppress;
+    aec_param->EnableBit |= BIT(5);              // DNS 回开(9.22 曾关以对齐小智配方,10dB 专项回开)
+    aec_param->DNS_over_drive        =  1.5f;
+    aec_param->DNS_gain_floor        =  0.05f;
+    aec_param->ANS_NoiseLevel        =  2.2e3f;
+    log_info("AEC override: enablebit=%d dt_aggr=%.1f es_aggr=%.1f es_min_supp=%.1f unconverge=%.1f dns_od=%.1f dns_floor=%.2f ans_nl=%.0f\n",
              (int)aec_param->EnableBit,
              (double)aec_param->AEC_DT_AggressiveFactor,
              (double)aec_param->ES_AggressFactor,
              (double)aec_param->ES_MinSuppress,
-             (double)aec_param->DNS_over_drive);
+             (double)aec_param->ES_Unconverge_OverDrive,
+             (double)aec_param->DNS_over_drive,
+             (double)aec_param->DNS_gain_floor,
+             (double)aec_param->ANS_NoiseLevel);
 }
 #endif
 
