@@ -13,10 +13,11 @@
 - **上行 ASR** — opus(默认,杰理闭源编码库 `lib_opus_enc.a`/`lib_opus_stenc.a` 经 SDK audio_server "virtual" 源通道驱动,16k/mono/CBR 16kbps/40ms → 恰 80B/包,~2KB/s 仅为 PCM 的 1/16;2026-09-20 定稿,编码任务 CPU 2-3%)/ PCM(可选,32KB/s,codec=101;注释 `TUYA_UPLINK_OPUS_ENABLE` 即回退)。mic 管线保持 PCM(VAD/AEC/能量门/barge-in 全不受影响),仅在发送前逐帧编码;编码器初始化失败自动回退 PCM。TCP 传输实测调通;方案详见 `docs/上行Opus编码_杰理闭源库方案.md`
 - **下行 TTS** — opus(默认,~2KB/s 治拥挤网络卡顿)/ PCM(可选,稳定)。opus 已调通:CBR + `sample_rate=0` 自动重采样
 - **传输层可选(TCP / UDP)** — 默认 TCP(`rtc-tcp-client` 源码直连,行为与历史版本一致);可切涂鸦团队预编译的 STM OPEN SDK(`stm/libstm_tuya.a`,UDP/DTLS 与 TCP 竞速、UDP 优先、不通自动回落),`TUYA_TRANSPORT_STM_ENABLE` 一个开关切换,两个后端同时编译共存。切换细节与已知差异见 `stm/README.md`
-- **DNS 降噪强化** — 嘈杂环境 ASR 优化:强制开 DNS 位(不受 flash 旧配置影响)+ 降噪强度 over_drive=3,实测底噪基线 9k~64k → 3k~6k;若小声说话被吃,在 `user_cfg.c` 覆盖块回调 2.0~2.5
-- **打断 (barge-in)** — AEC + VAD + 多帧能量确认,用户可随时打断 TTS(依赖 AEC)。空闲起轮与播报中打断用两道独立能量门(`BARGE_MIN_ENERGY` 10 万 / `BARGE_CONFIRM_ENERGY` 60 万),后者专门抗 TTS 回声的 AEC 残留误触发(实测残留确认帧 <40 万、真人插话 >110 万,取 60 万居中)。TTS 音频断续下发的"孤儿"片段同样可被 VAD+3 帧能量确认打断;停说收尾前冲刷 mic 缓冲尾音(≤320ms),防句尾字被掐
+- **AEC/DNS 前端配方** — `user_cfg.c` 覆盖块按官方 Qwen 全双工 demo 配方定稿(2026-09-23):DNS 强制开位(不受 flash 旧配置影响,over_drive=1.5/gain_floor=0.05)+ `ES_MinSuppress=6.0`(含 `ES_Unconverge_OverDrive` 显式同步)+ `ANS_NoiseLevel=2.2e3`;AGC 不可开(AEC 后级单工控制器,检测到远端讲话就把近端淡出,与打断根本冲突)。若小声说话被吃,把 `DNS_over_drive` 回调 2.0~2.5
+- **打断 (barge-in)** — 长流模式下由云端 VAD 全权判定,设备侧无打断逻辑。轮次制(注释 `TUYA_STREAM_MODE`)下为 AEC + VAD + 多帧能量确认(依赖 AEC):空闲起轮与播报中打断用两道独立能量门(`BARGE_MIN_ENERGY` 10 万 / `BARGE_CONFIRM_ENERGY` 60 万),后者专门抗 TTS 回声的 AEC 残留误触发(实测残留确认帧 <40 万、真人插话 >110 万,取 60 万居中);TTS "孤儿"片段同样可被 VAD+3 帧能量确认打断;停说收尾前冲刷 mic 缓冲尾音(≤320ms),防句尾字被掐
 - **音乐播放** — "播放XXX的歌":云端音乐 SKILL 回试听 mp3 URL,设备解析后走杰理网络解码链播放(https 自动 TLS);TTS 报幕后让出 DAC、播完自动恢复,播放中说话可打断停乐(VAD+3 帧能量门)。⚠️ 试听片段 ~30s,完整歌曲需在涂鸦平台购买音乐高级能力授权
-- **云端 VAD 停说判定** — 开口永远本地 VAD;停说由云端事件决定(TAI 2.1 协议经 ChatBreak 通知停说,代码兼容处理 ServerVad),带本地 VAD 兜底(云端停说事件丢失时本地判停收尾,TCP 通道)。STM/UDP 通道下该事件暂不可区分,自动退化为本地静音兜底,见 `stm/README.md`
+- **长流模式(默认,2026-09-23 定稿,对齐小智)** — 会话建立即开上行流、永不主动收流:开口/停说/话音段切分/打断判定 100% 由云端 VAD 决定(TAI 2.1 停说经 ChatBreak 通知,兼容 ServerVad),设备侧零信号判定、零计时器、零能量门,TTS 播放期间也照常逐帧上传(上行 ~2KB/s 常开)。唯一事件切换 = 云端 END:善后旧事件后立刻开新事件,流不断。注释 `TUYA_STREAM_MODE` 一键切回轮次制(本地 VAD 开口+云端停说,代码在 `tuya_agentic_demo.c` 的 `#else` 分支原样保留)
+- **TTS 播放期回声闸(长流模式配套,2026-09-24)** — 长流把本地门拆了,AEC 残差(实测单帧 sum 中位 ~12万、最坏 38.4万)会直达云 VAD 引发"自己打断自己"。播放期间(判据含解码缓冲水位,流 END ≠ 播完)扣帧只入 barge 历史:起播 8 帧盲窗(AEC 未收敛期)后,连续 3 帧 ≥60 万判真人插话 → 按 8 万能量闸回溯补发话音头 → 实时上行;停说 1s(25 帧 <40 万)重新扣帧。非播放期零改动;注释 `TUYA_STREAM_PLAYBACK_GATE` 回纯长流基线。误掐真人调高 `BARGE_CONFIRM_ENERGY`(默认 60 万),闸失灵调低
 - **MQTT 常驻 + DP 下行** — MQTT 与 AI 的 TLS 各自独立连接并存,`tuya_mqtt_ka` 线程维持心跳收 DP 下行(10ms 轮询,下发延迟毫秒级);App 里设备保持在线,云端下发的 DP/MCP 命令实时可收(`on_dp_downlink` / `on_event`)
 - **TTS 首字预蓄水** — 每轮 TTS 开头先攒 ~160ms 音频再喂解码器,治首帧短包 underrun 卡顿
 - **涂鸦云 OTA** — 开机连 AI 前检查升级,有新固件则下载烧写自动重启(双备份方式)
@@ -136,7 +137,11 @@ make ac791n_wifi_story_machine
 | `TUYA_KWS_ENABLE` | 唤醒词"你好涂鸦"(主)+"嘿涂鸦"门控(闭源引擎常开识别,失败自动回退常听)。**默认关=常听模式**;要启用把 `app_config.h` 里该行整行注释去掉(⚠️`#ifdef` 语义,置 0 无效),详见 `docs/WAKEWORD.md` | **关(常听)** |
 | `TUYA_DOWNLINK_OPUS_ENABLE` | 下行 TTS 用 opus(治卡顿);注释则用 PCM | 开 |
 | `TUYA_UPLINK_OPUS_ENABLE` | 上行 ASR 用杰理闭源 opus 库(audio_server 通道,~2KB/s);注释则 PCM(32KB/s,codec=101) | 开(opus) |
-| `TUYA_SERVER_VAD_ENABLE` | 云端 VAD 停说判定(开口仍本地 VAD;本地 VAD 兜底) | 开 |
+| `TUYA_SERVER_VAD_ENABLE` | 云端 VAD 裁决(长流模式硬依赖,demo.c 有 `#error` 守卫) | 开 |
+| `TUYA_STREAM_MODE` | **长流模式(默认形态)**:开流永不收,裁决 100% 云端;注释=回轮次制(本地 VAD 开口+云端停说,`#else` 分支原样保留) | 开 |
+| `TUYA_STREAM_PLAYBACK_GATE` | 长流模式 TTS 播放期回声闸:播放期扣帧,3 帧 ≥60万 判真人开门+回溯补发话音头;注释=回纯长流基线 | 开 |
+| `TUYA_CLOUD_OPEN_ENABLE` | 纯云端开口(哑门+云端裁决;`TUYA_STREAM_MODE` 的硬依赖之一) | 开 |
+| `TUYA_OPEN_ENERGY_MIN` | 开口能量门下限(Σ\|int16\|/40ms 帧);实际门自适应 = clip(4万, 1.8×空闲底噪中位数, 60万 上限),安静环境恒等于本值 | 40000 |
 | `TUYA_MUSIC_ENABLE` | 音乐技能:解析音乐 SKILL 交网络解码链播放,支持说话停乐 | 开 |
 | `TUYA_OTA_ENABLE` / `TUYA_FIRMWARE_VERSION` | 涂鸦云 OTA;版本号为手动方案(发版前改宏与平台一致) | 1 / "1.0.11" |
 
@@ -169,7 +174,7 @@ make ac791n_wifi_story_machine
 | **配网时连上就断(conn nack → 超时)** | 多为 2.4G 射频干扰。关掉手机 WiFi 再配、靠近设备、多试几次 |
 | **音乐只播 ~30 秒就停** | 平台试听片段限制;完整歌曲需在涂鸦平台购买音乐高级能力授权 |
 | **音乐放着放着自己停了** | 音乐 barge-in 误触发:音乐回采穿透了能量门。看日志 `[MUSIC-DBG]` 基线 sum,调高 `BARGE_CONFIRM_ENERGY`(`tuya_agentic_demo.c`) |
-| **嘈杂环境 ASR 识别不准** | 看串口 `idle drain avg_sum`(底噪基线)与说话帧 `act%`。DNS 已强制开且 over_drive=3(`user_cfg.c` 覆盖块);若**小声说话被吃/识别反而变差**(过压制),把 `DNS_over_drive` 回调 2.0~2.5。注意 DNS 只压稳态噪声(风扇/嗡嗡),旁边人声/电视等非稳态噪声无解,需离麦近一点 |
+| **嘈杂环境 ASR 识别不准** | 看串口 `idle drain avg_sum`(底噪基线)与说话帧 `act%`。DNS 强制开、官方配方 over_drive=1.5/gain_floor=0.05 + `ES_MinSuppress=6.0`(`user_cfg.c` 覆盖块,2026-09-23 定稿);若**小声说话被吃/识别反而变差**(过压制),把 `DNS_over_drive` 回调 2.0~2.5。注意 DNS 只压稳态噪声(风扇/嗡嗡),旁边人声/电视等非稳态噪声无解,需离麦近一点 |
 | **说"你好涂鸦"没反应** | 看日志 `[KWS-PROBE]` 里"你"段 k23/k04、"好"段 k27/k09 是否依次出现:出现但分数贴线=阈值偏高(0.7 可降到 0.65),完全不出=发音/前端问题。调参详见 `docs/WAKEWORD.md` |
 | **命令行 make 出的固件行为像旧代码** | 老 GNU make 静默跳过 objs.txt 重写,链接吃了上次构建的旧 obj 列表。带全参数重编并先删 `sdk.elf`:`make -j8 MKDIR="mkdir -p" RM="rm -rf" LINK_AT=0` |
 | **patch 打不上 / 行号错位** | SDK 版本不对。必须用 `AC79NN_SDK_V1.2.12_2026-03-07`(内容 = 官方 V1.2.0 release 包,patch 基线) |

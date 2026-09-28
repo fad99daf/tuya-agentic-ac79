@@ -491,4 +491,5 @@ VM_OPT=0;//单备份...(原样不动)
 ### 同步范围
 
 - SDK 开发树 → overlay 同步 5 文件:`tuya_agentic_demo.c`(凭据占位符惯例不变,全仓已扫描零真实三元组)、`tuya_ai.h`、`tai_client.c`、`user_cfg.c`、`app_config.h`。`iot_dns.c`/`tuya_stm_ai.c`/`tuya_opus_enc.c/.h`/Makefile/.cbp 已与主仓一致(85740c6/71ffd76 已含),本次未动。
-- `patches/tuya-agentic-v1.2.0.patch` 的 app_config.h 段与 README.md/README.en.md 宏表口径仍为 09-20 版,待补。
+- `patches/tuya-agentic-v1.2.0.patch` **全 11 段重新生成**(基线不变:`AC79NN_SDK_V1.2.12_2026-03-07` tag = 官方 V1.2.0 release 包,见 README §0;纯净基线树 `git apply --check` 全段通过)。顺带修复**陈段漏洞**:此前两次同步只重生成了点名的段,`audio_input.c/.h`、`app_music.c`、`wifi_app_task.c` 四段停留在更早版本——patch 路径产出的树缺 `_device_set_play_volume/_get_play_volume` 声明与实现,而 `tuya_mcp.c`(音量技能)在调用,patch-only 构建会在链接期炸;overlay 整覆盖路径不受影响,故未暴露。
+- README.md / README.en.md 口径更新:功能特性新增"长流模式(默认)""TTS 播放期回声闸"两条并改写打断/DNS 条目(官方配方 over_drive=1.5/MinSuppress=6.0),宏表新增 `TUYA_STREAM_MODE`/`TUYA_STREAM_PLAYBACK_GATE`/`TUYA_CLOUD_OPEN_ENABLE`/`TUYA_OPEN_ENERGY_MIN` 四行,FAQ 嘈杂环境条目参数同步。
