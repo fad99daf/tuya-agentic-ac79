@@ -13,7 +13,7 @@
 | 类别 | 说明 |
 |---|---|
 | **A. 新建集成模块** | `apps/common/LLM/tuya_agentic/` 下手写的胶水代码(PAL / 配网 / 对话主流程 / bool 补丁 / **OTA 编排** / **音乐技能**) |
-| **B. 改动的 SDK 原有文件** | 11 个:Makefile、user_cfg.c、app_music.c、app_main.c、app_config.h、wifi_app_task.c、audio_input.c/.h、board_7916A.c、AC791N_...cbp、isd_config_rule.c |
+| **B. 改动的 SDK 原有文件** | 12 个:Makefile、user_cfg.c、app_music.c、app_main.c、app_config.h、wifi_app_task.c、audio_input.c/.h、board_7916A.c、AC791N_...cbp、isd_config_rule.c、isd_config_rule_loader.c |
 | **C. 引入的依赖(原样,未改)** | 涂鸦开源 `rtc-tcp-client`/`iot-client`/`tuya-ble`/`common` + AWS `coreHTTP`/`coreMQTT` |
 
 ---
@@ -493,3 +493,34 @@ VM_OPT=0;//单备份...(原样不动)
 - SDK 开发树 → overlay 同步 5 文件:`tuya_agentic_demo.c`(凭据占位符惯例不变,全仓已扫描零真实三元组)、`tuya_ai.h`、`tai_client.c`、`user_cfg.c`、`app_config.h`。`iot_dns.c`/`tuya_stm_ai.c`/`tuya_opus_enc.c/.h`/Makefile/.cbp 已与主仓一致(85740c6/71ffd76 已含),本次未动。
 - `patches/tuya-agentic-v1.2.0.patch` **全 11 段重新生成**(基线不变:`AC79NN_SDK_V1.2.12_2026-03-07` tag = 官方 V1.2.0 release 包,见 README §0;纯净基线树 `git apply --check` 全段通过)。顺带修复**陈段漏洞**:此前两次同步只重生成了点名的段,`audio_input.c/.h`、`app_music.c`、`wifi_app_task.c` 四段停留在更早版本——patch 路径产出的树缺 `_device_set_play_volume/_get_play_volume` 声明与实现,而 `tuya_mcp.c`(音量技能)在调用,patch-only 构建会在链接期炸;overlay 整覆盖路径不受影响,故未暴露。
 - README.md / README.en.md 口径更新:功能特性新增"长流模式(默认)""TTS 播放期回声闸"两条并改写打断/DNS 条目(官方配方 over_drive=1.5/MinSuppress=6.0),宏表新增 `TUYA_STREAM_MODE`/`TUYA_STREAM_PLAYBACK_GATE`/`TUYA_CLOUD_OPEN_ENABLE`/`TUYA_OPEN_ENERGY_MIN` 四行,FAQ 嘈杂环境条目参数同步。
+
+---
+
+## 2026-09-28 增量改动(三元组量产授权区:load/write/erase 全链收官 + 烧录指南)
+
+> 覆盖主仓工作区 2026-09-27 ~ 09-28 的授权区阶段 A/B 与 write/erase 板上验证(上次同步 a95748a 之后)。与音频主线(长流/回声闸)零耦合,纯设备身份/产线通道。
+
+### AF. 新模块 `tuya_auth_region.c/.h`(A 类新增)
+
+- 96B 授权区读写载体,flash `0x5FE000` 4K 独立保留区:`probe`(load 前打印 head16 裸照)/`load`(magic+版本+尺寸+字符串域+CRC16-CCITT-FALSE 全链校验)/`write`(先擦 4K→写 96B→回读逐字节比对,头域与 CRC 一律函数内规范化)/`erase`(擦+FF 回读)。
+- 分区契约:`isd_config_rule.c` 与 `isd_config_rule_loader.c` 的 `[RESERVED_EXPAND_CONFIG] USER_ADR` 由 AUTO **钉死为 0x5FE000**(两文件必须同值)。AUTO 随 app 大小/资源布局漂移,是 09-17 首版方案写入 bug 的根源。
+- 地址域铁律(注释内嵌):`fget_attrs` 的 sclust 是 CPU 映射地址,喂 `sdfile_reserve_zone_*` 原样直传,与 flash 原始地址比对必须先 `sdfile_cpu_addr2flash_addr()`。
+- 运行期按名 `fopen("mnt/sdfile/EXT_RESERVED/user")` 取址,不依赖钉死值;烧写器分区表与该值不一致时开机自检打印 mismatch。
+- 串口命令解析器(`auth show/write/erase`)就绪,UART transport 未接线——产线工装定版后接 `tuya_auth_region_serial_line()` 即活。
+- `TUYA_AUTH_REGION_STRICT`(默认 0)为量产"只认区、不回落宏"开关:仅编译验证,板上未验。
+
+### AG. demo.c 三元组来源注入 + RW_TEST 验证钩子(已归零)
+
+- 启动时 probe→load:区有效→注入配网配置,日志 `triplet source: USER region @0x5FE000`;无效→回落 demo.c 顶部三宏,日志明示 `built-in macros`。三元组**仅在激活时消费**——VM 有 devid 时开机直连不读区码(换号必须配 K6,详见指南 §5)。
+- `TUYA_AUTH_RW_TEST`(app_config.h,**恒 0**):1=erase 验证、2=区无效时宏自写号验证,两档 2026-09-28 板上收官后归零;留 1/2 的产线事故场景已写入宏注释块。
+- 板上证据链:write OK crc=0x9be4(擦+写+回读)→断电重上(reset=LOW POWER)直接 load OK 同 crc→K6 后无 write 再现=已写号区跨 K6 保留→区码驱动重配网激活第 4 个 devid→普通重烧不碰区。
+
+### AH. 文档与工具
+
+- docs/ 新增《烧录与三元组授权区指南.md》:三种烧录形态(普通烧录不动区/全新板首烧带码/换号必须先全片擦除)、96B 布局表、开机日志速查、RW_TEST 红线、坑清单(AUTO 地址/叠写不擦/sclust 域/真实 bin 不进仓)。
+- tools/ 新增 `gen_auth_bin.py`:96B 授权码生成器,实测与板上 write/load 的 crc(0x9be4)和 head16 逐字节一致。真实授权 bin 一律不进仓(.gitignore 已挡 `*.bin`)。
+
+### 同步范围
+
+- 主仓 → overlay 同步 8 文件:`tuya_agentic_demo.c`(凭据占位符惯例不变,整仓复检零真实三元组)、`tuya_auth_region.c/.h`(新增)、`app_config.h`(授权区宏块)、`Makefile`/`AC791N_WIFI_STORY_MACHINE.cbp`(接线 tuya_auth_region.c)、`isd_config_rule.c`、`isd_config_rule_loader.c`(新增)。
+- patch **11 段扩为 12 段**重新生成(基线不变:`AC79NN_SDK_V1.2.12_2026-03-07` tag):`isd_config_rule.c` 段内容扩含 USER 区钉死,新增 `isd_config_rule_loader.c` 段;纯净基线树 `git apply` 后与 overlay 逐文件比对通过。

@@ -27,6 +27,7 @@
 #include "tuya_agentic.h"
 #include "tuya_mcp.h"
 #include "tuya_ble_prov.h"        /* tuya_ble_wifi_creds_t(BLE 配网结果类型)*/
+#include "tuya_auth_region.h"     /* 量产授权区(USER@0x5FE000):96B三元组 load/write/erase(阶段2) */
 #ifdef TUYA_MUSIC_ENABLE
 #include "tuya_music.h"           /* 音乐 SKILL 文本流重组+解析(实现 tuya_music.c) */
 /* 实现见 apps/wifi_story_machine/app_music.c(导出模式同 app_music_play_netcfg_prompt):
@@ -87,6 +88,18 @@ void _device_net_audio_play(bool flag);       /* 停/起 TTS 网络播放器(音
 #define TUYA_DEVID      "tuya_xxx"   /* 仅 TUYA_USE_ONBOARDING=0 时用 */
 #define TUYA_SECRET_KEY "xxxx"       /* 仅 TUYA_USE_ONBOARDING=0 时用 */
 #define TUYA_LOCAL_KEY  "xxxx"       /* 仅 TUYA_USE_ONBOARDING=0 时用 */
+
+/* ===== [阶段2] 运行期三元组(方案《涂鸦三元组量产烧录改造方案》§5.2,2026-09-28)=====
+ * tuya_agentic_main 开机先 tuya_auth_region_load() 填 g_tuya_triplet;三元组注入点
+ * (本文件 tuya_agentic_demo 调试路径 / BLE配网 tuya_ble_netcfg_start / on_boarding
+ * 填参)一律经下面 getter 取值:授权区有效→区域码;无效→回退上面默认宏(STRICT=0,
+ * 开发板行为不变)。STRICT=1 时无效区域在"首次配网"处拦截(见 netcfg_start 前)。*/
+static tuya_auth_region_t g_tuya_triplet;
+static int g_tuya_triplet_valid = 0;
+
+static const char *tuya_trip_pk(void)   { return g_tuya_triplet_valid ? g_tuya_triplet.product_key : TUYA_PRODUCT_KEY; }
+static const char *tuya_trip_uuid(void) { return g_tuya_triplet_valid ? g_tuya_triplet.uuid        : TUYA_UUID; }
+static const char *tuya_trip_key(void)  { return g_tuya_triplet_valid ? g_tuya_triplet.auth_key    : TUYA_AUTH_KEY; }
 
 #define TUYA_WAIT_MS    60000
 #ifdef TUYA_CLOUD_OPEN_ENABLE
@@ -1246,9 +1259,9 @@ void tuya_agentic_demo(void *arg)
     /* 正解:三件套 + token → 涂鸦云激活 → 下发 devid/secret/local_key */
     iot_on_boarding_config_t obcfg;
     memset(&obcfg, 0, sizeof(obcfg));
-    strncpy((char *)obcfg.uuid,        TUYA_UUID,        sizeof(obcfg.uuid) - 1);
-    strncpy((char *)obcfg.authkey,     TUYA_AUTH_KEY,    sizeof(obcfg.authkey) - 1);
-    strncpy((char *)obcfg.product_key, TUYA_PRODUCT_KEY, sizeof(obcfg.product_key) - 1);
+    strncpy((char *)obcfg.uuid,        tuya_trip_uuid(), sizeof(obcfg.uuid) - 1);
+    strncpy((char *)obcfg.authkey,     tuya_trip_key(),  sizeof(obcfg.authkey) - 1);
+    strncpy((char *)obcfg.product_key, tuya_trip_pk(),   sizeof(obcfg.product_key) - 1);
     obcfg.env              = PROD;
     obcfg.mqtt_disable_tls = false;
     obcfg.mqtt_auto_connect = 1;
@@ -3539,6 +3552,50 @@ void tuya_agentic_main(void *arg)
                TUYA_FIRMWARE_VERSION, tuya_get_effective_sw_ver());
     }
 
+    /* ===== [阶段2] 授权区加载(2026-09-28 首烧实测后启用):成功→三元组注入点用区域码;
+     * 失败→回退顶部默认宏(STRICT=0,开发板行为不变;STRICT=1 在"首次配网"消费点拦截)。
+     * 实现独立在 tuya_auth_region.c(fs/fs.h 与 newlib stdio.h 冲突,不能并入本文件)。===== */
+    tuya_auth_region_probe();   /* 诊断行:区地址/头16B(阶段1遗留,保留) */
+    if (tuya_auth_region_load(&g_tuya_triplet) == 0) {
+        g_tuya_triplet_valid = 1;
+        printf("[TUYA] triplet source: USER region @0x5FE000\r\n");
+    } else {
+        g_tuya_triplet_valid = 0;
+#if TUYA_AUTH_REGION_STRICT
+        printf("[TUYA] triplet source: NONE (region invalid; STRICT blocks provisioning)\r\n");
+#else
+        printf("[TUYA] triplet source: built-in macros (region empty/invalid)\r\n");
+#endif
+    }
+
+#if TUYA_AUTH_RW_TEST == 1
+    /* [一次性验证钩子] erase 通路板上验证(2026-09-28 已收官):load 成功后擦 4K+FF 回读+probe 复证。
+     * 只在本次开机读到有效授权码时执行,擦一次区即空,重启后 g_tuya_triplet_valid=0 自然跳过。
+     * 验证完把 app_config.h 的 TUYA_AUTH_RW_TEST 置 0。*/
+    if (g_tuya_triplet_valid) {
+        printf("[TUYA_AUTH] RW_TEST: erasing zone...\r\n");
+        tuya_auth_region_erase();
+        tuya_auth_region_probe();   /* 复证:头16B 应全 FF */
+    }
+#elif TUYA_AUTH_RW_TEST == 2
+    /* [一次性验证钩子] write 通路板上验证(2026-09-28 收尾):区无效→用顶部默认宏自写号
+     * (擦4K→写96B→回读逐字节比对),随后重 load 并把来源切成 USER 区——写→读→消费
+     * 全链一次开机走完。已写号的开机 load 直接成功,本分支不执行(不重擦不重写);
+     * 因此 K6/复位后若再现 "write OK" = 区被清过、保留失败——判定就看这一行。验证完置回 0。*/
+    if (!g_tuya_triplet_valid) {
+        tuya_auth_region_t t;
+        memset(&t, 0, sizeof(t));
+        strncpy(t.product_key, TUYA_PRODUCT_KEY, sizeof(t.product_key) - 1);
+        strncpy(t.uuid,        TUYA_UUID,        sizeof(t.uuid) - 1);
+        strncpy(t.auth_key,    TUYA_AUTH_KEY,    sizeof(t.auth_key) - 1);
+        printf("[TUYA_AUTH] RW_TEST: self-provision zone from built-in macros...\r\n");
+        if (tuya_auth_region_write(&t) == 0 && tuya_auth_region_load(&g_tuya_triplet) == 0) {
+            g_tuya_triplet_valid = 1;
+            printf("[TUYA] triplet source: USER region @0x5FE000 (self-provisioned)\r\n");
+        }
+    }
+#endif
+
     if (iot_init(pal) != 0) { printf("[TUYA] iot_init fail\r\n"); return; }
 
     /* 注册自定义日志 handler:把 SDK 日志从 fprintf(stderr)(会崩溃)重定向到 printf(UART)。
@@ -3666,11 +3723,19 @@ void tuya_agentic_main(void *arg)
     }
 
     /* ---- 首次:BLE 配网 ---- */
+#if TUYA_AUTH_REGION_STRICT
+    /* 量产:漏烧码设备(授权区无效)拦在配网前,明确报错不广播(方案§5.3/§7)。
+     * 已激活设备(VM 有 devid)走上方直连路径,不会到这,不受影响。 */
+    if (!g_tuya_triplet_valid) {
+        printf("[TUYA_AUTH] STRICT: region has no valid triplet, refuse provisioning\r\n");
+        return;
+    }
+#endif
     s_tuya_provisioning_active = 1;
     printf("[TUYA] no devid, start BLE provisioning...\r\n");
     s_prov_prompt_run = 1;   /* 启动"请配置网络"循环播报(每 30s),配网完成会停 */
     thread_fork("tuya_prov_prompt", 6, 4 * 1024, 0, 0, tuya_prov_prompt_task, NULL);
-    int prov_ret = tuya_ble_netcfg_start("TUYA", TUYA_PRODUCT_KEY, TUYA_UUID, TUYA_AUTH_KEY, main_prov_cb);
+    int prov_ret = tuya_ble_netcfg_start("TUYA", tuya_trip_pk(), tuya_trip_uuid(), tuya_trip_key(), main_prov_cb);
     s_prov_prompt_run = 0;   /* 配网完成/失败/超时,停循环播报 */
     os_time_dly(15);         /* ~150ms:让 prompt 线程看到标志退出,别让它播报到连 WiFi/激活阶段 */
     if (prov_ret != 0) {
@@ -3704,9 +3769,9 @@ void tuya_agentic_main(void *arg)
     /* ---- on_boarding 激活 ---- */
     iot_on_boarding_config_t ob;
     memset(&ob, 0, sizeof(ob));
-    strncpy((char *)ob.uuid,        TUYA_UUID,        sizeof(ob.uuid) - 1);
-    strncpy((char *)ob.authkey,     TUYA_AUTH_KEY,    sizeof(ob.authkey) - 1);
-    strncpy((char *)ob.product_key, TUYA_PRODUCT_KEY, sizeof(ob.product_key) - 1);
+    strncpy((char *)ob.uuid,        tuya_trip_uuid(), sizeof(ob.uuid) - 1);
+    strncpy((char *)ob.authkey,     tuya_trip_key(),  sizeof(ob.authkey) - 1);
+    strncpy((char *)ob.product_key, tuya_trip_pk(),   sizeof(ob.product_key) - 1);
     ob.env = PROD; ob.mqtt_disable_tls = false; ob.mqtt_auto_connect = 1; ob.timeout_ms = 30000;
     ob.cert_bundle_attach = NULL; ob.cacert = NULL;
     ob.reset_callback = on_cloud_reset;

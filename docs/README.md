@@ -11,6 +11,7 @@
 | [INTEGRATION.md](INTEGRATION.md) | 集成架构与原理:agentic-kit 移植到 AC791N 的整体设计、数据链路、PAL 对接 |
 | [WAKEWORD.md](WAKEWORD.md) | 唤醒词子系统("你好涂鸦"+"嘿涂鸦"):v2 引擎、官方 token、参数、调参、日志 |
 | [CHANGES.md](CHANGES.md) | 完整改动清单:新增文件、改动的 SDK 文件、逐项说明 |
+| [烧录与三元组授权区指南.md](烧录与三元组授权区指南.md) | 三元组量产授权区(0x5FE000)烧录/写号/换号全流程:三种烧录形态、96B 布局与生成工具、开机日志速查、RW_TEST 红线与坑清单 |
 
 ## 参考实现说明(未合入代码)
 

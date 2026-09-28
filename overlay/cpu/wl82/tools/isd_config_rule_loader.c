@@ -2,17 +2,6 @@
 
 // *INDENT-OFF*
 
-echo "注意！！！量产时不能使能CONFIG_OVERCLOCKING_ENABLE宏使用超频配置，否则后果自负"
-
-/****************************注意！！！量产时不能使能CONFIG_OVERCLOCKING_ENABLE宏使用超频配置，否则后果自负**********************************/
-/****************************注意！！！量产时不能使能CONFIG_OVERCLOCKING_ENABLE宏使用超频配置，否则后果自负**********************************/
-/****************************注意！！！量产时不能使能CONFIG_OVERCLOCKING_ENABLE宏使用超频配置，否则后果自负**********************************/
-/****************************注意！！！量产时不能使能CONFIG_OVERCLOCKING_ENABLE宏使用超频配置，否则后果自负**********************************/
-/****************************注意！！！量产时不能使能CONFIG_OVERCLOCKING_ENABLE宏使用超频配置，否则后果自负**********************************/
-/****************************注意！！！量产时不能使能CONFIG_OVERCLOCKING_ENABLE宏使用超频配置，否则后果自负**********************************/
-/****************************注意！！！量产时不能使能CONFIG_OVERCLOCKING_ENABLE宏使用超频配置，否则后果自负**********************************/
-/****************************注意！！！量产时不能使能CONFIG_OVERCLOCKING_ENABLE宏使用超频配置，否则后果自负**********************************/
-
 /********************以下宏定义的值需要和p33.h保持一致**************************/
 //Macro for VDDIOM_VOL_SEL
 #define VDDIOM_VOL_28V 0
@@ -62,29 +51,11 @@ DB_UPDATE_DATA=YES;
 #else
 NEW_FLASH_FS=YES; [单备份模式]//单备份
 #endif
-#if __FLASH_SIZE__ == (1 * 1024 * 1024)
-FLASH_SIZE=1M; [FLASH 总大小]
-#elif __FLASH_SIZE__ == (2 * 1024 * 1024)
-FLASH_SIZE=2M; [FLASH 总大小]
-#elif __FLASH_SIZE__ == (4 * 1024 * 1024)
-FLASH_SIZE=4M; [FLASH 总大小]
-#elif __FLASH_SIZE__ == (8 * 1024 * 1024)
-FLASH_SIZE=8M; [FLASH 总大小]
-#elif __FLASH_SIZE__ == (16 * 1024 * 1024)
-FLASH_SIZE=16M; [FLASH 总大小]
-#elif __FLASH_SIZE__ == (32 * 1024 * 1024)
-FLASH_SIZE=32M; [FLASH 总大小]
-#elif __FLASH_SIZE__ == (64 * 1024 * 1024)
-FLASH_SIZE=64M; [FLASH 总大小]
-#endif
+FLASH_SIZE=512K; [FLASH 总大小]
 
 //FORCE_VM_ALIGN=YES;
 CHIP_NAME=AC791N;[芯片型号选择] //8
-#if (defined CONFIG_SFC_ENABLE) || (defined CONFIG_NO_SDRAM_ENABLE)
 ENTRY=0x2000120; [程序入口地址 SFC模式地址]//程序入口地址
-#else
-ENTRY=0x4000120; [程序入口地址 SDRAM模式地址]
-#endif
 PID=AC791N_STORY;//长度16byte,示例：芯片封装_应用方向_方案名称
 VID=0.01;
 RESERVED_OPT=0;//入口地址为0x1E00120需要定义该配置项
@@ -103,12 +74,8 @@ LOADER_BAUD_RATE=1000000;
 LOADER_ASK_BAUD_RATE=1000000;
 SERIAL_SEND_KEY=YES;
 BEFORE_LOADER_WAIT_TIME=150;
+
 NEED_RESERVED_4K=YES;//关闭4K保留写NO
-#ifdef CONFIG_RELEASE_ENABLE
-CALC_RES_CFG=NO;
-#else
-CALC_RES_CFG=YES; [量产版本严禁打开]
-#endif
 //#支持EFUSE 烧写到flash最后4K
 //[FW_ADDITIONAL]
 //FILE_LIST=(file=fw.cfg:type=0xEE)
@@ -137,11 +104,6 @@ OSC=OSC0;             [OSC0|OSC1|OSC_RTC|HTC]
 OSC_FREQ=24MHz;
 OSC_HC_EN=0;
 OSC_1PIN_EN=0;
-#if defined CONFIG_OVERCLOCKING_ENABLE
-SYS_CLK=396MHz;	       [320M 240M 192M 160M 120M 96M 48M 24M 40M 24M，当SYS_CLK为其他值时sdram时钟跟随系统时钟]
-HSB_DIV=1; [高速总线时钟分频系数 HSB_DIV+1]
-LSB_DIV=1; [低速总线时钟分频系数 LSB_DIV+1]
-#else
 SYS_CLK=320MHz;	       [320M 240M 192M 160M 120M 96M 48M 24M 40M 24M，当SYS_CLK为其他值时sdram时钟跟随系统时钟]
 #if (defined CONFIG_RTC_ENABLE) && ((defined CONFIG_BOARD_7913A)||(defined CONFIG_BOARD_7915B))//7913 7915需要使用内置RTC电源模块需要P33速度低一些
 HSB_DIV=2; [高速总线时钟分频系数 HSB_DIV+1]
@@ -150,11 +112,9 @@ LSB_DIV=5; [低速总线时钟分频系数 LSB_DIV+1]
 HSB_DIV=1; [高速总线时钟分频系数 HSB_DIV+1]
 LSB_DIV=2; [低速总线时钟分频系数 LSB_DIV+1]
 #endif//CONFIG_RTC_ENABLE
-#endif//CONFIG_OVERCLOCKING_ENABLE
 
 //ERR_PORT_OUTPUT=PA09_112;[UBOOT/SDRAM出错IO翻转电平，PXXX_电平(0/1)+翻转(0/1，1翻转)+周期(0-F,100ms周期的倍数) ,如PA09_112代表PA09输出高电平翻转周期2*100m]
 
-//BOOT_DELAY=100; [系统起来前增加延时配置，针对电源不稳时一些外设拉电导致系统跑飞的情况, 单位为毫秒]
 //UTTX=PB03; [配置UBOOT调试输出Pin] //uboot串口tx
 UTBD=1000000; [配置UBOOT调试波特率]//uboot串口波特率
 //UTRX=PB05;串口升级[PB00 PB05 PA05]
@@ -175,11 +135,6 @@ UPDATE_JUMP=0;
 #psram=1;
 */
 
-#if defined CONFIG_OVERCLOCKING_ENABLE
-VDDIO=4;[VDDIO挡位 2:3.0V、3:3.1V、4:3.2V、5:3.3V、6:3.4V、7:3.5V，默认使用3.2V档位，实际芯片偏低则需要提高]
-DVDD=14;[DVDD-1.2V内核电压档位 9:1.20V、10:1.23V、11:1.26V、12:1.29V、13:1.32V、14:1.35V、15:1.38V，默认使用1.26V档位，实际芯片偏低则需要提高]
-DCDC14=4;[DCDC-1.4V电压档位 3:1.40V、4:1.45V、5:1.50V、6:1.55V、7:1.60V，默认使用1.40V档位，实际芯片偏低则需要提高]
-#else
 #if defined TCFG_LOWPOWER_VDDIOM_LEVEL
 VDDIO=TCFG_LOWPOWER_VDDIOM_LEVEL;[VDDIO挡位 2:3.0V、3:3.1V、4:3.2V、5:3.3V、6:3.4V、7:3.5V，默认使用3.2V档位，实际芯片偏低则需要提高]
 #else
@@ -195,7 +150,6 @@ DCDC14=VDC14_VOL_SEL_LEVEL;[DCDC-1.4V电压档位 3:1.40V、4:1.45V、5:1.50V、
 #else
 DCDC14=3;[DCDC-1.4V电压档位 3:1.40V、4:1.45V、5:1.50V、6:1.55V、7:1.60V，默认使用1.40V档位，实际芯片偏低则需要提高]
 #endif
-#endif
 //#############################################################################################################################################
 
 
@@ -208,7 +162,7 @@ ENABLE_SDRAM=1; [使能SDRAM]
 //###SDRAM配置====================================================================
 SDRAM_TEST_SIZE=4K; 	[SDRAM校验测试大小，默认4K(2M:2048K, 8M:8192K)]
 #ifdef CONFIG_RELEASE_ENABLE
-SDRAM_CONFIG_VAL=0;	[SDRAM在系统第二次以后启动，配置信息使用flash中的值，默认-1使能，0则不使能]
+SDRAM_CONFIG_VAL=-1;	[SDRAM在系统第二次以后启动，配置信息使用flash中的值，默认-1使能，0则不使能]
 #else
 SDRAM_CONFIG_VAL=0;	[SDRAM在系统第二次以后启动，配置信息使用flash中的值，默认-1使能，0则不使能]
 #endif
@@ -223,12 +177,6 @@ SDRAM_SIZE=2M;
 #else
 SDRAM_SIZE=0M;
 #endif
-#if defined CONFIG_OVERCLOCKING_ENABLE
-SDRAM_PLL3_EN = 1;      [1:SDRAM时钟使用PLL3，时钟只能240M，SDK可使用USB2.0]
-SDRAM_PLL3_NOUSB_EN = 0;[1:SDRAM时钟时钟PLL3，时钟跟随SDRAM_CL对应，但SDK不能使用USB2.0]
-SDRAM_CL=3;      [SDRAM时钟：SYS_CLK<=240M或=320M时:[0-120M,1-160M,2-192M,3-240M,4-246M,5-252M,6-258M,7-264M,8-270M,9-276M,10-282M,11-288M]，SYS_CLK>320M并且<384M时:SDRAM时钟为SYS_CLK*1.5/2，SYS_CLK>=384M时:SDRAM时钟为SYS_CLK/2,,, SDRAM时钟极限为288M]
-SDRAM_DQ_DLY_TRM=5; [SDRAM对应时钟的刷新配置：选0 刷新最快（太快影响SDRAM带宽），2-120M，3-160M，4-192M，5-240M，6->240M]
-#else
 SDRAM_PLL3_EN = 0;      [1:SDRAM时钟使用PLL3，时钟只能240M，SDK可使用USB2.0]
 SDRAM_PLL3_NOUSB_EN = 0;[1:SDRAM时钟时钟PLL3，时钟跟随SDRAM_CL对应，但SDK不能使用USB2.0]
 #if defined CONFIG_SDRAM_OVERCLOCKING_ENABLE
@@ -237,7 +185,6 @@ SDRAM_DQ_DLY_TRM=5; [SDRAM对应时钟的刷新配置：选0 刷新最快（太�
 #else
 SDRAM_CL=2;      [SDRAM时钟：SYS_CLK<=240M或=320M时:[0-120M,1-160M,2-192M,3-240M,4-246M,5-252M,6-258M,7-264M,8-270M,9-276M,10-282M,11-288M]，SYS_CLK>320M并且<384M时:SDRAM时钟为SYS_CLK*1.5/2，SYS_CLK>=384M时:SDRAM时钟为SYS_CLK/2,,, SDRAM时钟极限为288M]
 SDRAM_DQ_DLY_TRM=4; [SDRAM对应时钟的刷新配置：选0 刷新最快（太快影响SDRAM带宽），2-120M，3-160M，4-192M，5-240M，6->240M]
-#endif
 #endif
 SDRAM_WLCNT=3;		[PLL启动延时MS]
 SDRAM_D_DLY=1;	[0:不测试SDRAM，1:测试SDRAM]
@@ -261,6 +208,8 @@ SDRAM_UDQS_DLY_TRM=10;
 SDRAM_LDQS_DLY_TRM=10;
 SDRAM_DQ_DLY_INNER_TRM=0;
 
+//SDTX=PC06; [配置SD LOADER调试输出Pin]
+SDBD=1000000; [配置SD LOADER调试波特率]
 
 /*
 [(sdx)_(port)_(width)_(detect mode)_(clk)]
@@ -323,118 +272,46 @@ BTBOX_MIN_VER=1.2.4.f;
 //#升级之后需要保留VM数据，在生成升级文件时需要设置VM_OPT=1
 VM_ADR=0; [设置VM]
 VM_LEN=32K;
-#if CONFIG_DOUBLE_BANK_ENABLE
-VM_OPT=1;//双备份OTA升级时保留VM数据(涂鸦三元组/WiFi凭据存在VM里,擦了要重新配网)。版本号持久化也依赖此。
-#else
-VM_OPT=0;//单备份升级VM在升级时候默认VM不需要擦除,选择擦除会在ota_loader第二阶段擦除比较长，而且可能会造成VM丢失
-#endif
+VM_OPT=0;
 
 BTIF_ADR=AUTO; [设置资源]
 BTIF_LEN=0x1000;
 BTIF_OPT=1;
 
-//#第三方云平台profile
-#if defined CONFIG_SERVER_ASSIGN_PROFILE
-PROFILE_ADR=AUTO; [第三方云平台profile]
-PROFILE_LEN=0x1000;
-PROFILE_OPT=1;
-#endif
-
-//#思必驰打断唤醒profile
-#if (defined CONFIG_ASR_ALGORITHM) && (CONFIG_ASR_ALGORITHM == AISP_ALGORITHM)
-AISP_ADR=AUTO; [思必驰打断唤醒profile]
-AISP_LEN=0x1000;
-AISP_OPT=1;
-#endif
-
-#if defined CONFIG_AUDIO_ENABLE && defined CONFIG_VOICE_PROMPT_FILE_SAVE_IN_RESERVED_ZONE
-AUPACKRES_FILE=packres/AUPACKRES;
-AUPACKRES_ADR=AUTO; [请根据编译后FLASH INFO打印的实际地址填写,比如0x59a000]
-AUPACKRES_LEN=AUTO; [更新提示音资源打包后必须更新此实际长度,比如0x141000,建议根据后续资源升级的需求预留好空间]
-AUPACKRES_OPT=1;
-#endif
-
-#if defined CONFIG_UI_ENABLE && defined CONFIG_UI_FILE_SAVE_IN_RESERVED_ZONE
-UIPACKRES_FILE=packres/UIPACKRES;
-UIPACKRES_ADR=AUTO; [请根据编译后FLASH INFO打印的实际地址填写,比如0x6db000]
-UIPACKRES_LEN=AUTO; [更新UI资源打包后必须更新此实际长度,比如0x123000, 建议根据后续资源升级的需求预留好空间]
-UIPACKRES_OPT=1;
-#endif
-
 PRCT_ADR=0;
 PRCT_LEN=CODE_LEN;
 PRCT_OPT=2;
 
+PROFILE_ADR=AUTO; [第三方云平台profile]
+PROFILE_LEN=0x1000;
+PROFILE_OPT=1;
+
 //#烧录后不可升级的资源
 [RESERVED_EXPAND_CONFIG]
-/* 涂鸦三元组量产授权区(2026-09-28 阶段1):钉死紧贴AUPACKRES(0x5FF000)前一扇区。
- * 地址是烧写器镜像/产线脚本/固件三方契约:固件运行期fopen("mnt/sdfile/EXT_RESERVED/user")
- * 按名取址,不依赖此值;但产线bin直烧此地址。改地址必须同步isd_config_rule_loader.c+产线脚本。
- * 原AUTO分配随app大小/资源布局漂移,已弃用(2026-09-17首版三元组方案的写入bug根源)。*/
-#ifdef TUYA_AUTH_EMBED_TEST_BIN
-USER_FILE=tuya_auth/auth_test.bin; [app_config.h开TUYA_AUTH_EMBED_TEST_BIN才挂载:96B测试授权码随download一把烧,仅限全新板首烧联调]
-#endif
+/* 涂鸦三元组量产授权区:必须与isd_config_rule.c钉死值一致(0x5FE000)。
+ * 固件fopen按名取址不依赖此值,但烧写器镜像/产线脚本按地址写号。*/
 USER_ADR=0x5FE000;
 USER_LEN=0x1000;
 USER_OPT=1;
 
-#if defined CONFIG_EXCEPTION_AUTO_FIX_ENABLE
-FIX_ADR=AUTO; [异常后自动降低系统配置]
-FIX_LEN=0x1000;
-FIX_OPT=0;
-#endif
-
-#if defined CONFIG_SAVE_EXCEPTION_LOG_IN_FLASH
-LOG_ADR=AUTO; [异常打印信息]
-LOG_LEN=0x1000;
-LOG_OPT=0;
-#endif
-
-#if defined CONFIG_TVS_SDK_ENABLE
-TENCENT_ADR=AUTO; [腾讯云profile]
-TENCENT_LEN=0x3000;
-TENCENT_OPT=1;
-#endif
-
-#if defined CONFIG_TELECOM_SDK_ENABLE
-TELECOM_ADR=AUTO; [电信云profile]
-TELECOM_LEN=0x1000;
-TELECOM_OPT=1;
-#endif
-
-#if defined CONFIG_TUYA_SDK_ENABLE
-TUYA_ADR=AUTO; [涂鸦profile]
-TUYA_LEN=0x1000;
-TUYA_OPT=1;
-#endif
-
-#if defined TCFG_EXTFLASH_ENABLE
-//截取flash的一段空间作为extflash设备
-EXTFLASH_ADR=AUTO;
-EXTFLASH_LEN=0x400000;
-EXTFLASH_OPT=1;
-#endif
-
-/***************资源文件打包 请阅读以下信息******************************/
-//packers文件夹下会生成AUPACKRES,UIPACKRES这两个包是资源文件打包好的包需要
-//根据实际大小填写AUPACKRES_ADR,AUPACKRES_LEN,
-//工程中默认根据flash大小,在app_config.h中配置了资源的地址和长度，
-//资源起始地址和大小, 根据产品生命周期最大情况定义,
-//audio和ui资源需要放到最后, 新增的预留区配置请在前面添加
-#if defined CONFIG_AUDIO_ENABLE && defined CONFIG_VOICE_PROMPT_FILE_SAVE_IN_RESERVED_EXPAND_ZONE
-AUPACKRES_FILE=packres/AUPACKRES;
-AUPACKRES_ADR=CONFIG_AUDIO_PACKRES_ADR;
-AUPACKRES_LEN=CONFIG_AUDIO_PACKRES_LEN;
-AUPACKRES_OPT=1;
-#endif
-
-#if defined CONFIG_UI_ENABLE && defined CONFIG_UI_FILE_SAVE_IN_RESERVED_EXPAND_ZONE
-UIPACKRES_FILE=packres/UIPACKRES;
-UIPACKRES_ADR=CONFIG_UI_PACKRES_ADR;
-UIPACKRES_LEN=CONFIG_UI_PACKRES_LEN;
-UIPACKRES_OPT=1;
-#endif
-
 [BURNER_CONFIG]
 SIZE=32;
+
+#if defined CONFIG_SDFILE_EXT_ENABLE
+[SDCARD_CONFIG]
+HFS_FILE=jl_hfs.bin
+HFS_ADR=0G
+HFS_LEN=CONFIG_SDNAND_HFS_LEN_TEXT
+HFS_OPT=1
+
+HFAT_FILE=jl_hfat.bin
+HFAT_ADR=AUTO
+HFAT_LEN=CONFIG_SDNAND_HFAT_LEN_TEXT
+HFAT_OPT=1
+
+FAT1_FILE=jl_fat1.bin
+FAT1_ADR=AUTO
+FAT1_LEN=CONFIG_SDNAND_FAT1_LEN_TEXT
+FAT1_OPT=1
+#endif
 

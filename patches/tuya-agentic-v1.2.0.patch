@@ -679,7 +679,7 @@ index acba599d..180dba7e 100644
              break;
          case NET_NTP_GET_TIME_SUCC:	//NTP获取成功事件返回
 diff --git a/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp b/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp
-index 53b90818..d20daacf 100644
+index 53b90818..4de06acd 100644
 --- a/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp
 +++ b/apps/wifi_story_machine/board/wl82/AC791N_WIFI_STORY_MACHINE.cbp
 @@ -72,6 +72,22 @@
@@ -1191,12 +1191,13 @@ index 53b90818..d20daacf 100644
  <Unit filename="../../../../include_lib/system/os/os_api.h" />
  <Unit filename="../../../../include_lib/system/os/os_cpu.h" />
  <Unit filename="../../../../include_lib/system/os/os_error.h" />
-@@ -1571,5 +1212,47 @@
+@@ -1571,5 +1212,48 @@
  <Unit filename="../../../../lib/net/version.z.S" />
  <Unit filename="../../../../lib/server/version.z.S" />
  <Unit filename="../../../../lib/utils/version.z.S" />
 +	<Unit filename="../../../../apps/common/LLM/tuya_agentic/pal_ac791n.c"><Option compilerVar="CC" /></Unit>
 +		<Unit filename="../../../../apps/common/LLM/tuya_agentic/tuya_agentic_demo.c"><Option compilerVar="CC" /></Unit>
++		<Unit filename="../../../../apps/common/LLM/tuya_agentic/tuya_auth_region.c"><Option compilerVar="CC" /></Unit>
 +		<Unit filename="../../../../apps/common/LLM/tuya_agentic/tuya_mcp.c"><Option compilerVar="CC" /></Unit>
 +		<Unit filename="../../../../apps/common/LLM/tuya_agentic/tuya_music.c"><Option compilerVar="CC" /></Unit>
 +	<Unit filename="../../../../apps/common/LLM/tuya_agentic/tuya_ota.c"><Option compilerVar="CC" /></Unit>
@@ -1240,7 +1241,7 @@ index 53b90818..d20daacf 100644
  </Project>
  </CodeBlocks_project_file>
 diff --git a/apps/wifi_story_machine/board/wl82/Makefile b/apps/wifi_story_machine/board/wl82/Makefile
-index 2012bf8a..411d2446 100644
+index 2012bf8a..beb72922 100644
 --- a/apps/wifi_story_machine/board/wl82/Makefile
 +++ b/apps/wifi_story_machine/board/wl82/Makefile
 @@ -148,9 +148,11 @@ DEFINES := \
@@ -1499,7 +1500,7 @@ index 2012bf8a..411d2446 100644
  	../../../../apps/wifi_story_machine/board/wl82/board_7911B.c \
  	../../../../apps/wifi_story_machine/board/wl82/board_7911D.c \
  	../../../../apps/wifi_story_machine/board/wl82/board_7912D.c \
-@@ -618,6 +442,45 @@ c_SRC_FILES := \
+@@ -618,6 +442,46 @@ c_SRC_FILES := \
  	../../../../cpu/wl82/key/rdec.c \
  	../../../../cpu/wl82/port_waked_up.c \
  	../../../../cpu/wl82/setup.c \
@@ -1535,6 +1536,7 @@ index 2012bf8a..411d2446 100644
 +	../../../../apps/common/LLM/tuya_agentic/agentic-kit/third_party/coreMQTT/source/core_mqtt_state.c \
 +	../../../../apps/common/LLM/tuya_agentic/pal_ac791n.c \
 +	../../../../apps/common/LLM/tuya_agentic/tuya_agentic_demo.c \
++	../../../../apps/common/LLM/tuya_agentic/tuya_auth_region.c \
 +	../../../../apps/common/LLM/tuya_agentic/tuya_mcp.c \
 +	../../../../apps/common/LLM/tuya_agentic/tuya_music.c \
 +	../../../../apps/common/LLM/tuya_agentic/tuya_ota.c \
@@ -1545,7 +1547,7 @@ index 2012bf8a..411d2446 100644
  
  
  # 需要编译的 .S 文件
-@@ -646,7 +509,8 @@ cpp_SRC_FILES := \
+@@ -646,7 +510,8 @@ cpp_SRC_FILES := \
  
  
  # 需要编译的 .cc 文件
@@ -1555,7 +1557,7 @@ index 2012bf8a..411d2446 100644
  
  
  # 需要编译的 .cxx 文件
-@@ -710,6 +574,8 @@ LFLAGS := \
+@@ -710,6 +575,8 @@ LFLAGS := \
  	../../../../cpu/wl82/liba/lib_wav_dec.a \
  	../../../../cpu/wl82/liba/lib_dts_dec.a \
  	../../../../cpu/wl82/liba/lib_opus_dec.a \
@@ -1564,7 +1566,7 @@ index 2012bf8a..411d2446 100644
  	../../../../cpu/wl82/liba/lib_amr_dec.a \
  	../../../../cpu/wl82/liba/lib_amr_enc.a \
  	../../../../cpu/wl82/liba/lib_amrwb_enc.a \
-@@ -760,25 +626,18 @@ LFLAGS := \
+@@ -760,25 +627,18 @@ LFLAGS := \
  	../../../../cpu/wl82/liba/https_cli.a \
  	../../../../cpu/wl82/liba/http_server.a \
  	../../../../cpu/wl82/liba/json.a \
@@ -1590,7 +1592,7 @@ index 2012bf8a..411d2446 100644
  	../../../../cpu/wl82/liba/cJSON.a \
  	../../../../cpu/wl82/liba/ftpserver_new.a \
  	../../../../cpu/wl82/liba/http_server.a  \
-@@ -795,18 +654,13 @@ LFLAGS := \
+@@ -795,18 +655,13 @@ LFLAGS := \
  	../../../../cpu/wl82/liba/res.a \
  	../../../../cpu/wl82/liba/font.a \
  	../../../../cpu/wl82/liba/ui_draw.a \
@@ -1632,7 +1634,7 @@ index 2b69d8d3..196777e8 100644
  #if CONFIG_AUDIO_ENC_SAMPLE_SOURCE == AUDIO_ENC_SAMPLE_SOURCE_PLNK0
      .output_channel = OUTPUT_CHANNEL3,
 diff --git a/apps/wifi_story_machine/include/app_config.h b/apps/wifi_story_machine/include/app_config.h
-index f3cd60cb..7c0ffbb0 100644
+index f3cd60cb..af95a242 100644
 --- a/apps/wifi_story_machine/include/app_config.h
 +++ b/apps/wifi_story_machine/include/app_config.h
 @@ -115,10 +115,10 @@
@@ -1648,11 +1650,28 @@ index f3cd60cb..7c0ffbb0 100644
  #define CONFIG_AUDIO_PACKRES_ADR ((__FLASH_SIZE__) - CONFIG_AUDIO_PACKRES_LEN - 0x1000)
  #endif
  #else
-@@ -226,6 +226,208 @@
+@@ -226,6 +226,225 @@
  // #define CONFIG_HTTP_SERVER_ENABLE            //HTTP服务器
  // #define CONFIG_FTP_SERVER_ENABLE             //FTP服务器
  // #define CONFIG_VOLC_LLM_ENABLE               //火山大模型
 +#define CONFIG_TUYA_AGENTIC_ENABLE            //涂鸦 AgenticKit(连涂鸦 AI 云,apps/common/LLM/tuya_agentic)
++
++/* ===== 涂鸦三元组量产授权区(USER区@0x5FE000)烧录联调开关(2026-09-28 阶段1)=====
++ * 定义 = isd_config 给 USER 区挂 USER_FILE=tuya_auth/auth_test.bin,download 时
++ *   固件+资源+96B测试授权码一把烧进全新板(验证"OPT=1 带 FILE 首烧会写入"这一平台行为)。
++ * 默认注释 = USER 区不挂任何文件,随固件烧录保持空白(日常开发/量产形态)。
++ * 注意:已写号板子重烧固件前必须保持注释(对已编程扇区重复写96B而不先擦,位会写坏)。
++ * 量产写号不走此开关:产线脚本按台账逐台生成bin再挂入,见《涂鸦三元组量产烧录改造方案》§6。*/
++//#define TUYA_AUTH_EMBED_TEST_BIN
++
++/* ===== 授权区运行时验证钩子(2026-09-28 阶段2,两档均已板上收官,恒为 0)=====
++ * 1 = erase 验证(已收官):load 成功后擦4K+FF回读+probe复证。
++ * 2 = write 验证(已收官):区无效→内置宏自写号(擦→写→回读)+重load切来源USER区。
++ *   收官证据:crc=0x9be4 写/冷读三开机一致;断电重上仍 load OK;K6 后直接 load OK
++ *   无 write 再现 = 已写号区跨 K6 保留;zone 码驱动重配网激活第4个 devid 成功。
++ * ★必须保持 0:留 1 = 每块新写号板开机即被擦;留 2 = 空板永远用宏自愈,STRICT 量产语义失效。*/
++#define TUYA_AUTH_RW_TEST  0   /* 1/2 两档验证均板上收官(2026-09-28),产线/日常恒为 0 */
++
 +/* ===== 涂鸦下行 TTS 编码开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下生效)=====
 + * 不定义(默认)= PCM:稳定能播,但 16k/16bit/mono=32KB/s,拥挤测试网易卡顿。
 + * 定义下面宏 = opus:~2KB/s(1/16 带宽),云端确认支持(codec=111),帧长 80B/16kbps/40ms。
@@ -1857,7 +1876,7 @@ index f3cd60cb..7c0ffbb0 100644
  // #define CONFIG_ONESDK_LLM_ENABLE
  // #define CONFIG_SXY_QYAI_ENABLE
  // #define CONFIG_DUER_LC_DEMO_ENABLE           //小度澜川AI对话DEMO
-@@ -341,7 +543,7 @@
+@@ -341,7 +560,7 @@
  
  #ifdef CONFIG_AEC_ENC_ENABLE
  #define CONFIG_USB_AUDIO_AEC_ENABLE          //usb mic使能回声消除功能
@@ -1866,7 +1885,7 @@ index f3cd60cb..7c0ffbb0 100644
  // #define CONFIG_AEC_USE_PLAY_MUSIC_ENABLE       //播歌时需要使用AEC
  
  // #define CONFIG_AEC_USE_SMS_TDE   //使用tde算法, 编码参数req.enc.aec_enable设置为2
-@@ -413,7 +615,7 @@
+@@ -413,7 +632,7 @@
  #endif
  #endif
  
@@ -1968,7 +1987,7 @@ index dc4f1e38..497b9ca7 100644
  
  #ifdef CONFIG_ASSIGN_MACADDR_ENABLE
 diff --git a/cpu/wl82/tools/isd_config_rule.c b/cpu/wl82/tools/isd_config_rule.c
-index 8bed33ba..62563750 100644
+index 8bed33ba..d535103f 100644
 --- a/cpu/wl82/tools/isd_config_rule.c
 +++ b/cpu/wl82/tools/isd_config_rule.c
 @@ -324,7 +324,7 @@ BTBOX_MIN_VER=1.2.4.f;
@@ -1980,3 +1999,34 @@ index 8bed33ba..62563750 100644
  #else
  VM_OPT=0;//单备份升级VM在升级时候默认VM不需要擦除,选择擦除会在ota_loader第二阶段擦除比较长，而且可能会造成VM丢失
  #endif
+@@ -367,7 +367,14 @@ PRCT_OPT=2;
+ 
+ //#烧录后不可升级的资源
+ [RESERVED_EXPAND_CONFIG]
+-USER_ADR=AUTO; [固定预留给客户，避免客户量产后，想通过升级新增重要信息的保存却没有预先预留空间]
++/* 涂鸦三元组量产授权区(2026-09-28 阶段1):钉死紧贴AUPACKRES(0x5FF000)前一扇区。
++ * 地址是烧写器镜像/产线脚本/固件三方契约:固件运行期fopen("mnt/sdfile/EXT_RESERVED/user")
++ * 按名取址,不依赖此值;但产线bin直烧此地址。改地址必须同步isd_config_rule_loader.c+产线脚本。
++ * 原AUTO分配随app大小/资源布局漂移,已弃用(2026-09-17首版三元组方案的写入bug根源)。*/
++#ifdef TUYA_AUTH_EMBED_TEST_BIN
++USER_FILE=tuya_auth/auth_test.bin; [app_config.h开TUYA_AUTH_EMBED_TEST_BIN才挂载:96B测试授权码随download一把烧,仅限全新板首烧联调]
++#endif
++USER_ADR=0x5FE000;
+ USER_LEN=0x1000;
+ USER_OPT=1;
+ 
+diff --git a/cpu/wl82/tools/isd_config_rule_loader.c b/cpu/wl82/tools/isd_config_rule_loader.c
+index 96801d60..91d23835 100644
+--- a/cpu/wl82/tools/isd_config_rule_loader.c
++++ b/cpu/wl82/tools/isd_config_rule_loader.c
+@@ -288,7 +288,9 @@ PROFILE_OPT=1;
+ 
+ //#烧录后不可升级的资源
+ [RESERVED_EXPAND_CONFIG]
+-USER_ADR=AUTO; [固定预留给客户，避免客户量产后，想通过升级新增重要信息的保存却没有预先预留空间]
++/* 涂鸦三元组量产授权区:必须与isd_config_rule.c钉死值一致(0x5FE000)。
++ * 固件fopen按名取址不依赖此值,但烧写器镜像/产线脚本按地址写号。*/
++USER_ADR=0x5FE000;
+ USER_LEN=0x1000;
+ USER_OPT=1;
+ 

@@ -227,6 +227,23 @@
 // #define CONFIG_FTP_SERVER_ENABLE             //FTP服务器
 // #define CONFIG_VOLC_LLM_ENABLE               //火山大模型
 #define CONFIG_TUYA_AGENTIC_ENABLE            //涂鸦 AgenticKit(连涂鸦 AI 云,apps/common/LLM/tuya_agentic)
+
+/* ===== 涂鸦三元组量产授权区(USER区@0x5FE000)烧录联调开关(2026-09-28 阶段1)=====
+ * 定义 = isd_config 给 USER 区挂 USER_FILE=tuya_auth/auth_test.bin,download 时
+ *   固件+资源+96B测试授权码一把烧进全新板(验证"OPT=1 带 FILE 首烧会写入"这一平台行为)。
+ * 默认注释 = USER 区不挂任何文件,随固件烧录保持空白(日常开发/量产形态)。
+ * 注意:已写号板子重烧固件前必须保持注释(对已编程扇区重复写96B而不先擦,位会写坏)。
+ * 量产写号不走此开关:产线脚本按台账逐台生成bin再挂入,见《涂鸦三元组量产烧录改造方案》§6。*/
+//#define TUYA_AUTH_EMBED_TEST_BIN
+
+/* ===== 授权区运行时验证钩子(2026-09-28 阶段2,两档均已板上收官,恒为 0)=====
+ * 1 = erase 验证(已收官):load 成功后擦4K+FF回读+probe复证。
+ * 2 = write 验证(已收官):区无效→内置宏自写号(擦→写→回读)+重load切来源USER区。
+ *   收官证据:crc=0x9be4 写/冷读三开机一致;断电重上仍 load OK;K6 后直接 load OK
+ *   无 write 再现 = 已写号区跨 K6 保留;zone 码驱动重配网激活第4个 devid 成功。
+ * ★必须保持 0:留 1 = 每块新写号板开机即被擦;留 2 = 空板永远用宏自愈,STRICT 量产语义失效。*/
+#define TUYA_AUTH_RW_TEST  0   /* 1/2 两档验证均板上收官(2026-09-28),产线/日常恒为 0 */
+
 /* ===== 涂鸦下行 TTS 编码开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下生效)=====
  * 不定义(默认)= PCM:稳定能播,但 16k/16bit/mono=32KB/s,拥挤测试网易卡顿。
  * 定义下面宏 = opus:~2KB/s(1/16 带宽),云端确认支持(codec=111),帧长 80B/16kbps/40ms。
