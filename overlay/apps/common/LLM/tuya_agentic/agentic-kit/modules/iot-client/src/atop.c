@@ -801,10 +801,16 @@ void atop_schema_newest_response_free(const pal_t *pal, schema_newest_response_t
  * ============================================================================ */
 
 #define ATOP_DEVICE_UPGRADE_GET         "tuya.device.upgrade.get"
+#define ATOP_DEVICE_UPGRADE_SILENT_GET  "tuya.device.upgrade.silent.get"
 #define ATOP_DEVICE_VERSIONS_UPDATE     "tuya.device.versions.update"
 #define ATOP_DEVICE_UPGRADE_STATUS_UPD  "tuya.device.upgrade.status.update"
 
-int atop_upgrade_get(const pal_t *pal, const ota_upgrade_request_t *request, ota_upgrade_response_t *response)
+/* upgrade.get / silent.get 公共实现:仅请求体首字段与接口名分叉,响应结构与
+ * 解析完全一致(对齐 TuyaOpen matop_service.c:upgrade_info_get 发
+ * {"type":channel} 拉当前待升级任务,auto_upgrade_info_get 发 {"subId":null}
+ * 只拉静默任务,两者共用同一响应回调与解析)。*/
+static int atop_upgrade_get_impl(const pal_t *pal, const ota_upgrade_request_t *request,
+                                 ota_upgrade_response_t *response, bool silent)
 {
     if (request == NULL || response == NULL) {
         log_error("atop_upgrade_get: request or response is NULL");
@@ -824,7 +830,11 @@ int atop_upgrade_get(const pal_t *pal, const ota_upgrade_request_t *request, ota
     if (root == NULL) {
         return OPRT_MALLOC_FAILED;
     }
-    cJSON_AddNumberToObject(root, "type", request->channel);
+    if (silent) {
+        cJSON_AddNullToObject(root, "subId");   /* 静默自检:不带通道,响应里回 type */
+    } else {
+        cJSON_AddNumberToObject(root, "type", request->channel);
+    }
     cJSON_AddNumberToObject(root, "t", (double)timestamp);
 
     char *post_data = cJSON_PrintUnformatted(root);
@@ -840,7 +850,7 @@ int atop_upgrade_get(const pal_t *pal, const ota_upgrade_request_t *request, ota
         .key = request->key,
         .path = "/d.json",
         .timestamp = timestamp,
-        .api = ATOP_DEVICE_UPGRADE_GET,
+        .api = silent ? ATOP_DEVICE_UPGRADE_SILENT_GET : ATOP_DEVICE_UPGRADE_GET,
         .version = "4.4",
         .data = (void *)post_data,
         .datalen = strlen(post_data),
@@ -924,6 +934,20 @@ int atop_upgrade_get(const pal_t *pal, const ota_upgrade_request_t *request, ota
     log_info("atop_upgrade_get: upgrade available, version=%s, size=%ld",
              response->version ? response->version : "?", response->file_size);
     return OPRT_OK;
+}
+
+int atop_upgrade_get(const pal_t *pal, const ota_upgrade_request_t *request, ota_upgrade_response_t *response)
+{
+    return atop_upgrade_get_impl(pal, request, response, false);
+}
+
+/* 设备主动自检(开机/定时)专用:云端只从这里下发"静默升级"任务,APP 提醒
+ * 升级任务【不会】返回——提醒任务必须等用户在 App 点确认、云端推 MQTT
+ * protocol 15 后再走 upgrade.get 拉包。(2026-09-29 教训:自检误用
+ * upgrade.get,平台配"APP提醒升级"的任务开机被直接拉下来刷,"提醒"变"强制"。)*/
+int atop_upgrade_silent_get(const pal_t *pal, const ota_upgrade_request_t *request, ota_upgrade_response_t *response)
+{
+    return atop_upgrade_get_impl(pal, request, response, true);
 }
 
 void atop_upgrade_get_response_free(const pal_t *pal, ota_upgrade_response_t *response)

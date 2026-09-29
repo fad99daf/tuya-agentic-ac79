@@ -296,6 +296,18 @@ typedef struct {
 int atop_upgrade_get(const pal_t *pal, const ota_upgrade_request_t *request, ota_upgrade_response_t *response);
 
 /**
+ * @brief 查询"静默升级"任务(tuya.device.upgrade.silent.get v4.4)。
+ *
+ * 设备主动自检(开机/定时)专用:云端只从这里下发静默升级任务;平台配
+ * "APP提醒升级"的任务【不会】返回——提醒任务须等用户在 App 点确认、云端推
+ * MQTT protocol 15 后再走 atop_upgrade_get 拉包(对齐 TuyaOpen
+ * matop_service.c 的 auto_upgrade_info_get)。请求体为 {"subId":null,"t":...},
+ * request->channel 不参与请求(通道取响应里的 type);响应结构与解析与
+ * atop_upgrade_get 完全一致,释放同样用 atop_upgrade_get_response_free。
+ */
+int atop_upgrade_silent_get(const pal_t *pal, const ota_upgrade_request_t *request, ota_upgrade_response_t *response);
+
+/**
  * @brief Free memory in an ota_upgrade_response_t.
  */
 void atop_upgrade_get_response_free(const pal_t *pal, ota_upgrade_response_t *response);

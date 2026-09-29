@@ -214,7 +214,7 @@ tuya-agentic-ac79/
 ├── apply.bat            ← 合并脚本(Windows)
 ├── overlay/             ← 按 SDK 相对路径的对接代码
 ├── patches/
-│   └── tuya-agentic-v1.2.0.patch   ← 10 个改动文件的 diff
+│   └── tuya-agentic-v1.2.0.patch   ← 12 个改动文件的 diff
 └── docs/
     ├── README.md        ← 文档索引
     ├── INTEGRATION.md   ← 集成架构与原理

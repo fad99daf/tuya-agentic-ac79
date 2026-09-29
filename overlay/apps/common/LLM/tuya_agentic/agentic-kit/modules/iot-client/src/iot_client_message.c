@@ -8,6 +8,7 @@
 #include <stdio.h>
 
 #define IOT_PROTOCOL_CLOUD_REMOVE 11
+#define IOT_PROTOCOL_OTA_CONFIRM  15  /* cloud → device: app confirmed an OTA upgrade */
 
 /* Protocol 11 is a control-plane message, never a DP message.  Consume every
  * syntactically recognised protocol-11 frame, but notify the application only
@@ -56,6 +57,48 @@ static bool iot_client_message_handle_cloud_remove(iot_client_t *client,
     return true;
 }
 
+/* Protocol 15 = APP 确认升级通知(用户在 App 点了"确认升级",云端经 MQTT 下发)。
+ * 消费是可选的:注册了 ota_confirm_callback 才消费(该帧不再进 DP 层/裸
+ * message_callback),未注册则保持旧版行为原样透传(上游 eb19466 同款语义)。
+ * data.firmwareType 即固件通道,缺失/畸形按主固件通道 0 处理(对齐 TuyaOpen:
+ * 已通过认证的云端通知不因字段畸形而拒收)。回调跑在 MQTT 处理线程里,契约见
+ * iot_client.h——只许置标志/发信号量,应用侧 worker 再做 check/下载/烧写。*/
+static bool iot_client_message_handle_ota_confirm(iot_client_t *client,
+                                                  const uint8_t *bytes,
+                                                  size_t len)
+{
+    if (!client || !bytes || len == 0) return false;
+
+    cJSON *root = cJSON_ParseWithLength((const char *)bytes, len);
+    if (!root) return false;
+
+    cJSON *protocol = cJSON_GetObjectItem(root, "protocol");
+    if (!cJSON_IsNumber(protocol) ||
+        protocol->valueint != IOT_PROTOCOL_OTA_CONFIRM) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    if (!client->ota_confirm_callback) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    int channel = 0;
+    cJSON *data = cJSON_GetObjectItem(root, "data");
+    cJSON *firmware_type = data ? cJSON_GetObjectItem(data, "firmwareType") : NULL;
+    if (cJSON_IsNumber(firmware_type)) {
+        channel = firmware_type->valueint;
+    }
+
+    log_info("ota confirm: app-confirmed upgrade notice received (channel=%d)",
+             channel);
+    client->ota_confirm_callback(channel, client->ota_confirm_user_data);
+
+    cJSON_Delete(root);
+    return true;
+}
+
 static void mqtt_message_handler(const char *topic, size_t topic_len,
                                  const uint8_t *payload, size_t payload_len,
                                  void *user_data)
@@ -86,6 +129,11 @@ static void mqtt_message_handler(const char *topic, size_t topic_len,
                  decrypted_len > 200 ? "..." : "");
 
         if (iot_client_message_handle_cloud_remove(client, decrypted, decrypted_len)) {
+            client->pal->free(decrypted);
+            return;
+        }
+
+        if (iot_client_message_handle_ota_confirm(client, decrypted, decrypted_len)) {
             client->pal->free(decrypted);
             return;
         }

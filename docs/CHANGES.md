@@ -524,3 +524,37 @@ VM_OPT=0;//单备份...(原样不动)
 
 - 主仓 → overlay 同步 8 文件:`tuya_agentic_demo.c`(凭据占位符惯例不变,整仓复检零真实三元组)、`tuya_auth_region.c/.h`(新增)、`app_config.h`(授权区宏块)、`Makefile`/`AC791N_WIFI_STORY_MACHINE.cbp`(接线 tuya_auth_region.c)、`isd_config_rule.c`、`isd_config_rule_loader.c`(新增)。
 - patch **11 段扩为 12 段**重新生成(基线不变:`AC79NN_SDK_V1.2.12_2026-03-07` tag):`isd_config_rule.c` 段内容扩含 USER 区钉死,新增 `isd_config_rule_loader.c` 段;纯净基线树 `git apply` 后与 overlay 逐文件比对通过。
+
+## 2026-09-29 增量改动(涂鸦 OTA 全链:双 API 检查 + protocol15 推送 + USER 区版本记录)
+
+> 覆盖主仓工作区 2026-09-28 晚 ~ 09-29 的 OTA 编排与版本号持久化(上次同步 47b8650 之后)。与音频主线(长流/回声闸)零耦合。
+
+### AI. OTA 编排对齐 TuyaOpen 语义(tuya_ota.c/.h + agentic-kit iot-client)
+
+- **双入口分流**(`tuya_ota.c:36` 注释即契约):开机自检 `tuya_ota_check_and_upgrade()` → `tuya.device.upgrade.silent.get`(静默通道,无 App);App 确认(提醒/强制)后云端经 MQTT **protocol15**(`PRO_UPGD_REQ`)推送 → `iot_client_message.c` 路由到 `ota_confirm_callback` → `tuya_ota_check_and_upgrade_channel(ch)` → `tuya.device.upgrade.get`。设备收到任务即自动下载烧写,无二次确认——与 TuyaOpen `tuya_iot.c` 同构。
+- `atop.c`: `atop_upgrade_get` 拆 impl+wrapper,新增 `atop_upgrade_silent_get`(与上游双 API 口径一致);升级响应解析 url/版本/size/md5。
+- 下载前 HTTP size 与云端 `file_size` 比对,不符拒烧(防 CDN 坏包进备份区)。
+- `iot_client.h/.c`: 新增 `iot_client_register_ota_confirm_callback`(protocol15 回调注册)。
+
+### AJ. 新模块 `iot_ota_verify.c`(A 类新增)
+
+- HMAC-SHA256 流式摘要:下载边收边算,烧写完成后整包校验,`digest verify OK` 才算数——防传输损坏烧进备份区。错误码 `OPRT_OTA_VERIFY_FAILED` 与上游 agentic-kit 一致。
+
+### AK. USER 区版本记录 v2(tuya_ota.c 文件尾"版本号管理" + tuya_auth_region.c ver 区函数)
+
+- 布局:USER 区(0x5FE000)内偏移 **+0x800**,30B `TUYAVER` 结构(magic/version/len/字符串/CRC16-CCITT-FALSE);授权码仍在 +0,`auth_zone_rewrite` 换码时版本记录原样保留。
+- 写点=烧录数据落盘+摘要校验通过之后、`net_fclose` 之前(复位定时器窗之外,net_update.c:256);失败路径不清记录(保持上次成功值=真实状态)。沿革 v0 VM/v1 写点偏早,详见 tuya_ota.c 尾注。
+- **修复写入错位**:`sdfile_reserve_zone_*` 第 4 参是 **mode(恒 0)**,区内偏移必须折进地址 `sclust+TUYA_VER_OFF`——首版误把 0x800 当 mode 传,记录编程到 +0 与授权码 96B 撞车(位级取证定罪);修复后板上 `save OK` 一次过。
+- `tuya_get_effective_sw_ver()`:**记录优先、宏兜底**——忘改宏的旧宏包升级后上报记录值,任务照常闭合不再死循环;开机 `base=宏/effective=记录` 不一致即暴露旧宏包。
+- 双备份换区:USER 区 sclust(CPU 映射)随区漂移(实测 0x02301fe0→0x025f9fe0,flash 原址不动),运行时 `fget_attrs` 动态取址自动跟随,无需烧写期假设。
+- **板上证据链(两任务端到端全绿)**:1.0.16(09-28 晚,silent 通道:save OK 一次过→重启 `effective=1.0.16`→`no upgrade (current=1.0.16)` 任务闭合);1.0.17(09-29,APP强制:会话运行中 protocol15 推送→upgrade.get 命中→size/HMAC/下载 0-100%/烧写→`save OK (auth record preserved)`→重启 `effective=1.0.17` 任务闭合)。**授权区跨 OTA 保留自此板上验证**(指南 §9 同步翻已验)。
+- 平台版本闸行为验证:任务版本==设备上报版本时云端不下发(防重复/防降级,设计行为)。
+
+### AL. 构建接线与分区
+
+- `Makefile`/`.cbp`:接线 `iot_ota_verify.c`;`app_config.h`: `TUYA_FIRMWARE_VERSION` 1.0.11→1.0.14 + 版本记录兜底说明;`isd_config_rule.c`: `BR22_TWS_VERSION` 0→2(官方 update 文档要求每次发版+1)。
+
+### 同步范围
+
+- 主仓 → overlay 同步 16 文件 + 新增 `iot_ota_verify.c`;`tuya_agentic_demo.c` 74-76 行凭据占位符惯例保持(整仓复检:零真实三元组、diff 零新增 ≥28 字符字面量)。
+- patch **12 段全量重新生成**(基线不变:`AC79NN_SDK_V1.2.12_2026-03-07` tag):4 段实质更新(`.cbp`/`Makefile`/`app_config.h`/`isd_config_rule.c`),其余 8 段与旧 patch 逐字节一致;纯净基线树 `git apply --check` 全段通过。

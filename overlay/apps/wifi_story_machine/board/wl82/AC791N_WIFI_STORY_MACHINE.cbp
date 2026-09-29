@@ -1238,6 +1238,7 @@
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_dp.c"><Option compilerVar="CC" /></Unit>
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_on_boarding.c"><Option compilerVar="CC" /></Unit>
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_ota.c"><Option compilerVar="CC" /></Unit>
+<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_ota_verify.c"><Option compilerVar="CC" /></Unit>
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/mqtt.c"><Option compilerVar="CC" /></Unit>
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/common/tls.c"><Option compilerVar="CC" /></Unit>
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/common/log.c"><Option compilerVar="CC" /></Unit>

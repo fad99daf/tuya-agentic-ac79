@@ -177,6 +177,13 @@ static volatile int g_mqtt_ka_run;        /* MQTT 心跳线程运行标志:生�
  * 释放 iot/擦 VM/复位全部由 tuya_ai_run 这个唯一监督者完成。 */
 #define TUYA_CLOUD_RESET_NONE (-1)
 static volatile int s_cloud_reset_type = TUYA_CLOUD_RESET_NONE;
+/* protocol 15(APP 确认升级)的回调同样只写请求槽(跑在 iot_client_process 的
+ * MQTT 线程里,契约见 iot_client.h:只许置标志/发信号量,禁止调 OTA API)。
+ * 心跳线程下一拍派发 worker 线程执行 查询→下载→校验→烧写;首个确认锁定通道,
+ * worker 忙碌期间的重复确认帧不叠加(成功路径烧完反正 2s 内重启)。*/
+static volatile int s_ota_confirm_pending;
+static volatile int s_ota_confirm_channel;
+static volatile int s_ota_worker_busy;
 /* K6 runs in app_music's key context.  With a live iot client it only sets
  * this request; tuya_ai_run serialises the best-effort cloud notification and
  * the local reset state machine.  Before a client exists, K6 follows the
@@ -478,6 +485,38 @@ static void on_cloud_reset(iot_reset_type_t type, void *user_data)
     g_exit = 1;
 }
 
+/* APP 确认升级回调(MQTT protocol 15,iot_client_process 线程):
+ * 只入队请求(与云复位槽同款策略:首个确认锁定通道,重复帧不覆盖);
+ * 真正 查询/下载/烧写 在 tuya_mqtt_keepalive_task 派生的
+ * tuya_ota_confirm_task worker 里做,绝不在这里做(会卡死 MQTT 泵)。*/
+static void on_ota_confirm(int channel, void *user_data)
+{
+    (void)user_data;
+    if (!s_ota_confirm_pending) {
+        s_ota_confirm_channel = channel;
+        s_ota_confirm_pending = 1;
+    }
+    printf("[TUYA] ota confirm queued: app confirmed upgrade (channel=%d)\r\n", channel);
+}
+
+/* APP 确认升级 worker:独立线程跑 tuya_ota_check_and_upgrade_channel
+ * (查询→下载→校验→烧写),不占 MQTT 泵,下载期间心跳照常。成功路径烧完
+ * boot info 后 2s 自动重启,worker 打印一句就退出;失败上报 ERROR 后设备
+ * 照常跑。与 K6/云复位监督者的并发窗口:若复位恰在下载中到达,supervisor
+ * 停 MQTT 后 deinit client 可能与本线程踩踏——板级验证阶段接受(点完 App
+ * 确认后几秒内不按 K6 即可),要严格串行时在 supervisor 停 MQTT 前加对本
+ * 线程的等待。栈 8KB 与 tuya_ota_chk 同级(HTTPS/TLS 下载实测够用)。*/
+static void tuya_ota_confirm_task(void *arg)
+{
+    extern int tuya_ota_check_and_upgrade_channel(iot_client_t *client, int channel);
+    iot_client_t *iot = (iot_client_t *)arg;
+    int chan = s_ota_confirm_channel;
+    int ret = tuya_ota_check_and_upgrade_channel(iot, chan);
+    printf("[TUYA] ota confirm worker end (channel=%d ret=%d)%s\r\n", chan, ret,
+           ret == 1 ? ", wait reboot" : ", continue");
+    s_ota_worker_busy = 0;
+}
+
 static void tuya_mqtt_keepalive_task(void *arg)
 {
     extern int  iot_client_message_connect(iot_client_t *client);    /* src/iot_client_message.h 未进公共头 */
@@ -537,6 +576,22 @@ static void tuya_mqtt_keepalive_task(void *arg)
                 printf("[TUYA] mqtt reconnected\r\n");
             }
             failing = 0;
+        }
+
+        /* APP 确认升级派发:protocol 15 回调已入队,这里派 worker 执行
+         * (云复位请求挂起时不派——supervisor 马上要停本线程并 deinit client,
+         * 此时再 fork worker 只会加大踩踏窗口;worker 忙碌时新确认帧留队)。*/
+        if (s_ota_confirm_pending && !s_ota_worker_busy &&
+            s_cloud_reset_type == TUYA_CLOUD_RESET_NONE) {
+            s_ota_confirm_pending = 0;
+            s_ota_worker_busy = 1;
+            printf("[TUYA] ota confirm: dispatch upgrade worker (channel=%d)\r\n",
+                   s_ota_confirm_channel);
+            if (thread_fork("tuya_ota_cf", 4, 8 * 1024, 0, 0,
+                            tuya_ota_confirm_task, iot) != 0) {
+                printf("[TUYA] ota confirm worker fork failed\r\n");
+                s_ota_worker_busy = 0;
+            }
         }
         os_time_dly(1);
     }
@@ -1269,6 +1324,7 @@ void tuya_agentic_demo(void *arg)
     obcfg.cert_bundle_attach = NULL;
     obcfg.cacert = NULL;
     obcfg.reset_callback = on_cloud_reset;
+    obcfg.ota_confirm_callback = on_ota_confirm;   /* APP 确认升级(protocol 15) */
     iot = iot_client_init_on_boarding_with_token(&obcfg, TUYA_ACTIVATION_TOKEN);
     if (!iot) { printf("[TUYA] on_boarding_with_token fail(token 过期/三件套错?)\r\n"); return; }
     printf("[TUYA] activated, devid=%s\r\n", iot->devid);
@@ -1281,8 +1337,9 @@ void tuya_agentic_demo(void *arg)
     cfg.cert_bundle_attach = NULL; cfg.cacert = NULL;
     cfg.message_callback = on_mqtt_message;   /* MQTT 常驻:收 DP 下行 */
     cfg.reset_callback = on_cloud_reset;
+    cfg.ota_confirm_callback = on_ota_confirm;   /* APP 确认升级(protocol 15) */
     extern const char *tuya_get_effective_sw_ver(void);
-    cfg.sw_ver = tuya_get_effective_sw_ver();   /* 上报生效版本:VM>源码基线 */
+    cfg.sw_ver = tuya_get_effective_sw_ver();   /* 上报生效版本:USER区记录优先,无记录回退源码宏(见 tuya_ota.c"版本号管理") */
 
     strncpy((char *)cfg.devid,      TUYA_DEVID,      sizeof(cfg.devid) - 1);
     strncpy((char *)cfg.secret_key, TUYA_SECRET_KEY, sizeof(cfg.secret_key) - 1);
@@ -3670,8 +3727,9 @@ void tuya_agentic_main(void *arg)
         cfg.mqtt_disable_tls = false; cfg.mqtt_auto_connect = 1;
         cfg.cert_bundle_attach = NULL; cfg.cacert = NULL;
         cfg.reset_callback = on_cloud_reset;
+    cfg.ota_confirm_callback = on_ota_confirm;   /* APP 确认升级(protocol 15) */
         extern const char *tuya_get_effective_sw_ver(void);
-        cfg.sw_ver = tuya_get_effective_sw_ver();   /* 上报生效版本:VM>源码基线 */
+        cfg.sw_ver = tuya_get_effective_sw_ver();   /* 上报生效版本:USER区记录优先,无记录回退源码宏(见 tuya_ota.c"版本号管理") */
 
         strncpy((char *)cfg.devid, devid, sizeof(cfg.devid) - 1);
         strncpy((char *)cfg.secret_key, secret, sizeof(cfg.secret_key) - 1);
@@ -3775,8 +3833,9 @@ void tuya_agentic_main(void *arg)
     ob.env = PROD; ob.mqtt_disable_tls = false; ob.mqtt_auto_connect = 1; ob.timeout_ms = 30000;
     ob.cert_bundle_attach = NULL; ob.cacert = NULL;
     ob.reset_callback = on_cloud_reset;
+    ob.ota_confirm_callback = on_ota_confirm;   /* APP 确认升级(protocol 15) */
     extern const char *tuya_get_effective_sw_ver(void);
-    ob.sw_ver = tuya_get_effective_sw_ver();   /* 上报生效版本:VM>源码基线 */
+    ob.sw_ver = tuya_get_effective_sw_ver();   /* 上报生效版本:USER区记录优先,无记录回退源码宏(见 tuya_ota.c"版本号管理") */
     iot_client_t *iot = iot_client_init_on_boarding_with_token(&ob, s_main_creds.token);
     if (!iot) { printf("[TUYA] on_boarding_with_token fail\r\n"); return; }
     if (!iot->devid[0] || !iot->secret_key[0] || !iot->local_key[0]) {

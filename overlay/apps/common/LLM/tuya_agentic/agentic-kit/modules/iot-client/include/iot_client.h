@@ -25,6 +25,7 @@
 #define OPRT_NOT_SUPPORTED            (-0x0005) //-5, Not supported
 #define OPRT_MALLOC_FAILED            (-0x0006) //-6, Memory allocation failed
 #define OPRT_TLS_HANDSHAKE_FAILED     (-0x0007) //-7, TLS handshake failed
+#define OPRT_OTA_VERIFY_FAILED        (-0x000D) //-13, OTA firmware digest mismatch (值与上游 agentic-kit 一致)
 
 /* ---- Logging subsystem ----
  * The IoT SDK shares the process-wide log facade (see log.h).
@@ -92,6 +93,16 @@ typedef enum {
 
 typedef void (*iot_reset_callback_t)(iot_reset_type_t type, void *user_data);
 
+/* APP-confirmed OTA notices (cloud MQTT protocol 15) are received by
+ * iot_client_process(), exactly like protocol 11.  The callback must only
+ * set a flag, signal a semaphore, or enqueue work for an application
+ * worker: never call tuya_iot_ota_check_upgrade(), download firmware or
+ * write flash here — those must run outside the MQTT process loop.
+ * Registering the callback opts the client in to consuming protocol-15
+ * frames (they then never reach the DP layer or message_callback);
+ * without one they pass through as before (upstream eb19466). */
+typedef void (*iot_ota_confirm_callback_t)(int channel, void *user_data);
+
 /**
  * @brief IoT client configuration structure
  */
@@ -108,6 +119,8 @@ typedef struct {
     iot_message_callback_t message_callback; // MQTT message callback
     iot_reset_callback_t reset_callback; // Cloud device-removal callback
     void *reset_user_data;               // Opaque reset callback context
+    iot_ota_confirm_callback_t ota_confirm_callback; // APP-confirmed OTA (protocol 15) callback
+    void *ota_confirm_user_data;               // Opaque OTA confirm callback context
 
     /* ---- DP layer restore (all caller-owned, may be NULL) ---- */
     const char *schema;            // Persisted DP schema JSON to restore on restart (NULL = none / loose mode)
@@ -136,6 +149,8 @@ typedef struct {
     iot_message_callback_t message_callback; // MQTT message callback
     iot_reset_callback_t reset_callback; // Cloud device-removal callback
     void *reset_user_data;               // Opaque reset callback context
+    iot_ota_confirm_callback_t ota_confirm_callback; // APP-confirmed OTA (protocol 15) callback
+    void *ota_confirm_user_data;               // Opaque OTA confirm callback context
     const char *sw_ver;            // Application firmware version (e.g. "1.2.3"); NULL = use SDK default IOT_SDK_SW_VER
 } iot_on_boarding_config_t;
 
@@ -173,6 +188,8 @@ struct iot_dp_context;
     iot_message_callback_t message_callback;  // User callback for incoming messages
     iot_reset_callback_t reset_callback;      // Cloud device-removal callback
     void *reset_user_data;                     // Opaque reset callback context
+    iot_ota_confirm_callback_t ota_confirm_callback; // APP-confirmed OTA (protocol 15) callback
+    void *ota_confirm_user_data;               // Opaque OTA confirm callback context
 
     struct iot_dp_context *dp;    // DP layer state; points into dp_storage, NULL when inactive
     void *dp_storage[IOT_DP_CONTEXT_STORAGE / sizeof(void *)]; // inline storage for *dp (no heap)

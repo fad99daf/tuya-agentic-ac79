@@ -1,4 +1,4 @@
-#ifndef APP_CONFIG_H
+﻿#ifndef APP_CONFIG_H
 #define APP_CONFIG_H
 
 #define AUDIO_ENC_SAMPLE_SOURCE_MIC         0
@@ -435,14 +435,18 @@
 #define TUYA_MUSIC_ENABLE
 
 /* ===== 涂鸦云 OTA(固件升级)开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
- * TUYA_FIRMWARE_VERSION:固件版本号(编译期写死)。⚠️手动方案:每次发版前改成与
+ * TUYA_FIRMWARE_VERSION:固件版本号(编译期写死)。发版纪律:每次出包前改成与
  *   涂鸦平台上传固件时填的版本号一致,再编译+出 OTA 包+传平台。
- *   (曾尝试跨 OTA 自动持久化版本号——VM 方案重启后读回 CRC 损坏,实测不可靠,
- *    已回退手动;tuya_get_effective_sw_ver() 直接返回本宏,见 tuya_ota.c。)
+ *   2026-09-29 起另有 USER 保留区版本记录兜底(tuya_ver_region_*):OTA 烧录
+ *   落盘+摘要校验通过后(net_fclose 前)把云端任务版本写入 USER 区(断电验证
+ *   链路),升级后上报记录值——即使包里忘改宏也不会死循环(2026-09-29 旧宏包
+ *   事故的防复发);开机日志 base=宏/effective=记录 不一致即暴露旧宏包。
+ *   tuya_get_effective_sw_ver() 优先返回记录,无记录回退本宏,见 tuya_ota.c
+ *   "版本号管理"。
  * TUYA_OTA_ENABLE:1=开机连 AI 前检查一次涂鸦云 OTA;0=关闭(不检查)。
  *   检查到新固件会:播报提示音 -> HTTPS 下载 -> 烧写 flash -> 自动重启。
  *   实现见 apps/common/LLM/tuya_agentic/tuya_ota.c。*/
-#define TUYA_FIRMWARE_VERSION   "1.0.11"
+#define TUYA_FIRMWARE_VERSION   "1.0.14"
 #define TUYA_OTA_ENABLE         1
 
 // #define CONFIG_ONESDK_LLM_ENABLE

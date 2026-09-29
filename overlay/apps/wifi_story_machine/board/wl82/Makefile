@@ -461,6 +461,7 @@ c_SRC_FILES := \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_dp.c \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_on_boarding.c \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_ota.c \
+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_ota_verify.c \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/mqtt.c \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/common/tls.c \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/common/log.c \

@@ -4,6 +4,8 @@
 #include "iot_config_defaults.h"
 
 #include <string.h>
+#include <stdio.h>
+#include <time.h>
 
 /**
  * @file iot_ota.c
@@ -41,8 +43,10 @@ int tuya_iot_ota_report_version(iot_client_t *client, const char *sw_ver)
     return atop_version_update(client->pal, &req);
 }
 
-int tuya_iot_ota_check_upgrade(iot_client_t *client, int channel,
-                          tuya_iot_ota_upgrade_info_t *info)
+/* upgrade.get(确认后拉包) / silent.get(设备自检) 公共实现:仅分叉 ATOP 接口,
+ * 请求构造与响应映射完全一致(响应结构两接口相同,见 atop.c 公共实现注释)。*/
+static int iot_ota_check_upgrade_impl(iot_client_t *client, int channel,
+                                      bool silent, tuya_iot_ota_upgrade_info_t *info)
 {
     if (client == NULL || info == NULL) {
         return OPRT_INVALID_PARAMETER;
@@ -65,7 +69,8 @@ int tuya_iot_ota_check_upgrade(iot_client_t *client, int channel,
     };
 
     ota_upgrade_response_t resp = {0};
-    int rt = atop_upgrade_get(client->pal, &req, &resp);
+    int rt = silent ? atop_upgrade_silent_get(client->pal, &req, &resp)
+                    : atop_upgrade_get(client->pal, &req, &resp);
     if (rt != OPRT_OK) {
         return rt;
     }
@@ -80,6 +85,22 @@ int tuya_iot_ota_check_upgrade(iot_client_t *client, int channel,
     info->hmac        = resp.hmac;
 
     return OPRT_OK;
+}
+
+int tuya_iot_ota_check_upgrade(iot_client_t *client, int channel,
+                          tuya_iot_ota_upgrade_info_t *info)
+{
+    return iot_ota_check_upgrade_impl(client, channel, false, info);
+}
+
+/* 设备主动自检(开机/定时)专用:silent.get 只返回"静默升级"任务,APP 提醒
+ * 升级任务不下发——须等用户在 App 确认、云端推 MQTT protocol 15 后再走
+ * tuya_iot_ota_check_upgrade(upgrade.get)拉包。(2026-09-29 修复:开机自检
+ * 误用 upgrade.get,平台"APP提醒升级"任务被当静默任务直接刷机。) */
+int tuya_iot_ota_check_upgrade_silent(iot_client_t *client,
+                                      tuya_iot_ota_upgrade_info_t *info)
+{
+    return iot_ota_check_upgrade_impl(client, 0, true, info);
 }
 
 int tuya_iot_ota_report_status(iot_client_t *client, int channel, tuya_iot_ota_status_t status)
@@ -117,4 +138,30 @@ void tuya_iot_ota_upgrade_info_free(iot_client_t *client, tuya_iot_ota_upgrade_i
     if (info->md5)     pal->free(info->md5);
     if (info->hmac)    pal->free(info->hmac);
     memset(info, 0, sizeof(tuya_iot_ota_upgrade_info_t));
+}
+
+int tuya_iot_ota_report_progress(iot_client_t *client, int channel,
+                                 int percent)
+{
+    if (client == NULL || percent < 0 || percent > 100) {
+        return OPRT_INVALID_PARAMETER;
+    }
+
+    /* 外层 protocol/t 与内层 data 都由本端拼(TuyaOpen 是 protocol_data_publish
+     * 包装外层,这里 publish 是透传加密,故带上全帧)。progress 为字符串。*/
+    char json[96];
+    int len = snprintf(json, sizeof(json),
+                       "{\"protocol\":16,\"t\":%u,\"data\":"
+                       "{\"progress\":\"%d\",\"firmwareType\":%d}}",
+                       (unsigned)(uint32_t)time(NULL), percent, channel);
+    if (len <= 0 || (size_t)len >= sizeof(json)) {
+        return OPRT_INVALID_PARAMETER;
+    }
+
+    int rt = iot_client_publish(client, (const uint8_t *)json, (size_t)len);
+    if (rt != OPRT_OK) {
+        log_warn("ota progress publish fail (rt=%d, percent=%d ch=%d)",
+                 rt, percent, channel);
+    }
+    return rt;
 }
