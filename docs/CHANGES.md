@@ -558,3 +558,34 @@ VM_OPT=0;//单备份...(原样不动)
 
 - 主仓 → overlay 同步 16 文件 + 新增 `iot_ota_verify.c`;`tuya_agentic_demo.c` 74-76 行凭据占位符惯例保持(整仓复检:零真实三元组、diff 零新增 ≥28 字符字面量)。
 - patch **12 段全量重新生成**(基线不变:`AC79NN_SDK_V1.2.12_2026-03-07` tag):4 段实质更新(`.cbp`/`Makefile`/`app_config.h`/`isd_config_rule.c`),其余 8 段与旧 patch 逐字节一致;纯净基线树 `git apply --check` 全段通过。
+
+---
+
+## 2026-09-30 增量改动(agentic-kit 阶段 0 热修:TLS1.3 NST 会话容忍 + mqtt recv==0 EOF/link_dead)
+
+> 背景:agentic-kit 上游对齐分析(2026-09-29)定案 vendor 基线 `49ab2af`(2026-07-17)、落后 0.5.0 约 48 提交,制定分四阶段整树步进方案。本节为**阶段 0 热修**:只移植两个最高风险修复,不 re-vendor。对照锚点与阶段计划见 `UPSTREAM-BASE.md`(本日新增)。
+
+### AM. tls.c:TLS 1.3 NewSessionTicket 不再拆会话(上游 957d1c4 逐字移植)
+
+- TLS1.3 服务端会在应用记录之间下发 NewSessionTicket,mbedTLS 把它以 `MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET` 交给读方——非致命,语义是"这次没有你的数据,再读一次"。原 `tls_read()` 落到通用错误分支直接 `return TLS_ERR_NET` 拆连接 = **会话随机中途断链**,且日志上与真传输故障无法区分。
+- 移植形态:`tls_read()` 内 +6 行 `#ifdef` 守卫(上游原样,老版本 mbedTLS 自动休眠)。本工程 mbedTLS 3.4.0(`include_lib/net/mbedtls_3_4_0`)头文件**含**该常量 → 守卫编译为**激活态**。
+- 该文件本地另有 tai_log.h 改名与 tls_write 慢链路诊断(原样保留),故走手工插入而非整文件替换。
+
+### AN. mqtt.c:整文件对齐上游 0a81046(recv==0 EOF 翻译 + link_dead/DISCONNECT 压制)
+
+- **取整文件而非打补丁**:本仓 mqtt.c 与基线 49ab2af 内容一致(零本地改动),基线→0a81046 的全部差异经逐行审后整体采纳,落地后与上游 0a81046 版内容**逐字节一致**(CRLF 行尾除外)——阶段 1 re-vendor 时该文件零冲突。包含(跨 8b108e0+0a81046 两提交):
+  - **TCP recv==0 EOF 翻译**:非 TLS 链路 `transport_recv()` 原把 0 直通给 coreMQTT(coreMQTT 读作"暂无数据"),对端关闭最长 **60s 无感**直到 keepalive 超时;现 0=EOF → `OPRT_COMMUNICATION_ERROR` 并打 `TCP peer closed`。TLS 分支原本就有此翻译,TCP 分支是漏掉的不对称。
+  - **link_dead + DISCONNECT 压制**:死链上发 DISCONNECT 必失败且 coreMQTT 刷 ERROR(弱网重连周期每次两条噪音日志)。机制:仅 `MQTTRecvFailed/MQTTSendFailed/MQTTKeepAliveTimeout` 三态判死,成功交换清标志(防一次瞬时错误压制整个活会话的 DISCONNECT);4 个 coreMQTT 调用点全报状态(含 publish——DP 上报必经、最早暴露死链的点)。
+  - 行为中性重构:`mqtt_abort_connect()` 折叠三段逐字节相同的连接失败展开(防漏改);7 处日志 `%d` → `MQTT_Status_strerror` 符号名(现场日志直接可读)。
+- 依赖核实:vendored coreMQTT(`third_party/coreMQTT/source/`)含 `MQTT_Status_strerror`/`MQTTKeepAliveTimeout`,无 include 变更。
+
+### 验证与回退
+
+- JL clang `-fsyntax-only`(真实 -I/-D 集,140 令牌)两文件 0 error;主仓 ↔ overlay 副本逐字节一致。
+- 板上验证:**CB 全量构建(先清 .bc)→ 冒烟(配网/对话打断/DP/OTA 双通道/K6)→ 隔夜 soak**——两项修复均治"随机断链"类问题,观察窗建议 ≥12h,关注 MQTT 重连频次与 `TCP peer closed` 日志(出现即说明 EOF 翻译在干活)。
+- 回退点:overlay tag **`align-phase0`**;单文件回退 `git checkout align-phase0^ -- <file>`。
+
+### 同步范围
+
+- 仅 2 文件:`agentic-kit/common/tls.c`、`agentic-kit/modules/iot-client/src/mqtt.c`;**patch 不重新生成**(Makefile/.cbp/app_config.h 未动,12 段照旧有效)。
+- 新增 `docs/UPSTREAM-BASE.md`(对照锚点:各子模块基线 SHA、机械适配重放清单、本地补丁台账、分阶段计划摘要)。
