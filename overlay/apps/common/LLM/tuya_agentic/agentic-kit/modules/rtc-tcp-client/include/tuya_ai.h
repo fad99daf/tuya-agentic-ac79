@@ -64,7 +64,13 @@ extern "C" {
 #define TAI_EVT_PAYLOADS_END     1
 #define TAI_EVT_END              2
 #define TAI_EVT_ONE_SHOT         3
+/* Server-sent. Doubles as the cloud-VAD turn boundary: the current cloud sends
+ * this when the user stops speaking (or speaks over the reply) and no longer
+ * sends TAI_EVT_SERVER_VAD. Device response: clear the interrupted turn's
+ * downlink playback; keep the uplink audio Event open (no audio_end/start). */
 #define TAI_EVT_CHAT_BREAK       4
+/* Legacy server-sent turn-end signal. The current cloud does not send it;
+ * kept for protocol compatibility. Do not build new handling on it. */
 #define TAI_EVT_SERVER_VAD       5
 #define TAI_EVT_MCP_CMD          1000
 #define TAI_EVT_SERVER_TIMEOVER  1001
@@ -260,7 +266,12 @@ typedef struct tai_config {
 
     /* --- Session / event JSON options (NULL = built-in defaults) --- */
     const char *session_attrs_json;
-    const char *event_user_data_json;
+    const char *event_user_data_json;      /* → chatAttributes value (string) */
+    /* Optional per-connection custom parameters emitted on every EventStart as
+     * {"sessionAttributes":{"custom.param":<this raw JSON object>}} alongside
+     * chatAttributes. This is where server-side workflows read device intent,
+     * e.g. "{\"clm_intent\":\"ai_image\"}". NULL = omit sessionAttributes. */
+    const char *event_custom_param_json;
     const char *agent_token;
 
     /* --- Business identifiers --- */
@@ -347,6 +358,15 @@ void        tai_disconnect(tai_ctx_t *ctx);
  * worker, send SessionClose, and release resources. */
 void        tai_request_disconnect(tai_ctx_t *ctx);
 
+/* Update the user-data emitted on subsequent EventStart packets, so the intent
+ * can change per turn (e.g. an image-recognition turn vs. a plain chat turn).
+ * Pass NULL for user_data_json to fall back to the built-in default, and NULL
+ * for custom_param_json to omit sessionAttributes.custom.param entirely.
+ * The pointers must stay valid until the next call (typically string literals). */
+void tai_set_event_params(tai_ctx_t *ctx,
+                          const char *user_data_json,
+                          const char *custom_param_json);
+
 /* =========================================================================
  * Sending data
  * ========================================================================= */
@@ -371,6 +391,19 @@ int tai_send_image_with_text(tai_ctx_t *ctx,
                              uint8_t format,
                              uint16_t width, uint16_t height);
 
+/* Send an image + streamed audio in ONE event (multimodal query):
+ *   EventStart -> Image(OneShot) -> Audio(START..MIDDLE..END)
+ *   -> EventPayloadsEnd -> EventEnd
+ * Usage: _start(img+audio params) -> _chunk(pcm) x N -> _end().
+ * chunk/end share tai_send_audio_chunk/_end semantics. */
+int tai_send_image_audio_start(tai_ctx_t *ctx,
+                               const uint8_t *img_data, size_t img_len,
+                               uint8_t img_format, uint16_t width, uint16_t height,
+                               uint8_t codec, uint8_t channels,
+                               uint8_t bit_depth, uint32_t sample_rate);
+int tai_send_image_audio_chunk(tai_ctx_t *ctx, const uint8_t *pcm, size_t len);
+int tai_send_image_audio_end  (tai_ctx_t *ctx);
+
 int tai_chat_break(tai_ctx_t *ctx);
 
 /* Current uplink turn id (client-generated per tai_send_audio_start; stamps
@@ -387,7 +420,7 @@ int tai_send_mcp_response(tai_ctx_t *ctx, const char *json_rpc_response);
  *
  *   1. Compile-time maximum (TAI_LOG_LEVEL, default 4 = DEBUG).
  *      Messages above this level are optimised away at build time.
- *   2. Runtime level, set via tai_set_log_level().  Default: TAI_LOG_DEBUG.
+ *   2. Runtime level, set via tai_set_log_level().  Default: TAI_LOG_INFO.
  *
  * These thin inlines exist for source-compatibility with callers; new
  * code should prefer log_set_level() / log_get_level() directly.

@@ -1319,7 +1319,7 @@ void tuya_agentic_demo(void *arg)
     strncpy((char *)obcfg.product_key, tuya_trip_pk(),   sizeof(obcfg.product_key) - 1);
     obcfg.env              = PROD;
     obcfg.mqtt_disable_tls = false;
-    obcfg.mqtt_auto_connect = 1;
+    obcfg.mqtt_disable_auto_connect = false;   /* 阶段1上游字段(语义反转):false=init/激活后自动连 MQTT,等效旧 mqtt_auto_connect=1 */
     obcfg.timeout_ms       = 30000;
     obcfg.cert_bundle_attach = NULL;
     obcfg.cacert = NULL;
@@ -1333,7 +1333,7 @@ void tuya_agentic_demo(void *arg)
     iot_client_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.region = AY; cfg.env = PROD;
-    cfg.mqtt_disable_tls = false; cfg.mqtt_auto_connect = 1;
+    cfg.mqtt_disable_tls = false; cfg.mqtt_disable_auto_connect = false;
     cfg.cert_bundle_attach = NULL; cfg.cacert = NULL;
     cfg.message_callback = on_mqtt_message;   /* MQTT 常驻:收 DP 下行 */
     cfg.reset_callback = on_cloud_reset;
@@ -3724,7 +3724,7 @@ void tuya_agentic_main(void *arg)
             printf("[TUYA] region=%s (from VM)\r\n", region_name(cfg.region));
         }
         cfg.env = PROD;
-        cfg.mqtt_disable_tls = false; cfg.mqtt_auto_connect = 1;
+        cfg.mqtt_disable_tls = false; cfg.mqtt_disable_auto_connect = false;
         cfg.cert_bundle_attach = NULL; cfg.cacert = NULL;
         cfg.reset_callback = on_cloud_reset;
     cfg.ota_confirm_callback = on_ota_confirm;   /* APP 确认升级(protocol 15) */
@@ -3830,7 +3830,7 @@ void tuya_agentic_main(void *arg)
     strncpy((char *)ob.uuid,        tuya_trip_uuid(), sizeof(ob.uuid) - 1);
     strncpy((char *)ob.authkey,     tuya_trip_key(),  sizeof(ob.authkey) - 1);
     strncpy((char *)ob.product_key, tuya_trip_pk(),   sizeof(ob.product_key) - 1);
-    ob.env = PROD; ob.mqtt_disable_tls = false; ob.mqtt_auto_connect = 1; ob.timeout_ms = 30000;
+    ob.env = PROD; ob.mqtt_disable_tls = false; ob.mqtt_disable_auto_connect = false; ob.timeout_ms = 30000;
     ob.cert_bundle_attach = NULL; ob.cacert = NULL;
     ob.reset_callback = on_cloud_reset;
     ob.ota_confirm_callback = on_ota_confirm;   /* APP 确认升级(protocol 15) */

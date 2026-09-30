@@ -176,40 +176,78 @@ OTA_API void tuya_iot_ota_upgrade_info_free(iot_client_t *client, tuya_iot_ota_u
 OTA_API int tuya_iot_ota_report_progress(iot_client_t *client, int channel,
                                          int percent);
 
-/* ---- 流式固件摘要校验(移植自上游 agentic-kit e09d502)----
- * 下载循环逐块喂给校验器,烧启动区【之前】调 finish 比对云端摘要:
- *   hmac 优先: HMAC-SHA256(key=设备 secret_key, msg=大写hex(SHA256(固件)));
- *   无 hmac 时退化 MD5(固件);两者都没下发返回 OPRT_NOT_SUPPORTED(ctx 保持
- *   NULL,由应用决定是否照烧)。比较大小写不敏感。*/
+/* ============================================================================
+ * Firmware digest verification (MD5 / HMAC-SHA256)
+ * ============================================================================ */
 
-/** @brief 摘要校验上下文(不透明;init 时内部拷贝期望摘要与 HMAC 密钥)。 */
+/** Opaque streaming digest context (allocated by tuya_iot_ota_verify_init). */
 typedef struct tuya_iot_ota_verify_ctx tuya_iot_ota_verify_ctx_t;
 
 /**
- * @brief 创建摘要校验器。必须在 tuya_iot_ota_upgrade_info_free 之前调用。
+ * @brief Start verifying a firmware image against the cloud digest.
  *
- * @return OPRT_OK 建好;OPRT_NOT_SUPPORTED 云端未下发任何摘要(ctx 保持 NULL,
- *         可跳过校验);其它错误(摘要格式非法/内存不足)必须中止升级。
+ * Algorithm selection (following TuyaOpen tuya_ota.c):
+ * - If @p info->hmac is a non-empty string: expected value is
+ *   HMAC-SHA256(key = client->secret_key,
+ *               msg = UPPERCASE_hex(SHA-256(firmware))) as 64 hex chars.
+ * - Else if @p info->md5 is a non-empty string: expected value is
+ *   MD5(firmware) as 32 hex chars.
+ * - Else: OPRT_NOT_SUPPORTED (nothing to verify against). The cloud sends ""
+ *   for a digest it has not configured, so an empty string counts as absent
+ *   and falls through to the next algorithm.
+ *
+ * A non-empty digest of the wrong length is OPRT_INVALID_PARAMETER, never a
+ * silent downgrade to the weaker algorithm.
+ *
+ * On any error return, @p ctx_out is not written — initialize it to NULL
+ * before the call. The returned context borrows client->pal: call
+ * tuya_iot_ota_verify_finish() or tuya_iot_ota_verify_abort() before
+ * iot_client_deinit().
+ *
+ * @param[in]  client   IoT client instance (provides secret_key + allocator)
+ * @param[in]  info     Upgrade info returned by tuya_iot_ota_check_upgrade()
+ * @param[out] ctx_out  Initialized verification context
+ * @return OPRT_OK on success, OPRT_NOT_SUPPORTED if neither digest is present
+ *         (absent or empty), OPRT_INVALID_PARAMETER on bad args or on a
+ *         non-empty digest of the wrong length
  */
 OTA_API int tuya_iot_ota_verify_init(iot_client_t *client,
-                                     const tuya_iot_ota_upgrade_info_t *info,
-                                     tuya_iot_ota_verify_ctx_t **ctx_out);
+                                const tuya_iot_ota_upgrade_info_t *info,
+                                tuya_iot_ota_verify_ctx_t **ctx_out);
 
 /**
- * @brief 喂入一块固件数据(必须与写入 flash 的字节严格一致)。
- * @return OPRT_OK;错误时应 abort 并中止本次升级。
+ * @brief Feed a firmware chunk into the digest.
+ *
+ * Call for every chunk in download order; the chunk order and boundaries do
+ * not affect the result.
+ *
+ * @param ctx  Verification context
+ * @param data Firmware bytes
+ * @param len  Number of bytes
+ * @return OPRT_OK on success, error code on failure
  */
 OTA_API int tuya_iot_ota_verify_update(tuya_iot_ota_verify_ctx_t *ctx,
-                                       const uint8_t *data, size_t len);
+                                  const uint8_t *data, size_t len);
 
 /**
- * @brief 全部数据喂完后比对云端摘要。无论成败内部都释放 ctx,之后不得再用。
- * @return OPRT_OK 匹配;OPRT_OTA_VERIFY_FAILED 固件被篡改/损坏(必须中止,
- *         不得切换启动分区);其它错误同样中止。
+ * @brief Finish verification and free the context.
+ *
+ * The context is freed on every path (success or failure); do not use it
+ * again after this call.
+ *
+ * @param ctx Verification context
+ * @return OPRT_OK if the digest matches, OPRT_OTA_VERIFY_FAILED on mismatch,
+ *         error code on internal failure
  */
 OTA_API int tuya_iot_ota_verify_finish(tuya_iot_ota_verify_ctx_t *ctx);
 
-/** @brief 下载中途失败时直接释放 ctx(不比对)。NULL 安全。 */
+/**
+ * @brief Free a verification context without checking the digest.
+ *
+ * For download-failure paths where verification will never complete.
+ *
+ * @param ctx Verification context (NULL is a safe no-op)
+ */
 OTA_API void tuya_iot_ota_verify_abort(tuya_iot_ota_verify_ctx_t *ctx);
 
 #endif /* _IOT_OTA_H_ */

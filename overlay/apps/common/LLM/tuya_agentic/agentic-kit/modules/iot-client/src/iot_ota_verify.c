@@ -1,27 +1,22 @@
 #include "iot_ota.h"
 #include "iot_config_defaults.h"
 
-#include "mbedtls/md5.h"
-#include "mbedtls/sha256.h"
-#include "mbedtls/md.h"
+#include <mbedtls/md5.h>
+#include <mbedtls/sha256.h>
+#include <mbedtls/md.h>
 
 #include <string.h>
 
 /**
- * @file iot_ota_verify.c
- * @brief 流式固件摘要校验(OTA 下载防篡改/防损坏)。
+ * @file tuya_iot_ota_verify.c
+ * @brief Streaming firmware digest verification for OTA downloads.
  *
- * 移植自上游 agentic-kit e09d502 "feat(ota): add firmware digest
- * verification",函数名按本仓前缀惯例从 iot_ota_verify_* 改为
- * tuya_iot_ota_verify_*,逻辑逐行等价。
- *
- * 与 TuyaOpen 的 tuya_ota.c 校验一致:
- *   expected = HMAC-SHA256(key = 设备 secret_key,
- *                          msg = UPPERCASE_hex(SHA-256(固件字节)))
- * 即 HMAC 的消息是 SHA-256 摘要的 64 字符大写十六进制【字符串】(对应
- * TuyaOpen 的 hex2str),不是小写、也不是原始 32 字节。云端没下发 hmac
- * (字段缺失或空串)时退化为 MD5(固件字节) 比对;但 hmac 非空而长度非法时
- * init 直接报错,绝不静默降级到 md5。比较大小写不敏感。
+ * Replicates the validation performed by TuyaOpen's tuya_ota.c:
+ *   expected = HMAC-SHA256(device secret_key, UPPERCASE_hex(SHA-256(image)))
+ * i.e. the HMAC message is the 64-character hex STRING of the SHA-256
+ * digest (uppercase, matching TuyaOpen's hex2str), not the raw 32-byte
+ * digest. MD5 is provided as a fallback for upgrade responses that carry
+ * no "hmac" field.
  */
 
 #define OTA_MD5_HEX_LEN    32
@@ -99,8 +94,8 @@ static void ctx_free(tuya_iot_ota_verify_ctx_t *ctx)
 }
 
 int tuya_iot_ota_verify_init(iot_client_t *client,
-                             const tuya_iot_ota_upgrade_info_t *info,
-                             tuya_iot_ota_verify_ctx_t **ctx_out)
+                        const tuya_iot_ota_upgrade_info_t *info,
+                        tuya_iot_ota_verify_ctx_t **ctx_out)
 {
     if (client == NULL || info == NULL || ctx_out == NULL || client->pal == NULL) {
         return OPRT_INVALID_PARAMETER;
@@ -176,7 +171,7 @@ int tuya_iot_ota_verify_init(iot_client_t *client,
 }
 
 int tuya_iot_ota_verify_update(tuya_iot_ota_verify_ctx_t *ctx,
-                               const uint8_t *data, size_t len)
+                          const uint8_t *data, size_t len)
 {
     if (ctx == NULL || (len > 0 && data == NULL)) {
         return OPRT_INVALID_PARAMETER;

@@ -45,7 +45,7 @@ int tuya_iot_ota_report_version(iot_client_t *client, const char *sw_ver)
 
 /* upgrade.get(确认后拉包) / silent.get(设备自检) 公共实现:仅分叉 ATOP 接口,
  * 请求构造与响应映射完全一致(响应结构两接口相同,见 atop.c 公共实现注释)。*/
-static int iot_ota_check_upgrade_impl(iot_client_t *client, int channel,
+static int tuya_iot_ota_check_upgrade_impl(iot_client_t *client, int channel,
                                       bool silent, tuya_iot_ota_upgrade_info_t *info)
 {
     if (client == NULL || info == NULL) {
@@ -72,6 +72,7 @@ static int iot_ota_check_upgrade_impl(iot_client_t *client, int channel,
     int rt = silent ? atop_upgrade_silent_get(client->pal, &req, &resp)
                     : atop_upgrade_get(client->pal, &req, &resp);
     if (rt != OPRT_OK) {
+        log_error("atop_upgrade_get failed: %d", rt);
         return rt;
     }
 
@@ -90,7 +91,7 @@ static int iot_ota_check_upgrade_impl(iot_client_t *client, int channel,
 int tuya_iot_ota_check_upgrade(iot_client_t *client, int channel,
                           tuya_iot_ota_upgrade_info_t *info)
 {
-    return iot_ota_check_upgrade_impl(client, channel, false, info);
+    return tuya_iot_ota_check_upgrade_impl(client, channel, false, info);
 }
 
 /* 设备主动自检(开机/定时)专用:silent.get 只返回"静默升级"任务,APP 提醒
@@ -100,7 +101,7 @@ int tuya_iot_ota_check_upgrade(iot_client_t *client, int channel,
 int tuya_iot_ota_check_upgrade_silent(iot_client_t *client,
                                       tuya_iot_ota_upgrade_info_t *info)
 {
-    return iot_ota_check_upgrade_impl(client, 0, true, info);
+    return tuya_iot_ota_check_upgrade_impl(client, 0, true, info);
 }
 
 int tuya_iot_ota_report_status(iot_client_t *client, int channel, tuya_iot_ota_status_t status)

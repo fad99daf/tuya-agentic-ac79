@@ -4,100 +4,9 @@
 #include "iot_config_defaults.h"
 #include "iot_dp_internal.h"
 #include "cJSON.h"
+
 #include <string.h>
 #include <stdio.h>
-
-#define IOT_PROTOCOL_CLOUD_REMOVE 11
-#define IOT_PROTOCOL_OTA_CONFIRM  15  /* cloud → device: app confirmed an OTA upgrade */
-
-/* Protocol 11 is a control-plane message, never a DP message.  Consume every
- * syntactically recognised protocol-11 frame, but notify the application only
- * when its non-empty data.gwId exactly identifies this client. */
-static bool iot_client_message_handle_cloud_remove(iot_client_t *client,
-                                                    const uint8_t *bytes,
-                                                    size_t len)
-{
-    if (!client || !bytes || len == 0) return false;
-
-    cJSON *root = cJSON_ParseWithLength((const char *)bytes, len);
-    if (!root) return false;
-
-    cJSON *protocol = cJSON_GetObjectItem(root, "protocol");
-    if (!cJSON_IsNumber(protocol) ||
-        protocol->valueint != IOT_PROTOCOL_CLOUD_REMOVE) {
-        cJSON_Delete(root);
-        return false;
-    }
-
-    cJSON *data = cJSON_GetObjectItem(root, "data");
-    cJSON *gwid = cJSON_IsObject(data) ? cJSON_GetObjectItem(data, "gwId") : NULL;
-    if (!cJSON_IsString(gwid) || !gwid->valuestring ||
-        gwid->valuestring[0] == '\0' || client->devid[0] == '\0' ||
-        strcmp(gwid->valuestring, client->devid) != 0) {
-        log_warn("cloud remove: ignored protocol 11 with missing or foreign gwId");
-        cJSON_Delete(root);
-        return true;
-    }
-
-    iot_reset_type_t type = IOT_RESET_REMOTE_UNBIND;
-    cJSON *message_type = cJSON_GetObjectItem(root, "type");
-    if (cJSON_IsString(message_type) && message_type->valuestring &&
-        strcmp(message_type->valuestring, "reset_factory") == 0) {
-        type = IOT_RESET_REMOTE_FACTORY;
-    }
-
-    if (client->reset_callback) {
-        log_warn("cloud remove: accepted protocol 11 (%s)",
-                 type == IOT_RESET_REMOTE_FACTORY ? "factory" : "unbind");
-        client->reset_callback(type, client->reset_user_data);
-    } else {
-        log_warn("cloud remove: no reset callback registered; request ignored");
-    }
-    cJSON_Delete(root);
-    return true;
-}
-
-/* Protocol 15 = APP 确认升级通知(用户在 App 点了"确认升级",云端经 MQTT 下发)。
- * 消费是可选的:注册了 ota_confirm_callback 才消费(该帧不再进 DP 层/裸
- * message_callback),未注册则保持旧版行为原样透传(上游 eb19466 同款语义)。
- * data.firmwareType 即固件通道,缺失/畸形按主固件通道 0 处理(对齐 TuyaOpen:
- * 已通过认证的云端通知不因字段畸形而拒收)。回调跑在 MQTT 处理线程里,契约见
- * iot_client.h——只许置标志/发信号量,应用侧 worker 再做 check/下载/烧写。*/
-static bool iot_client_message_handle_ota_confirm(iot_client_t *client,
-                                                  const uint8_t *bytes,
-                                                  size_t len)
-{
-    if (!client || !bytes || len == 0) return false;
-
-    cJSON *root = cJSON_ParseWithLength((const char *)bytes, len);
-    if (!root) return false;
-
-    cJSON *protocol = cJSON_GetObjectItem(root, "protocol");
-    if (!cJSON_IsNumber(protocol) ||
-        protocol->valueint != IOT_PROTOCOL_OTA_CONFIRM) {
-        cJSON_Delete(root);
-        return false;
-    }
-
-    if (!client->ota_confirm_callback) {
-        cJSON_Delete(root);
-        return false;
-    }
-
-    int channel = 0;
-    cJSON *data = cJSON_GetObjectItem(root, "data");
-    cJSON *firmware_type = data ? cJSON_GetObjectItem(data, "firmwareType") : NULL;
-    if (cJSON_IsNumber(firmware_type)) {
-        channel = firmware_type->valueint;
-    }
-
-    log_info("ota confirm: app-confirmed upgrade notice received (channel=%d)",
-             channel);
-    client->ota_confirm_callback(channel, client->ota_confirm_user_data);
-
-    cJSON_Delete(root);
-    return true;
-}
 
 static void mqtt_message_handler(const char *topic, size_t topic_len,
                                  const uint8_t *payload, size_t payload_len,
@@ -128,25 +37,24 @@ static void mqtt_message_handler(const char *topic, size_t topic_len,
                  (int)dump_len, (const char *)decrypted,
                  decrypted_len > 200 ? "..." : "");
 
-        if (iot_client_message_handle_cloud_remove(client, decrypted, decrypted_len)) {
-            client->pal->free(decrypted);
-            return;
-        }
-
-        if (iot_client_message_handle_ota_confirm(client, decrypted, decrypted_len)) {
-            client->pal->free(decrypted);
-            return;
-        }
-
-        /* Offer the plaintext to the DP layer first; if it does not consume it,
-         * forward to the user's raw message callback (backward compatible). */
-        bool dp_consumed = iot_dp_dispatch_downlink(client, topic, topic_len,
-                                                    decrypted, decrypted_len);
-        log_info("[MQTT-RX] dp_dispatch=%s %s",
-                 dp_consumed ? "consumed" : "pass-through",
-                 client->message_callback ? "-> user_cb" : "(no user_cb)");
-        if (!dp_consumed && client->message_callback) {
-            client->message_callback(topic, topic_len, decrypted, decrypted_len);
+        /* Check for cloud device-remove (protocol 11) before DP dispatch:
+         * reset notices must work in loose mode (no schema) and must not
+         * leak into the DP layer or raw message callback. */
+        if (iot_client_message_handle_reset(client, decrypted, decrypted_len)) {
+            /* consumed: reset notices never reach the DP layer or raw callback */
+        } else if (iot_client_message_handle_ota_confirm(client, decrypted, decrypted_len)) {
+            /* consumed: APP-confirmed OTA notices never reach the DP/raw path */
+        } else {
+            /* Offer the plaintext to the DP layer first; if it does not consume it,
+             * forward to the user's raw message callback (backward compatible). */
+            bool dp_consumed = iot_dp_dispatch_downlink(client, topic, topic_len,
+                                                        decrypted, decrypted_len);
+            log_info("[MQTT-RX] dp_dispatch=%s %s",
+                     dp_consumed ? "consumed" : "pass-through",
+                     client->message_callback ? "-> user_cb" : "(no user_cb)");
+            if (!dp_consumed && client->message_callback) {
+                client->message_callback(topic, topic_len, decrypted, decrypted_len);
+            }
         }
     } else {
         /* Decryption failed: never feed raw ciphertext to the DP parser. */
@@ -159,6 +67,99 @@ static void mqtt_message_handler(const char *topic, size_t topic_len,
     client->pal->free(decrypted);
 }
 
+bool iot_client_message_handle_reset(iot_client_t *client,
+                                     const uint8_t *bytes, size_t len)
+{
+    if (!client || !bytes || len == 0) return false;
+
+    cJSON *root = cJSON_ParseWithLength((const char *)bytes, len);
+    if (!root) return false;
+
+    cJSON *jproto = cJSON_GetObjectItem(root, "protocol");
+    if (!cJSON_IsNumber(jproto) || jproto->valueint != IOT_PROTO_GW_RESET) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    /* Not opted in: leave protocol 11 on the raw message_callback path,
+     * as v0.1.0-v0.3.0 did. */
+    if (!client->reset_callback) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    /* data.gwId: the removed device id. TuyaOpen only logs it; we defensively
+     * consume-but-skip if it doesn't match our devid (broker anomaly). */
+    cJSON *data = cJSON_GetObjectItem(root, "data");
+    if (data) {
+        cJSON *jgw = cJSON_GetObjectItem(data, "gwId");
+        if (jgw && cJSON_IsString(jgw) && client->devid[0] != '\0') {
+            if (strcmp(jgw->valuestring, client->devid) != 0) {
+                log_warn("reset: gwId mismatch (got '%s', expected '%s') — consumed, not ours",
+                         jgw->valuestring, client->devid);
+                cJSON_Delete(root);
+                return true;
+            }
+        }
+    }
+
+    /* Classify: root-level "type":"reset_factory" → factory, else unbind.
+     * Mirrors TuyaOpen tuya_iot.c:316-322 (type is on the root object, not
+     * inside data). */
+    iot_reset_type_t type = IOT_RESET_REMOTE_UNBIND;
+    cJSON *jtype = cJSON_GetObjectItem(root, "type");
+    if (jtype && cJSON_IsString(jtype) &&
+        strcmp(jtype->valuestring, "reset_factory") == 0) {
+        type = IOT_RESET_REMOTE_FACTORY;
+    }
+
+    log_warn("reset: device-remove notice received (type=%s)",
+             type == IOT_RESET_REMOTE_FACTORY ? "factory" : "unbind");
+
+    client->reset_callback(type, client->reset_user_data);
+
+    cJSON_Delete(root);
+    return true;
+}
+
+bool iot_client_message_handle_ota_confirm(iot_client_t *client,
+                                            const uint8_t *bytes, size_t len)
+{
+    if (!client || !bytes || len == 0) return false;
+
+    cJSON *root = cJSON_ParseWithLength((const char *)bytes, len);
+    if (!root) return false;
+
+    cJSON *jproto = cJSON_GetObjectItem(root, "protocol");
+    if (!cJSON_IsNumber(jproto) || jproto->valueint != IOT_PROTO_UPGRADE_REQUEST) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    /* Not opted in: preserve the pre-callback behavior and expose protocol 15
+     * to the raw message_callback for applications that parse it themselves. */
+    if (!client->ota_confirm_callback) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    /* TuyaOpen treats a missing firmwareType as the main firmware channel.
+     * A malformed value follows the same default rather than rejecting an
+     * otherwise-authenticated cloud notice. */
+    int channel = 0;
+    cJSON *data = cJSON_GetObjectItem(root, "data");
+    cJSON *jchannel = data ? cJSON_GetObjectItem(data, "firmwareType") : NULL;
+    if (cJSON_IsNumber(jchannel)) {
+        channel = jchannel->valueint;
+    }
+
+    log_info("ota confirm: app-confirmed upgrade notice received (channel=%d)", channel);
+    client->ota_confirm_callback(channel, client->ota_confirm_user_data);
+
+    cJSON_Delete(root);
+    return true;
+}
+
 static int iot_client_message_try_connect(iot_client_t *client)
 {
     /* Connect is rare (not a hot path); the subscribe topic lives on the stack
@@ -167,13 +168,17 @@ static int iot_client_message_try_connect(iot_client_t *client)
     char subscribe_topic[64];
     int sn_ret = snprintf(subscribe_topic, sizeof(subscribe_topic),
              "smart/device/in/%s", client->devid);
-    if (sn_ret < 0 || (size_t)sn_ret >= (int)sizeof(subscribe_topic))
+    if (sn_ret < 0 || (size_t)sn_ret >= (int)sizeof(subscribe_topic)) {
+        log_error("Failed to build subscribe topic: %d", sn_ret);
         return OPRT_COMMUNICATION_ERROR;
+    }
 
     char password[17] = {0};
     int md5_ret = iot_md5_password(client->secret_key, password);
-    if (md5_ret != 0)
+    if (md5_ret != 0) {
+        log_error("iot_md5_password failed: %d", md5_ret);
         return OPRT_COMMUNICATION_ERROR;
+    }
 
     mqtt_tls_config_t tls_cfg = { .cacert = client->cacert,
                                   .cert_bundle_attach = client->cert_bundle_attach };
@@ -219,6 +224,19 @@ int iot_client_message_connect(iot_client_t *client)
 {
     if (!client || client->mqtt_url[0] == '\0' || client->devid[0] == '\0') {
         return OPRT_INVALID_PARAMETER;
+    }
+
+    /* Already connected is success, not a reason to build a second link.
+     * iot_client_message_try_connect() assigns client->mqtt unconditionally, so
+     * without this the previous mqtt client, its packet buffer and its open
+     * socket leak with no handle left to free them. Easy to hit now that
+     * iot_client_connect() is public and documented as *the* way to bring the
+     * link up: an app that also left mqtt_auto_connect true calls it on an
+     * already-connected client. To force a fresh link, disconnect first. */
+    if (client->mqtt) {
+        log_warn("iot_client_message_connect: already connected, ignoring "
+                 "(call iot_client_disconnect() first to reconnect)");
+        return OPRT_OK;
     }
 
     return iot_client_message_try_connect(client);
@@ -277,6 +295,7 @@ int iot_client_message_publish(iot_client_t *client,
     int sn = snprintf(pub_topic, sizeof(pub_topic),
                       "smart/device/out/%s", client->devid);
     if (sn < 0 || (size_t)sn >= sizeof(pub_topic)) {
+        log_error("Failed to build publish topic: %d", sn);
         client->pal->free(encrypted);
         return OPRT_COMMUNICATION_ERROR;
     }

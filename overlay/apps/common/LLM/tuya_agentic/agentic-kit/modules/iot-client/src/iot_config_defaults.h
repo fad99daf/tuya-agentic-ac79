@@ -25,7 +25,7 @@
 #define IOT_CN_PRE_HOST "a1-cn.wgine.com"
 #define IOT_AZ_HOST "a1.tuyaus.com"
 #define IOT_AZ_PRE_HOST "a1-us.wgine.com"
-#define IOT_UEAZ_HOST "a1-ueaz.tuyaeu.com"
+#define IOT_UEAZ_HOST "a1-ueaz.tuyaus.com"
 #define IOT_UEAZ_PRE_HOST "a1-ueaz.wgine.com"
 #define IOT_EU_HOST "a1.tuyaeu.com"
 #define IOT_EU_PRE_HOST "a1-eu.wgine.com"
@@ -50,7 +50,7 @@
 #ifndef IOT_SDK_BV
 #define IOT_SDK_BV      "2.0"
 #endif
-#define SDK_VERSION "agentic-kit_0.1.0"
+#define SDK_VERSION "agentic-kit_0.4.0"
 
 /**
  * @brief Get the built-in default PAL adapter (POSIX or FreeRTOS).

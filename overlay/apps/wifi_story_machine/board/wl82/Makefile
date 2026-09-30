@@ -455,6 +455,7 @@ c_SRC_FILES := \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop_base.c \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/cipher_wrapper.c \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/http_client_interface.c \
+	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_atop.c \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client.c \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client_message.c \
 	../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_dns.c \

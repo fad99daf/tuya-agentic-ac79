@@ -67,25 +67,33 @@ _Avoid_: packet type (the wire kind), stream flag (chunk position), command.
 
 **Sign level**:
 How each Frame is authenticated: `NONE`, `HMAC_SHA1` (20-byte sig), or `HMAC_SHA256`
-(32-byte sig) (`TAI_SIGN_*`). ClientHello is the one Frame sent unsigned.
-_Avoid_: encryption (signing ≠ confidentiality), auth mode.
+(32-byte sig) (`TAI_SIGN_*`). The names are wire labels, not algorithm choices — there is no
+SHA-1 primitive in `tai_crypto.c`; both signed levels compute HMAC-SHA256 into a 32-byte buffer
+and `HMAC_SHA1` merely ships its first 20 bytes. ClientHello is the one Frame sent unsigned.
+_Avoid_: encryption (signing ≠ confidentiality), auth mode, "the SHA-1 signature".
 
 **Keepalive (Ping / Pong)**:
 The liveness exchange the background thread runs: it sends a Ping every `ping_interval_ms`
 (default 60 s) and treats the Connection as dead if no inbound traffic — a Pong *or any*
 received data — arrives within `ping_timeout_ms` (default 90 s), then fires `on_disconnect`.
 Counting any receive, not just Pong, keeps a long downstream stream from tripping a spurious
-timeout (see [ADR 0001](docs/adr/0001-receive-worker-callback-greedy-nest.md)).
+timeout.
 _Avoid_: heartbeat, poll.
 
 **Chat break**:
 A client-sent Event (`TAI_EVT_CHAT_BREAK`) that interrupts the server's in-progress
-response. Sent standalone, not part of an Event's normal lifecycle.
+response. Sent standalone, not part of an Event's normal lifecycle. The server also sends
+the same event type *down* — as the cloud-VAD turn boundary (user stopped speaking, or
+spoke over the reply): the device clears the interrupted turn's downlink and keeps the
+uplink open. The current cloud no longer sends `TAI_EVT_SERVER_VAD`; a device must treat
+an inbound ChatBreak as the turn boundary.
 _Avoid_: cancel, stop, abort.
 
 **Server VAD**:
 A server-sent Event (`TAI_EVT_SERVER_VAD`) signalling that voice-activity detection found
-the end of the user's speech in audio mode.
+the end of the user's speech in audio mode. **Legacy**: the current cloud signals the
+turn boundary with an inbound ChatBreak instead and never sends this event; the constant
+stays for protocol compatibility. Do not build new handling on it.
 _Avoid_: silence detection, endpointing.
 
 **MCP command**:
@@ -125,7 +133,7 @@ with another sender (including the worker's Ping). The receive buffers are touch
 the worker, so receiving — and the user callbacks dispatched from it — is lock-free; mbedTLS
 read and write are serialised inside the TLS layer, so the worker can read while a caller
 writes. (The shared PAL mutex is *recursive*, but TAI does not rely on that — the recursion
-exists for the IoT DP layer; see [ADR 0001](docs/adr/0001-receive-worker-callback-greedy-nest.md).)
+exists for the IoT DP layer; see the `mutex_create` contract in `pal/pal.h`.)
 
 ### Sending
 
@@ -143,8 +151,17 @@ no large contiguous frame buffer:
 
 `send_one_frame_sg` signs the logical `[frame header || app header || payload]` via
 `tai_frame_hmac_sg` (byte-identical to the contiguous HMAC — the receiver is unchanged), then
-writes the merged `[frame header || app header]`, the **zero-copy payload**, and the signature
-(2–3 TLS records per Frame). A logical packet over 32 KB is fragmented across the concat, with the
+emits the frame in one of two shapes, split by `TAI_FRAME_COALESCE_LIMIT` (default 512 B,
+counting the whole frame: header, app header, payload, signature):
+
+- **Below the limit**: the frame is coalesced into `tx_ctrl_buf` and sent as ONE TLS record.
+  A control packet's payload already lives in `tx_ctrl_buf`, so it is only shifted in place
+  (memmove — payload and scratch are the same buffer, which is why the relocation happens
+  before the frame header overwrites its front).
+- **At or above the limit**: zero-copy, 2–3 TLS records — the merged
+  `[frame header || app header]`, the **payload from the caller's buffer**, and the signature.
+
+A logical packet over 32 KB is fragmented across the concat, with the
 app header only in the first Frame. (ClientHello is the one exception: it is sent *unsigned* and
 one-shot, so `tai_connect` frames it inline on the stack rather than through the signing sender.)
 
@@ -203,7 +220,8 @@ the media header, parses `audio-params` once per stream (sample rate, frame size
 START), splits concatenated constant-bitrate Opus by frame size, and delivers each frame to
 `on_audio`; **Text** strips the text header and delivers to `on_text` with its Stream flag;
 **Event** unpacks the Event type and data (EventEnd clears the open Event) and delivers to
-`on_event` — where ServerVAD, MCP commands, etc. surface; **ConnectionClose / SessionClose**
+`on_event` — where the inbound ChatBreak (the cloud-VAD turn boundary), MCP commands, etc.
+surface; **ConnectionClose / SessionClose**
 clear state and fire `on_disconnect`. An **unknown Packet type or Event type** (framing and HMAC
 valid, but the type is not enumerated) is *tolerated*: it is logged and skipped so the link stays
 up — a server that introduces a forward-compatible new type must not knock existing clients
@@ -234,8 +252,7 @@ freed memory. Because it joins the worker, it must run on a thread *other* than 
 (no join), so it is safe from any thread including a receive callback; the owning thread must
 still call `tai_disconnect` afterwards to join and release. Receive callbacks therefore have a
 re-entrancy contract — may call `tai_send_*`, must not call `tai_disconnect` / `tai_ctx_deinit`,
-must not block — captured in [ADR 0001](docs/adr/0001-receive-worker-callback-greedy-nest.md)
-and `tuya_ai.h`.
+must not block — captured in the callback-contract block in `tuya_ai.h`.
 
 ### Invariants
 
@@ -243,6 +260,13 @@ and `tuya_ai.h`.
   large, a single Frame stays well within it.
 - Reassembly trusts FIRST/MIDDLE/LAST ordering — safe over the reliable, in-order Connection.
 - ClientHello is the only unsigned Frame.
+- Only sign levels 1 and 2 map to a signature length; any other value falls through to
+  `sig_len = 0`, which disables signing in *both* directions — every Frame ships unsigned and
+  `tai_frame_verify` returns OK without looking — while ClientHello's security suite still
+  advertises that level byte. A configured `sign_level` of 0 is not that case: zero reads as
+  "unset" and becomes HMAC_SHA256. Nothing local catches a wrong choice here — the loopback
+  server derives keys and signs through the very same functions as the client, so even a wrong
+  algorithm round-trips.
 
 ## Example dialogue
 
@@ -256,8 +280,8 @@ and `tuya_ai.h`.
 > wrapped in a Frame with a sequence number and an HMAC signature at your sign level.
 > **Dev:** The reply comes back on `on_text`?
 > **Expert:** Right — server text arrives on `on_text` with a stream flag (START…END for a
-> streamed answer), audio on `on_audio`, and everything else on `on_event`: ServerVAD,
-> EventEnd, and MCP commands.
+> streamed answer), audio on `on_audio`, and everything else on `on_event`: the inbound
+> ChatBreak (cloud-VAD turn boundary), EventEnd, and MCP commands.
 > **Dev:** When the server asks me to run a tool?
 > **Expert:** That's an `on_event` with event type MCPCmd (1000) carrying JSON-RPC. You run
 > it and reply with `tai_send_mcp_response`. To cut the model off mid-answer, send a chat
