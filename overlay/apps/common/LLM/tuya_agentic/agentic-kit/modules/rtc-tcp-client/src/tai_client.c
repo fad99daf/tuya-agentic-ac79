@@ -119,21 +119,23 @@ static inline void ctx_io_close(tai_ctx_t *ctx)
 
 /* Decode + log an outgoing application packet.  Separated from send_app
  * so the stack-allocated attr array only exists during the log call. */
+#if AGENTIC_KIT_TAI_LOG_LEVEL >= 3
 static void log_send_packet(tai_ctx_t *ctx,
-                            const uint8_t *app_bytes, size_t app_len)
+                             const uint8_t *app_bytes, size_t app_len)
 {
     uint8_t     pkt_type;
-    tai_attr_t  attrs[TAI_MAX_ATTRS];
+    tai_attr_t  attrs[AGENTIC_KIT_TAI_MAX_ATTRS];
     int         attr_count = 0;
     const uint8_t *payload;
     size_t         payload_len;
     if (tai_packet_decode(ctx->proto_ver, app_bytes, app_len,
-                          &pkt_type, attrs, TAI_MAX_ATTRS, &attr_count,
+                          &pkt_type, attrs, AGENTIC_KIT_TAI_MAX_ATTRS, &attr_count,
                           &payload, &payload_len) == TAI_OK) {
         tai_log_packet(ctx->proto_ver, 1,
                        pkt_type, attrs, attr_count, payload, payload_len);
     }
 }
+#endif
 
 /* =========================================================================
  * Scatter-gather streaming send (§6)
@@ -195,7 +197,7 @@ static int send_one_frame_sg(tai_ctx_t *ctx, uint8_t frag_flag, uint16_t seq,
      * the frame header overwrites its front; the HMAC above sampled the
      * original bytes, which the in-place shift preserves. Capped by the smaller
      * of the coalesce limit and tx_ctrl_buf so shrinking either knob stays safe. */
-    if (wire_len < TAI_FRAME_COALESCE_LIMIT &&
+    if (wire_len < AGENTIC_KIT_TAI_FRAME_COALESCE_LIMIT &&
         wire_len <= sizeof(ctx->tx_ctrl_buf)) {
         uint8_t *buf = ctx->tx_ctrl_buf;
         if (pay_len)                                  /* pay is NULL when 0 */
@@ -229,11 +231,11 @@ static int send_app_sg(tai_ctx_t *ctx, size_t hdr_len,
                        const uint8_t *payload, size_t payload_len)
 {
     if (TAI_FRAME_HDR_LEN + hdr_len > sizeof(ctx->tx_hdr_buf)) return TAI_ERR_MEM;
-    if (hdr_len >= TAI_MAX_FRAGMENT_PAYLOAD)                   return TAI_ERR_MEM;
+    if (hdr_len >= AGENTIC_KIT_TAI_MAX_FRAGMENT_PAYLOAD)                   return TAI_ERR_MEM;
 
     size_t total = hdr_len + payload_len;
 
-    if (total <= TAI_MAX_FRAGMENT_PAYLOAD) {
+    if (total <= AGENTIC_KIT_TAI_MAX_FRAGMENT_PAYLOAD) {
         uint16_t seq = tai_next_seq(ctx);
         int rc = send_one_frame_sg(ctx, TAI_FRAG_NONE, seq,
                                    hdr_len, payload, payload_len);
@@ -245,12 +247,12 @@ static int send_app_sg(tai_ctx_t *ctx, size_t hdr_len,
     }
 
     /* Fragment over the logical hdr||payload concat. The header lives only in
-     * the first fragment (hdr_len < TAI_MAX_FRAGMENT_PAYLOAD guarantees the
+     * the first fragment (hdr_len < AGENTIC_KIT_TAI_MAX_FRAGMENT_PAYLOAD guarantees the
      * whole header plus some payload fits the first chunk). */
     size_t offset = 0;
     while (offset < total) {
         size_t chunk = total - offset;
-        if (chunk > TAI_MAX_FRAGMENT_PAYLOAD) chunk = TAI_MAX_FRAGMENT_PAYLOAD;
+        if (chunk > AGENTIC_KIT_TAI_MAX_FRAGMENT_PAYLOAD) chunk = AGENTIC_KIT_TAI_MAX_FRAGMENT_PAYLOAD;
         uint8_t flag = (offset == 0)                ? TAI_FRAG_FIRST
                      : (offset + chunk >= total)    ? TAI_FRAG_LAST
                                                     : TAI_FRAG_MIDDLE;
@@ -297,8 +299,9 @@ static int send_app_sg(tai_ctx_t *ctx, size_t hdr_len,
  * tai_connect (sig_len=0). */
 static int send_app(tai_ctx_t *ctx, const uint8_t *app_bytes, size_t app_len)
 {
-    if (log_get_level() >= LOG_INFO)
-        log_send_packet(ctx, app_bytes, app_len);
+#if AGENTIC_KIT_TAI_LOG_LEVEL >= 3
+    log_send_packet(ctx, app_bytes, app_len);
+#endif
     return send_app_sg(ctx, /*hdr_len=*/0, app_bytes, app_len);
 }
 
@@ -346,6 +349,7 @@ tai_ctx_t *tai_ctx_init(void *mem, const tai_config_t *cfg)
     ctx->on_image              = cfg->on_image;
     ctx->on_event              = cfg->on_event;
     ctx->on_disconnect         = cfg->on_disconnect;
+    ctx->on_flow_control       = cfg->on_flow_control;
     ctx->user_data             = cfg->user_data;
 
     ctx->ping_interval_ms  = cfg->ping_interval_ms  ? cfg->ping_interval_ms  : 60000U;
@@ -408,7 +412,7 @@ void tai_ctx_deinit(tai_ctx_t *ctx)
 /* Forward declarations (defined below; used by the confirmed-connect wait) */
 static void *worker_thread(void *arg);
 static int   tai_recv_data(tai_ctx_t *ctx, uint32_t timeout_ms);
-static int   tai_process_rx(tai_ctx_t *ctx);
+static int   tai_process_rx(tai_ctx_t *ctx, int *paused);
 
 int tai_connect(tai_ctx_t *ctx)
 {
@@ -440,7 +444,7 @@ int tai_connect(tai_ctx_t *ctx)
         TAI_LOGE(ctx->pal, TAG, "key derivation failed: %d", rc);
         return rc;
     }
-    TAI_LOGD(ctx->pal, TAG, "keys derived (ikm_len=%u)", ikm_len);
+    TAI_LOGD(ctx->pal, TAG, "keys derived (ikm_len=%zu)", ikm_len);
 
     /* 3. TLS connect (or raw TCP in test mode) */
     if (ctx->disable_tls) {
@@ -481,11 +485,11 @@ int tai_connect(tai_ctx_t *ctx)
 
     uint16_t seq = tai_next_seq(ctx);
     /* 5-byte frame hdr + the ClientHello app block (built into tx_ctrl_buf, so
-     * bounded by TAI_TX_CTRL_BUF_SIZE). Sized to that bound rather than a fixed
+     * bounded by AGENTIC_KIT_TAI_TX_CTRL_BUF_SIZE). Sized to that bound rather than a fixed
      * 256 so a long client_id/device_id frames fine — the only limit is the
      * same tx_ctrl_buf that the build step already enforces. Unsigned, so no
      * signature trailer. */
-    uint8_t ch_frame[TAI_FRAME_HDR_LEN + TAI_TX_CTRL_BUF_SIZE];
+    uint8_t ch_frame[TAI_FRAME_HDR_LEN + AGENTIC_KIT_TAI_TX_CTRL_BUF_SIZE];
     int frame_len = tai_frame_encode(TAI_FRAG_NONE, seq,
                                       ctx->tx_ctrl_buf, (size_t)app_len,
                                       ctx->sign_key, 0,  /* sig_len=0 */
@@ -498,8 +502,9 @@ int tai_connect(tai_ctx_t *ctx)
         TAI_LOGE(ctx->pal, TAG, "send ClientHello failed: %d", rc);
         tai_disconnect(ctx); return rc;
     }
-    if (log_get_level() >= LOG_INFO)
-        log_send_packet(ctx, ctx->tx_ctrl_buf, (size_t)app_len);
+#if AGENTIC_KIT_TAI_LOG_LEVEL >= 3
+    log_send_packet(ctx, ctx->tx_ctrl_buf, (size_t)app_len);
+#endif
 
     /* 5. SessionNew */
     app_len = tai_proto_build_session_new(ctx,
@@ -540,7 +545,7 @@ int tai_connect(tai_ctx_t *ctx)
                 tai_disconnect(ctx); return TAI_ERR_NET;
             }
             if (n > 0) {
-                int fatal = tai_process_rx(ctx);
+                int fatal = tai_process_rx(ctx, NULL);
                 if (fatal != TAI_OK) {
                     TAI_LOGE(ctx->pal, TAG, "connect: protocol error before ack (%d)", fatal);
                     tai_disconnect(ctx); return TAI_ERR_PROTO;
@@ -602,7 +607,7 @@ void tai_disconnect(tai_ctx_t *ctx)
     TAI_LOGI(ctx->pal, TAG, "disconnecting");
 
     /* Stop and join the background worker FIRST. With running=0 the worker exits
-     * its next loop pass -- bounded by TAI_WORKER_POLL_CAP_MS (~200 ms) even when
+     * its next loop pass -- bounded by AGENTIC_KIT_TAI_WORKER_POLL_CAP_MS (~200 ms) even when
      * idle, so this no longer blocks up to a whole ping interval. Joining BEFORE
      * we send SessionClose / close the socket is deliberate: it guarantees the
      * worker can neither (a) race our send on the shared TX buffers, nor (b)
@@ -644,6 +649,9 @@ void tai_disconnect(tai_ctx_t *ctx)
     ctx->rx_len     = 0;
     ctx->frag_len   = 0;
     ctx->frag_state = 0;
+    ctx->rx_pending_len      = 0;  /* teardown drops a paused Packet remainder */
+    ctx->rx_pending_wire_len = 0;
+    ctx->rx_pending_body     = NULL;
     ctx->connecting = 0;          /* clear in case a connect aborted mid-handshake */
     ctx->disconnect_emitted = 0;  /* re-arm the single-point on_disconnect      */
     ctx->rx_event_id[0] = '\0';   /* clear latched turn id so a reconnect starts clean */
@@ -658,7 +666,7 @@ static int process_app_packet(tai_ctx_t *ctx,
                                const uint8_t *app_bytes, size_t app_len)
 {
     uint8_t     pkt_type;
-    tai_attr_t  attrs[TAI_MAX_ATTRS];
+    tai_attr_t  attrs[AGENTIC_KIT_TAI_MAX_ATTRS];
     int         attr_count = 0;
     const uint8_t *payload;
     size_t         payload_len;
@@ -666,10 +674,10 @@ static int process_app_packet(tai_ctx_t *ctx,
     int rc = tai_packet_decode(ctx->proto_ver,
                                 app_bytes, app_len,
                                 &pkt_type,
-                                attrs, TAI_MAX_ATTRS, &attr_count,
+                                attrs, AGENTIC_KIT_TAI_MAX_ATTRS, &attr_count,
                                 &payload, &payload_len);
     if (rc != TAI_OK) {
-        TAI_LOGW(ctx->pal, TAG, "packet decode failed: %d (app_len=%u)", rc, app_len);
+        TAI_LOGW(ctx->pal, TAG, "packet decode failed: %d (app_len=%zu)", rc, app_len);
         return TAI_PROTO_ERR_PKT_DECODE;   /* fatal cause, returned to the worker */
     }
 
@@ -719,15 +727,55 @@ static int tai_recv_data(tai_ctx_t *ctx, uint32_t timeout_ms)
  * Returns a fail-fast cause for the worker: TAI_OK (no fatal; processed zero or
  * more frames), a TAI_PROTO_ERR_* detail on a protocol error, or
  * TAI_RX_PEER_CLOSE|code on a server CONNECTION_CLOSE. Never touches the
- * connection lifecycle itself — the worker owns that.
+ * connection lifecycle itself — the worker owns that. Sets @p paused when
+ * admission closes between complete Frames; NULL disables flow control during
+ * the synchronous connect handshake.
  * ========================================================================= */
-static int tai_process_rx(tai_ctx_t *ctx)
+static int tai_process_rx(tai_ctx_t *ctx, int *paused)
 {
+    if (paused) *paused = 0;
+
     /* Process all complete frames sitting in rx_buf. Any structural error is
      * fail-fast: on a reliable, ordered TLS stream a desync cannot be recovered
      * by dropping bytes/frames, so we RETURN the cause and let the worker tear
      * the connection down (the app reconnects). */
     while (ctx->rx_len >= 5) {
+        /* One receive may contain several complete Frames. Stop before the next
+         * one when the consumer fills while dispatching the previous Frame.
+         * The leading paused gate (not the helper) is what keeps this
+         * checkpoint dark during the connect handshake (paused == NULL). */
+        if (paused && tai_rx_admission_paused(ctx)) {
+            *paused = 1;
+            break;
+        }
+
+        /* A codec-frame callback may have filled the app queue mid-Packet.
+         * Re-dispatching the Frame here would replay accepted bytes; drain only
+         * its explicit pending remainder instead. Once it drains, slide the
+         * pinned Frame out from rx_buf so the next loop starts at the Frame
+         * behind it. */
+        if (ctx->rx_pending_len) {
+            if (tai_proto_drain_pending_audio(ctx)) {
+                if (paused) *paused = 1;
+                break;
+            }
+            /* The pinned Frame must be consumed exactly once. A zero or
+             * oversized length would underflow rx_len (a huge memmove) or
+             * leave the Frame in place to be dispatched again, so fail fast
+             * instead of silently desyncing the stream. */
+            size_t wire_len = ctx->rx_pending_wire_len;
+            if (wire_len < 5 || wire_len > ctx->rx_len) {
+                TAI_LOGE(ctx->pal, TAG,
+                         "pending slide out of range: wire=%zu rx=%zu",
+                         wire_len, ctx->rx_len);
+                return TAI_PROTO_ERR_FRAME_DECODE;
+            }
+            memmove(ctx->rx_buf, ctx->rx_buf + wire_len, ctx->rx_len - wire_len);
+            ctx->rx_len -= wire_len;
+            ctx->rx_pending_wire_len = 0;
+            continue;
+        }
+
         /* Detect version from first byte */
         int ver = tai_frame_detect_version(ctx->rx_buf[0]);
         if (ver < 0) {
@@ -745,7 +793,7 @@ static int tai_process_rx(tai_ctx_t *ctx)
          * the server ignores the advertised MAX_FRAGMENT_LEN. */
         if (needed > sizeof(ctx->rx_buf)) {
             TAI_LOGE(ctx->pal, TAG,
-                     "inbound frame %u B exceeds rx_buf %u B (server ignored MAX_FRAGMENT_LEN?)",
+                     "inbound frame %zu B exceeds rx_buf %zu B (server ignored MAX_FRAGMENT_LEN?)",
                      needed, sizeof(ctx->rx_buf));
             return TAI_PROTO_ERR_OVERSIZED;
         }
@@ -755,7 +803,7 @@ static int tai_process_rx(tai_ctx_t *ctx)
         int rc = tai_frame_verify(ctx->rx_buf, needed,
                                    ctx->sig_len, ctx->sign_key, ctx->pal);
         if (rc != TAI_OK) {
-            TAI_LOGW(ctx->pal, TAG, "HMAC verify failed (frame=%u bytes)", needed);
+            TAI_LOGW(ctx->pal, TAG, "HMAC verify failed (frame=%zu bytes)", needed);
             return TAI_PROTO_ERR_HMAC;
         }
 
@@ -818,9 +866,24 @@ static int tai_process_rx(tai_ctx_t *ctx)
                 return fatal;   /* PROTOCOL detail or TAI_RX_PEER_CLOSE|code */
         }
 
+        /* A mid-Packet pause pins this Frame's front; the paused body pointer
+         * therefore remains valid until the remainder drains. Once it drains,
+         * the pending-drain path above already slid the Frame, so this code
+         * runs only for the no-pending fast path. */
+        if (ctx->rx_pending_len) {
+            ctx->rx_pending_wire_len = needed;
+            if (paused) *paused = 1;
+            break;
+        }
+
         /* Consume frame from rx_buf */
         memmove(ctx->rx_buf, ctx->rx_buf + needed, ctx->rx_len - needed);
         ctx->rx_len -= needed;
+
+        /* During tai_connect(), stop immediately after the acknowledgement.
+         * Coalesced media stays buffered for the worker, preserving the public
+         * contract that application receive callbacks run on that thread. */
+        if (ctx->connecting && ctx->session_ack >= 0) break;
     }
 
     return TAI_OK;
@@ -904,7 +967,7 @@ static int send_text_locked(tai_ctx_t *ctx, const char *text, size_t len)
 int tai_send_text(tai_ctx_t *ctx, const char *text, size_t len)
 {
     if (!ctx || !ctx->connected || !text) return TAI_ERR_ARGS;
-    TAI_LOGI(ctx->pal, TAG, "send_text: %u bytes", len);
+    TAI_LOGI(ctx->pal, TAG, "send_text: %zu bytes", len);
     ctx_lock(ctx);
     int rc = send_text_locked(ctx, text, len);
     ctx_unlock(ctx);
@@ -1069,7 +1132,7 @@ int tai_send_image(tai_ctx_t *ctx,
                    uint8_t format, uint16_t width, uint16_t height)
 {
     if (!ctx || !ctx->connected || !data) return TAI_ERR_ARGS;
-    TAI_LOGI(ctx->pal, TAG, "send_image: %u bytes fmt=%u %ux%u",
+    TAI_LOGI(ctx->pal, TAG, "send_image: %zu bytes fmt=%u %ux%u",
              len, format, width, height);
     ctx_lock(ctx);
     int rc = send_image_locked(ctx, data, len, format, width, height);
@@ -1141,7 +1204,7 @@ int tai_send_image_with_text(tai_ctx_t *ctx,
                              uint16_t width, uint16_t height)
 {
     if (!ctx || !ctx->connected || !text || !img_data) return TAI_ERR_ARGS;
-    TAI_LOGI(ctx->pal, TAG, "send_image_with_text: text=%u img=%u bytes",
+    TAI_LOGI(ctx->pal, TAG, "send_image_with_text: text=%zu img=%zu bytes",
              text_len, img_len);
     ctx_lock(ctx);
     int rc = send_image_with_text_locked(ctx, text, text_len,
@@ -1260,6 +1323,13 @@ int tai_send_mcp_response(tai_ctx_t *ctx, const char *json_rpc_response)
  * Drives recv + dispatch in a loop, sends periodic pings, detects pong
  * timeouts.  Auto-started by tai_connect(), stopped by tai_disconnect().
  *
+ * Receive backpressure: admission (tai_rx_admission_paused(), i.e. the
+ * on_flow_control hook) is queried at four checkpoints — pass top, before
+ * each drain read, between buffered Frames (tai_process_rx), and before each
+ * codec-frame callback (tai_protocol.c). See tuya_ai.h on_flow_control and
+ * ADR 0001 for the contract; the paused branches below each consume one
+ * facet of that state.
+ *
  * Locking: the mbedTLS read/write mutex now lives inside the shared TLS module
  * (tls_write / tls_read, granularity = a single ssl_* call), so the worker no
  * longer needs to wrap recv+dispatch in ctx_lock.  rx_buf / frag_buf are touched
@@ -1272,6 +1342,10 @@ static void *worker_thread(void *arg)
     tai_ctx_t *ctx = (tai_ctx_t *)arg;
     TAI_LOGD(ctx->pal, TAG, "worker: started");
 
+    int paused = 0;
+    int resume_buffered = ctx->rx_len > 0;
+    uint64_t last_resume_ms = 0;
+
     /* The worker owns the disconnect decision: lower layers RETURN a fatal
      * cause, transport faults are detected here, and we fire on_disconnect once
      * on exit. f_reason==0xFF means a clean stop (tai_disconnect / request). */
@@ -1280,14 +1354,20 @@ static void *worker_thread(void *arg)
     uint16_t f_code   = 0;
 
     while (ctx->running) {
-        uint64_t now = ctx->pal->time_ms();
+        int was_paused = paused;
+        paused = tai_rx_admission_paused(ctx);
+        if (!ctx->running) break;
 
-        /* Liveness timeout: any inbound traffic counts as alive, not just
-         * PONGs. A busy downstream stream proves the link is up even while a
-         * ping is overdue, so we never kill an actively-receiving connection. */
+        uint64_t now = ctx->pal->time_ms();
+        if (was_paused && !paused) last_resume_ms = now;
+
+        /* Any inbound traffic proves liveness. An intentional receive pause
+         * suspends this deadline; reopening admission grants a fresh budget
+         * without pretending any bytes were received. */
         uint64_t last_alive = (ctx->last_rx_ms > ctx->last_pong_ms)
                                   ? ctx->last_rx_ms : ctx->last_pong_ms;
-        if (now - last_alive > ctx->ping_timeout_ms) {
+        if (last_resume_ms > last_alive) last_alive = last_resume_ms;
+        if (!paused && now - last_alive > ctx->ping_timeout_ms) {
             TAI_LOGW(ctx->pal, TAG, "worker: liveness timeout (%llu ms idle)",
                      (unsigned long long)(now - last_alive));
             f_reason = TAI_DISCONNECT_TRANSPORT;
@@ -1337,13 +1417,32 @@ static void *worker_thread(void *arg)
                                ? 1
                                : (uint32_t)(ctx->ping_interval_ms - since_ping);
         /* Cap the idle block so tai_disconnect (running=0) is noticed within
-         * ~TAI_WORKER_POLL_CAP_MS instead of waiting out a whole ping interval. */
-        if (wait_ms > TAI_WORKER_POLL_CAP_MS) wait_ms = TAI_WORKER_POLL_CAP_MS;
+         * ~AGENTIC_KIT_TAI_WORKER_POLL_CAP_MS instead of waiting out a whole ping interval. */
+        if (wait_ms > AGENTIC_KIT_TAI_WORKER_POLL_CAP_MS) wait_ms = AGENTIC_KIT_TAI_WORKER_POLL_CAP_MS;
+
+        /* Pausing skips the read so the receive window can close. Keep Ping and
+         * shutdown housekeeping active while admission is closed. */
+        if (paused) {
+            ctx->pal->sleep_ms(AGENTIC_KIT_TAI_FLOW_CONTROL_POLL_MS);
+            continue;
+        }
 
         uint64_t drain_start = ctx->pal->time_ms();
-        int n = tai_recv_data(ctx, wait_ms);
+        /* A pending codec-frame remainder is not extra inbound bytes. Enter the
+         * drain directly so reopening admission resumes it without requiring a
+         * new receive; a pending rx_buf remainder also keeps the Frame pinned,
+         * making rx_len a valid resume marker. Partial input returns to a
+         * bounded blocking receive rather than spinning. */
+        int n = ctx->rx_pending_len ? 1
+               : resume_buffered      ? (int)ctx->rx_len
+                                      : tai_recv_data(ctx, wait_ms);
+        resume_buffered = 0;
+        /* Set when this pass drained real input; gates the end-of-pass yield
+         * below so an idle pass (blocking wait timed out, no data) does not
+         * gain fixed latency on top of it. */
+        int did_work = (n > 0);
         while (n > 0 && ctx->running) {
-            int fatal = tai_process_rx(ctx);
+            int fatal = tai_process_rx(ctx, &paused);
             if (fatal != TAI_OK) {
                 if (fatal & TAI_RX_PEER_CLOSE) {
                     f_reason = TAI_DISCONNECT_CONNECTION_CLOSE;
@@ -1354,11 +1453,21 @@ static void *worker_thread(void *arg)
                 }
                 break;
             }
+            if (paused) {
+                /* Do not read past the buffered Frame that closed admission. */
+                resume_buffered = 1;
+                break;
+            }
+            if (!ctx->running) break;
             /* Bound the greedy drain so periodic ping / liveness / shutdown
              * checks run even under a sustained flood; leftover bytes wait for
              * the next pass. */
-            if (ctx->pal->time_ms() - drain_start > TAI_DRAIN_BUDGET_MS)
+            if (ctx->pal->time_ms() - drain_start > AGENTIC_KIT_TAI_DRAIN_BUDGET_MS)
                 break;
+            ctx->pal->sleep_ms(AGENTIC_KIT_TAI_WORKER_YIELD_MS);
+            /* Admission is checked immediately before the next drain read. */
+            paused = tai_rx_admission_paused(ctx);
+            if (paused || !ctx->running) break;
             n = tai_recv_data(ctx, 0);   /* drain remainder non-blocking */
         }
         if (f_reason != 0xFF) break;     /* fail-fast / CONNECTION_CLOSE during drain */
@@ -1377,7 +1486,11 @@ static void *worker_thread(void *arg)
         }
         /* n > 0: budget yield (running still set) -> loop, keep housekeeping.
          * n == TAI_ERR_AGAIN: wait timed out (ping due) or drain finished.
-         * running cleared with no fatal: a clean tai_request_disconnect. */
+         * running cleared with no fatal: a clean tai_request_disconnect.
+         * The yield applies only between drain passes that did work; an idle
+         * pass must not add fixed latency on top of its blocking wait. */
+        if (did_work)
+            ctx->pal->sleep_ms(AGENTIC_KIT_TAI_WORKER_YIELD_MS);
     }
 
     /* Single-point disconnect: fire on_disconnect exactly once if the worker

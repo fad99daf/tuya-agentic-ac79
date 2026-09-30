@@ -589,3 +589,24 @@ VM_OPT=0;//单备份...(原样不动)
 
 - 仅 2 文件:`agentic-kit/common/tls.c`、`agentic-kit/modules/iot-client/src/mqtt.c`;**patch 不重新生成**(Makefile/.cbp/app_config.h 未动,12 段照旧有效)。
 - 新增 `docs/UPSTREAM-BASE.md`(对照锚点:各子模块基线 SHA、机械适配重放清单、本地补丁台账、分阶段计划摘要)。
+
+## 2026-09-30 增量改动(agentic-kit 阶段 1:re-vendor 至 5f4d845)
+
+> 三路合并法(base=49ab2af / local=逆向适配 / theirs=5f4d845,LF 归一)整树步进;10 冲突按裁决表全解。收:DNS UE/WE、ATOP 缓冲可配、volatile 密钥清零、激活 v2.0、iot_client_reset v5.0、iot_atop_call、小帧合并、多模态、protocol11/15 opt-in、上游版 iot_ota_verify.c;Makefile/.cbp +iot_atop.c。clang 预检 35/35 绿;板测 4/6 绿(配网/对话打断/DP/K6),OTA 与 soak 并入阶段 2 一并测。tag `align-phase1-5f4d845` 待板测全绿后打在 647ec00。详见 `UPSTREAM-BASE.md` §2/§3。
+
+## 2026-09-30 增量改动(agentic-kit 阶段 2:re-vendor 至 48e3c0c / 0.5.0)
+
+> 上游 BREAKING 重构 + PR#42 背压系列一并收编。三路合并(base=5f4d845 / local=阶段1树逆向适配 / theirs=48e3c0c)7 冲突全解,merged-vs-theirs 556 行逐行对账:ConnectionRefresh/长流v3 event_id/OTA 双API/send_only/schema 自愈/[MQTT-RX]/SG PRE/tls_write 诊断/tai_current_event_id 全部存活。clang 预检 26/26 零真错(预检配方新增 `-U_MSC_VER`:fork 伪定义 _MSC_VER 会拉 MSVC-only sal.h)。
+
+- **AGENTIC_KIT_ 旋钮前缀 + 头文件拆分**(8987cf3):iot-client 旋钮集中 `include/iot_client_config_defaults.h`、rtc 集中 `include/tai_config_defaults.h`;删旧 `src/iot_config_defaults.h`、`src/iot_client_internal.h`,新 `src/iot_internal.h` 承载域名表/版本/IOT_LOG*/pal_strdup(SG 表上游已带,85740c6 收编)。
+- **编译期日志门面 + 本地运行时层**(ff8e85c):tai_log.h = 上游门面(AGENTIC_KIT_LOG_LEVEL 天花板 + AGENTIC_KIT_LOG 派发)+ 永久本地扩展(log_set_handler/log_set_level/log_get_level/log_default_handler/log_emit_valist),log.c 运行时状态版——demo 的 tuya_log_redirect 动态调级链不折,天花板编译期裁剪照旧。
+- **协议 9000 MQTT AI 控制通道**(387957b):`iot_ai_ctrl.c/h` 新文件;分发链 reset→ota_confirm→**ai_ctrl**→DP→raw;demo 四个 init 点注册 `on_ai_ctrl`(printf 对照观察,不动状态)。Makefile/.cbp +iot_ai_ctrl.c。
+- **TCP 接收背压**(PR#42 四提交):`pal_t.sleep_ms` 必填——pal_ac791n.c 以 vTaskDelay(pdMS_TO_TICKS) 实现;`tai_config_t.on_flow_control` 留 NULL(连续接收,与旧行为一致;真接线是阶段 3 项)。
+- **服务器时间过滤打断对照**(65ce503):on_audio START 锁存 `g_turn_start_ts`(=msg->timestamp_ms,服务器媒体头);CHAT_BREAK 分支解析 breakAttributes.time 同轴比较,打 `[TUYA-AI] break-time hit/stale/no-start/no-time` 对照日志(只记不改判;hex 半字对打印,避杰理 newlib %llu 崩溃雷)。板上确认与 event-id/对冲判属一致率后收编为主判据。
+- **tai_connect 时序风险销案**:confirmed-connect 5f4d845↔48e3c0c 逐行一致,无需 demo 适配。
+
+### 验证与回退
+
+- 板测(用户执行):CB 全量构建(.bc 已清)→ 配网/对话打断/DP/OTA(阶段1 遗留项并入)→ 声学测试时一并 soak ≥2h(覆盖 ≥1 个 30min ConnectionRefresh 周期),观察 9000 通道 `[TUYA-AI-CTRL]` 与 `break-time` 对照日志。
+- 回退点:overlay 阶段1 提交 647ec00(tag 待打);整树回退 `git checkout 647ec00 -- overlay/apps/common/LLM/tuya_agentic/agentic-kit` 等。
+- patch 段:Makefile/.cbp 有接线变化(+iot_ai_ctrl.c),旧 12 段中对应段作废,以 overlay 整树覆盖为准。

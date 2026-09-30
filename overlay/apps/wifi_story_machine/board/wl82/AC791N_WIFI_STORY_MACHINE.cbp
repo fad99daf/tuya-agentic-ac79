@@ -1232,6 +1232,7 @@
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/atop_base.c"><Option compilerVar="CC" /></Unit>
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/cipher_wrapper.c"><Option compilerVar="CC" /></Unit>
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/http_client_interface.c"><Option compilerVar="CC" /></Unit>
+<Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_ai_ctrl.c"><Option compilerVar="CC" /></Unit>
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_atop.c"><Option compilerVar="CC" /></Unit>
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client.c"><Option compilerVar="CC" /></Unit>
 <Unit filename="../../../../apps/common/LLM/tuya_agentic/agentic-kit/modules/iot-client/src/iot_client_message.c"><Option compilerVar="CC" /></Unit>

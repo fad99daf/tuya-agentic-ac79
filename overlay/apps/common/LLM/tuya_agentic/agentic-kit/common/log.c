@@ -1,5 +1,14 @@
 /*
- * log.c -- Default implementation of the log facade.
+ * log.c -- Runtime-level implementation of the log facade (AC79 port).
+ *
+ * LOCAL EXTENSION (permanent — see docs/UPSTREAM-BASE.md ledger): upstream
+ * 48e3c0c ships this file stateless (destination and ceiling are compile-time
+ * facts). This port keeps the runtime layer instead: the default
+ * AGENTIC_KIT_LOG expansion lands in log_emit(), which applies the runtime
+ * level set via log_set_level() and dispatches to the handler registered via
+ * log_set_handler() (tuya_agentic_demo.c: tuya_log_redirect). The
+ * compile-time ceiling still applies upstream of here — log_tag_* collapses
+ * above AGENTIC_KIT_LOG_LEVEL before any call is generated.
  *
  * State (handler + runtime level) is kept in plain globals.  Updates are
  * unsynchronised: setters are expected to run during startup before worker
@@ -63,6 +72,15 @@ void log_default_handler(log_level_t level, const char *fmt, va_list args)
 #else
     funlockfile(stderr);
 #endif
+}
+
+void log_emit_valist(log_level_t level, const char *fmt, va_list args)
+{
+    if (level > g_level)
+        return;
+
+    log_fn_t handler = g_handler ? g_handler : log_default_handler;
+    handler(level, fmt, args);
 }
 
 void log_emit(log_level_t level, const char *fmt, ...)

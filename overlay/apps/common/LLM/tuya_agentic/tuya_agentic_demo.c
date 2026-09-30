@@ -230,6 +230,12 @@ static unsigned int s_play_gate_blind, s_play_gate_was_busy, s_play_gate_last_hi
 static volatile int g_local_break_pend;    /* 已发出未收到的本地 chat_break 数(主循环写,worker 线程减,临界区内增减) */
 static volatile int g_uplinking;           /* 上行窗口标志(主循环写,on_event 读) */
 static char g_turn_event_id[64];           /* 本轮 event-id(audio_start 后读回;临界区内更新,on_event 上行窗判属用) */
+/* 阶段2·服务器时间过滤双判(上游 65ce503):本轮 TTS START 帧的服务器媒体头
+ * 时间戳(tai_audio_msg_t.timestamp_ms,on_audio worker 线程写)。chat_break 的
+ * breakAttributes.time 与它同一时钟轴——≥本轮起点=打断属于本轮,<起点=旧轮
+ * 在途回执。现阶段只打对照日志不改判属行为,板上确认与 event-id/对冲判属
+ * 一致率后再收编为唯一判据(计划见 UPSTREAM-BASE.md §4 阶段2)。*/
+static volatile unsigned long long g_turn_start_ts;
 #if TUYA_TRANSPORT_STM_ENABLE && TUYA_STM_MCP_VIA_TEXT
 /* STM 暂用 TEXT 承载 MCP response，云端会误把 JSON 当作一轮用户文本并生成
  * NLG/TTS。下一轮 AUDIO 前由 demo 任务 chat_break 隔离这轮污染。 */
@@ -355,6 +361,21 @@ static int json_array_first_string(const char *json, const char *key, char *out,
     out[len] = '\0';
     return 0;
 }
+/* json_find_value 返回点起的极简 u64 解析(容忍前导引号/空白;非数字/空=0)。
+ * 服务端时间戳 13 位毫秒必须 64 位;不走 strtoull/printf %ll——demo.c:3600 注释
+ * 明言杰理 newlib 对 64 位格式符支持存疑(tai_pkt_log.c 的 %llu 仅活在日志级
+ * 门控后),对照日志用 %x 半字对打印,彻底避开。*/
+static unsigned long long json_u64_after(const char *p)
+{
+    unsigned long long v = 0;
+    if (!p) return 0;
+    while (*p == ' ' || *p == '\"' || *p == '\t') p++;
+    while (*p >= '0' && *p <= '9') {
+        v = v * 10 + (unsigned long long)(*p - '0');
+        p++;
+    }
+    return v;
+}
 
 /* ------------------------------------------------------------------------- */
 /* base64 + token 解析(搬自 text_chat_demo.c)                               */
@@ -449,6 +470,21 @@ static void on_mqtt_message(const char *topic, size_t topic_len,
            (unsigned)data_len,
            (int)(data_len < 512 ? data_len : 512),
            data ? (const char *)data : "(null)");
+}
+
+/* 阶段2·9000 MQTT AI 控制通道(上游 387957b):服务端 AI 事件(asrInterrupt 等)
+ * 经 MQTT 带外下发,分发链 reset→ota_confirm→9000→DP→raw(iot_client_message.c)。
+ * 与 TAI TCP 的 CHAT_BREAK/breakAttributes 双通道并行观察打断时序,回调内只打
+ * 日志不动状态——type/json_data 均为 borrowed、回调须非阻塞(iot_client.h 契约)。
+ * 板上对照一致率确认后,再决定打断以哪条通道为准(计划阶段2 收编判据)。*/
+static void on_ai_ctrl(const char *type, const char *json_data,
+                       size_t data_len, void *user_data)
+{
+    (void)user_data;
+    printf("[TUYA-AI-CTRL] type=%s data=%.*s\r\n",
+           type ? type : "(null)",
+           (int)(data_len < 256 ? data_len : 256),
+           json_data ? json_data : "");
 }
 
 extern u32 wifi_get_tuya_network_ready_generation(void);
@@ -708,6 +744,7 @@ static void on_audio(tai_ctx_t *ctx, const tai_audio_msg_t *msg, void *ud)
      * 预蓄水:本轮首次 fread 会等 cbuf 攒够 TTS_PREBUFFER_BYTES 再喂解码器,
      * 避免首帧 80B 直接播→40ms underrun 卡顿。START 才触发,后续帧不动。*/
     if (msg->stream_flag == TAI_STREAM_START) {
+        g_turn_start_ts = msg->timestamp_ms;   /* 阶段2双判:本轮起点(服务器时钟轴,见 g_turn_start_ts 注释) */
         _device_rbuf_clear();
         tts_prebuffer_arm();
     }
@@ -1252,6 +1289,29 @@ static void on_event(tai_ctx_t *ctx, const tai_event_msg_t *msg, void *ud)
         OS_EXIT_CRITICAL();
         printf("[TUYA-AI] chat_break (%s, pend=%d)\r\n",
                _receipt ? "receipt" : "cloud", g_local_break_pend);
+        /* 阶段2·服务器时间过滤对照(上游 65ce503,只记不改判):breakAttributes.time
+         * 与本轮 TTS START 锁存的 g_turn_start_ts 同一服务器时钟轴——≥起点=打断
+         * 属本轮(hit),<起点=旧轮在途回执(stale);缺时间/未起轮=no-time/no-start
+         * (上游 SDK 语义缺时间 fail-closed,此处仅观察)。与上面 receipt/cloud、
+         * event-id 判属三者对照,板上确认一致率后再收编为主判据(UPSTREAM-BASE.md
+         * §4 阶段2)。hex 半字对打印避 %llu 雷(见 json_u64_after 注释)。*/
+        if (msg->data && msg->len) {
+            char payload[384];
+            size_t plen = msg->len;
+            if (plen >= sizeof(payload)) plen = sizeof(payload) - 1;
+            memcpy(payload, msg->data, plen);
+            payload[plen] = '\0';
+            char *attrs = json_get_object_raw(payload, "breakAttributes");
+            unsigned long long brk_ts   = json_u64_after(attrs ? json_find_value(attrs, "time") : NULL);
+            unsigned long long start_ts = g_turn_start_ts;
+            const char *verdict = (!brk_ts)   ? "no-time"
+                                : (!start_ts) ? "no-start"
+                                : (brk_ts >= start_ts) ? "hit" : "stale";
+            printf("[TUYA-AI] break-time %s: brk=%x%08x start=%x%08x\r\n", verdict,
+                   (unsigned)(brk_ts >> 32), (unsigned)brk_ts,
+                   (unsigned)(start_ts >> 32), (unsigned)start_ts);
+            free(attrs);
+        }
 #ifdef TUYA_SERVER_VAD_ENABLE
         if (!_receipt) {
             g_server_vad_stop = 1;
@@ -1264,8 +1324,13 @@ static void on_event(tai_ctx_t *ctx, const tai_event_msg_t *msg, void *ud)
              * 是"设备上有东西在播才停";g_tts_playing 由 on_audio 逐帧维护,只在
              * 旧流 stream-end 后为 0——为 0 即旧流已终结、无残包可排,跳过安全。
              * on_event 与 on_audio 同在 worker 线程,读它无竞态。语音循环按
-             * 2(在播:停+排空窗)/1(没播:仅记录)分别处理。 */
-            g_cloud_break_evt = g_tts_playing ? 2 : 1;
+             * 2(在播:停+排空窗)/1(没播:仅记录)分别处理。
+             * ★ 2026-09-30 "打断不灵敏"第二修:g_tts_playing 只是"下行流"标志,
+             *   流 END 后喇叭还压着数秒缓冲尾巴(play-gate _pg_busy 的第二臂,
+             *   同判据 640)——break 落在排空期判 1 就"nothing to stop",尾巴照
+             *   漏(当日实测逐条命中此分支)。cbuf 水位读与主循环同类跨线程单
+             *   读,无锁安全;排空窗开不开由消费端按执行时流状态再分。 */
+            g_cloud_break_evt = (g_tts_playing || _device_get_play_level() >= 640) ? 2 : 1;
 #endif
         }
 #endif
@@ -1327,6 +1392,7 @@ void tuya_agentic_demo(void *arg)
     obcfg.ota_confirm_callback = on_ota_confirm;   /* APP 确认升级(protocol 15) */
     iot = iot_client_init_on_boarding_with_token(&obcfg, TUYA_ACTIVATION_TOKEN);
     if (!iot) { printf("[TUYA] on_boarding_with_token fail(token 过期/三件套错?)\r\n"); return; }
+    iot_ai_ctrl_set_callback(iot, on_ai_ctrl, NULL);   /* 阶段2·9000 AI控制通道(见 on_ai_ctrl) */
     printf("[TUYA] activated, devid=%s\r\n", iot->devid);
 #else
     /* 直连:已预注册设备,直接用三元组 */
@@ -1346,6 +1412,7 @@ void tuya_agentic_demo(void *arg)
     strncpy((char *)cfg.local_key,  TUYA_LOCAL_KEY,  sizeof(cfg.local_key) - 1);
     iot = iot_client_init(&cfg);
     if (!iot) { printf("[TUYA] iot_client_init fail\r\n"); return; }
+    iot_ai_ctrl_set_callback(iot, on_ai_ctrl, NULL);   /* 阶段2·9000 AI控制通道(见 on_ai_ctrl) */
 #endif
     strncpy(local_key_buf, (const char *)iot->local_key, sizeof(local_key_buf) - 1);
 
@@ -2295,19 +2362,25 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
                     printf("[TUYA] uplink f#%u sum=%u act=%u%%\r\n", uplink_frames, fs, fa);
             }
         }
-        /* 云端判打断(回调只置标志:2=TTS在播/1=没播)。≤40ms 轮询延迟,人耳无感。
-         * 在播:停喇叭+清 rbuf+开 3s 残包排空窗(on_audio 在窗内丢弃云端不再发的
-         * 旧 TTS 流)。没播:仅记录——云端 asrInterrupt 不知道设备是否播完,此时
-         * 开窗会把新轮回话整段吃掉(2026-09-23 "你好后没反应"根因,见 on_event)。 */
+        /* 云端判打断(回调只置标志:2=有东西在响/1=静音)。≤40ms 轮询延迟,人耳无感。
+         * 2 且流还活着(g_tts_playing=1):停喇叭+清 rbuf+开 3s 残包排空窗(on_audio
+         * 在窗内丢弃云端不再发的旧 TTS 流)。2 但流已 END(=2 判据的 cbuf 排空尾巴
+         * 臂,或 END 恰落在回调→消费的 ≤40ms 间隙):只清 rbuf 即静音——流已终结无
+         * 残包可排,新轮回话最快 ~0.6s 后到,开窗会把它吃掉(2026-09-23 "你好后没
+         * 反应"根因)。1:仅记录(云端 asrInterrupt 不知道设备是否播完,静音期开窗
+         * 同样吃新轮回话)。 */
         if (g_cloud_break_evt) {
-            int _tts_live = (g_cloud_break_evt == 2);
+            int _evt = g_cloud_break_evt;
             g_cloud_break_evt = 0;
-            if (_tts_live) {
+            if (_evt == 2 && g_tts_playing) {
                 printf("[TUYA] cloud barge-in: stop TTS (frames=%u)\r\n", uplink_frames);
                 _device_rbuf_clear();
                 g_tts_drop_until = timer_get_ms() + 3000;
                 g_tts_drop_cnt = 0;
                 g_tts_playing = 0;
+            } else if (_evt == 2) {
+                printf("[TUYA] cloud barge-in: stop drain tail (frames=%u)\r\n", uplink_frames);
+                _device_rbuf_clear();   /* 尾巴静音即止;无残包,不开排空窗 */
             } else {
                 printf("[TUYA] cloud break: no TTS playing, nothing to stop (frames=%u)\r\n",
                        uplink_frames);
@@ -3749,6 +3822,7 @@ void tuya_agentic_main(void *arg)
         iot_client_t *iot = iot_client_init(&cfg);
         if (iot) {
             s_tuya_cloud_client_ready = 1;
+            iot_ai_ctrl_set_callback(iot, on_ai_ctrl, NULL);   /* 阶段2·9000 AI控制通道(见 on_ai_ctrl) */
             /* 连 AI 之前先检查涂鸦云 OTA(此时 iot_client 活着,且 AI 会话还没起,
              * 无并发冲突;OTA 走 ATOP over HTTPS,与 MQTT 串行无妨)。
              * 有升级则下载烧写并自动重启(不返回);无升级则正常连 AI。*/
@@ -3843,6 +3917,7 @@ void tuya_agentic_main(void *arg)
         return;
     }
     s_tuya_cloud_client_ready = 1;
+    iot_ai_ctrl_set_callback(iot, on_ai_ctrl, NULL);   /* 阶段2·9000 AI控制通道(见 on_ai_ctrl) */
     printf("[TUYA] activated, devid=%s\r\n", iot->devid);
 
     /* ---- 持久化三元组 + WiFi 凭据(下次开机直连)----

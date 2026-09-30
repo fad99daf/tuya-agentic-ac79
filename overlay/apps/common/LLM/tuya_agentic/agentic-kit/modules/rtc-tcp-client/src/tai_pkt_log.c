@@ -8,11 +8,11 @@
  *
  * Log level / volume policy for streaming media (audio/video/image):
  *   - START / END / ONE_SHOT frames  : always logged at INFO
- *   - MIDDLE frames, TAI_LOG_MEDIA_SAMPLE_N > 0 (default):
+ *   - MIDDLE frames, AGENTIC_KIT_TAI_LOG_MEDIA_SAMPLE_N > 0 (default):
  *       only every N-th MIDDLE frame is logged, at INFO, with a
  *       "sample-every" / "sample-idx" marker; all others are dropped
  *       (no DEBUG trace) to avoid flooding the log pipeline.
- *   - MIDDLE frames, TAI_LOG_MEDIA_SAMPLE_N == 0:
+ *   - MIDDLE frames, AGENTIC_KIT_TAI_LOG_MEDIA_SAMPLE_N == 0:
  *       every MIDDLE frame is logged at DEBUG (developer "flood" mode).
  *
  * Every media packet also carries an "order" field -- a per-direction
@@ -29,14 +29,12 @@
 
 #define TAG "pkt"
 
-/* Sample 1-in-N media MIDDLE frames to INFO.  All non-sampled MIDDLE
- * frames are dropped (no log line).  Set to 0 to disable sampling, in
- * which case every MIDDLE frame logs at DEBUG instead.  Override with
- *     cmake -DTAI_LOG_MEDIA_SAMPLE_N=<n>
- */
-#ifndef TAI_LOG_MEDIA_SAMPLE_N
-#define TAI_LOG_MEDIA_SAMPLE_N 50
-#endif
+/* Packet diagnostics have only INFO and DEBUG outcomes. Keep the entire
+ * formatter out of lower-ceiling builds so its calls, work and strings vanish
+ * together; tai_internal.h removes the corresponding call sites. */
+#if AGENTIC_KIT_TAI_LOG_LEVEL >= 3
+
+/* AGENTIC_KIT_TAI_LOG_MEDIA_SAMPLE_N default & docs: include/tai_config_defaults.h. */
 
 /* snprintf into buf at *pos; advances pos.  Bails (returning 0) if there is
  * no room left for at least one char + NUL.  Always keeps *pos strictly
@@ -382,7 +380,7 @@ static void put_payload(char *buf, size_t cap, size_t *pos,
 
         size_t text_len = (plen > offset) ? plen - offset : 0;
         bput(buf, cap, pos,
-             "{\"data-id\":%u,\"stream-flag\":\"%s\",\"seq\":%u,\"length\":%u",
+             "{\"data-id\":%u,\"stream-flag\":\"%s\",\"seq\":%u,\"length\":%zu",
              (unsigned)data_id, sflag_kebab(sf), (unsigned)seq, text_len);
         if (text_len > 0) {
             bput(buf, cap, pos, ",\"data\":");
@@ -407,7 +405,7 @@ static void put_payload(char *buf, size_t cap, size_t *pos,
         uint64_t ts = packed & UINT64_C(0x3FFFFFFFFFF);
         bput(buf, cap, pos,
              "{\"id\":%u,\"stream-flag\":\"%s\","
-             "\"timestamp\":%llu,\"pts\":0,\"length\":%u}",
+             "\"timestamp\":%llu,\"pts\":0,\"length\":%zu}",
              (unsigned)data_id, sflag_kebab(sf),
              (unsigned long long)ts,
              plen - 8);
@@ -422,7 +420,7 @@ static void put_payload(char *buf, size_t cap, size_t *pos,
         size_t data_len = plen - 2;
         bput(buf, cap, pos, "{\"event-type\":\"%s\"", evt_kebab(evt));
         if (data_len > 0 && data_off + data_len <= plen) {
-            bput(buf, cap, pos, ",\"length\":%u,\"data\":", data_len);
+            bput(buf, cap, pos, ",\"length\":%zu,\"data\":", data_len);
             put_jstr(buf, cap, pos,
                      (const char *)(p + data_off), data_len);
         }
@@ -474,6 +472,57 @@ static void put_payload(char *buf, size_t cap, size_t *pos,
  * gracefully when this fills. */
 #define TAI_LOG_BUF_SIZE 1024
 
+/* Format one already-classified Packet. The caller selects the compile-time
+ * sink (INFO or DEBUG); this helper owns no level policy. */
+static const char *format_packet_log(char buf[TAI_LOG_BUF_SIZE],
+                                     uint8_t proto_ver,
+                                     int is_send,
+                                     uint8_t pkt_type,
+                                     const tai_attr_t *attrs, int attr_count,
+                                     const uint8_t *payload, size_t payload_len,
+                                     int is_media, uint8_t stream_flag,
+                                     uint32_t order, uint32_t sample_idx)
+{
+    const char *dir;
+    if (is_send) {
+        dir = "send";
+    } else {
+        switch (pkt_type) {
+        case TAI_PKT_AUDIO: dir = "receive-audio"; break;
+        case TAI_PKT_VIDEO: dir = "receive-video"; break;
+        case TAI_PKT_IMAGE: dir = "receive-image"; break;
+        default:            dir = "receive"; break;
+        }
+    }
+
+    /* Written strictly sequentially via bput() and NUL-terminated at buf[pos]
+     * below, so no zero-init is needed (avoids a memset on the log hot path). */
+    size_t cap = TAI_LOG_BUF_SIZE - 1;
+    size_t pos = 0;
+
+    bput(buf, cap, &pos, "{\"packet-type\":\"%s\"", pkt_kebab(pkt_type));
+
+    if (is_media && stream_flag != 0xFF)
+        bput(buf, cap, &pos, ",\"order\":%u", (unsigned)order);
+
+    if (sample_idx)
+        bput(buf, cap, &pos, ",\"sample-every\":%u,\"sample-idx\":%u",
+             (unsigned)AGENTIC_KIT_TAI_LOG_MEDIA_SAMPLE_N, (unsigned)sample_idx);
+
+    if (!is_send)
+        bput(buf, cap, &pos, ",\"payload-len\":%zu", payload_len);
+
+    bput(buf, cap, &pos, ",\"attributes\":");
+    put_attrs(buf, cap, &pos, attrs, attr_count);
+
+    bput(buf, cap, &pos, ",\"payload\":");
+    put_payload(buf, cap, &pos, proto_ver, pkt_type, payload, payload_len);
+
+    bput(buf, cap, &pos, "}");
+    buf[pos] = '\0';
+    return dir;
+}
+
 void tai_log_packet(uint8_t proto_ver,
                     int is_send,
                     uint8_t pkt_type,
@@ -484,7 +533,7 @@ void tai_log_packet(uint8_t proto_ver,
     if (pkt_type == TAI_PKT_PING || pkt_type == TAI_PKT_PONG)
         return;
 
-    /* --- Decide effective log level / volume for media streams ----------
+    /* --- Apply the compile-time media log policy -------------------------
      *
      * Non-media packets always log at INFO.  Media packets (audio / video
      * / image) have much higher rates and need filtering:
@@ -498,8 +547,11 @@ void tai_log_packet(uint8_t proto_ver,
      * A per-direction "order" counter lets operators stitch sampled
      * output back into a continuous timeline; it resets on START /
      * ONE_SHOT and advances on every subsequent media frame.
+     *
+     * The preprocessor selects the MIDDLE path below. There is no runtime
+     * log-level variable or level comparison: runtime decisions inspect only
+     * Packet data (Packet type / Stream flag) and the sampling counter.
      */
-    int      log_level  = TAI_LOG_INFO;
     uint32_t sample_idx = 0;          /* non-zero => sampled middle frame */
     int      is_media   = (pkt_type == TAI_PKT_AUDIO ||
                            pkt_type == TAI_PKT_VIDEO ||
@@ -526,61 +578,39 @@ void tai_log_packet(uint8_t proto_ver,
         }
 
         if (stream_flag == TAI_STREAM_MIDDLE) {
-            if (TAI_LOG_MEDIA_SAMPLE_N > 0) {
-                /* Sample every N-th; drop the rest entirely. */
-                static uint32_t sample_counter = 0;
-                uint32_t n = ++sample_counter;
-                if ((n % TAI_LOG_MEDIA_SAMPLE_N) != 0)
-                    return;              /* dropped -- no log line */
-                sample_idx = n;          /* keep at INFO, mark sampled */
-            } else {
-                /* Flood mode: developer opt-in.  All MIDDLE at DEBUG. */
-                log_level = TAI_LOG_DEBUG;
-            }
+#if AGENTIC_KIT_TAI_LOG_MEDIA_SAMPLE_N > 0
+            /* Sampling mode is compiled as INFO-only. Drop non-sampled
+             * MIDDLE Packets before formatting. */
+            static uint32_t sample_counter = 0;
+            uint32_t n = ++sample_counter;
+            if ((n % AGENTIC_KIT_TAI_LOG_MEDIA_SAMPLE_N) != 0)
+                return;
+            sample_idx = n;
+#elif AGENTIC_KIT_TAI_LOG_LEVEL >= 4
+            /* Flood mode exists only in a DEBUG build. The DEBUG sink and
+             * formatter call disappear entirely at lower ceilings. */
+            char debug_buf[TAI_LOG_BUF_SIZE];
+            const char *debug_dir = format_packet_log(
+                debug_buf, proto_ver, is_send, pkt_type,
+                attrs, attr_count, payload, payload_len,
+                is_media, stream_flag, order, 0);
+            log_tag_debug(TAG, "%s:  %s", debug_dir, debug_buf);
+            return;
+#else
+            /* Sampling disabled and DEBUG not compiled: no MIDDLE log. */
+            return;
+#endif
         }
     }
 
-    /* Runtime filter: bail before doing any expensive formatting. */
-    if (log_get_level() < log_level) return;
-
-    const char *dir;
-    if (is_send) {
-        dir = "send";
-    } else {
-        switch (pkt_type) {
-        case TAI_PKT_AUDIO: dir = "receive-audio"; break;
-        case TAI_PKT_VIDEO: dir = "receive-video"; break;
-        case TAI_PKT_IMAGE: dir = "receive-image"; break;
-        default:            dir = "receive"; break;
-        }
-    }
-
-    /* Written strictly sequentially via bput() and NUL-terminated at buf[pos]
-     * below, so no zero-init is needed (avoids a memset on the log hot path). */
-    char buf[TAI_LOG_BUF_SIZE];
-    size_t cap = TAI_LOG_BUF_SIZE - 1;
-    size_t pos = 0;
-
-    bput(buf, cap, &pos, "{\"packet-type\":\"%s\"", pkt_kebab(pkt_type));
-
-    if (is_media && stream_flag != 0xFF)
-        bput(buf, cap, &pos, ",\"order\":%u", (unsigned)order);
-
-    if (sample_idx)
-        bput(buf, cap, &pos, ",\"sample-every\":%u,\"sample-idx\":%u",
-             (unsigned)TAI_LOG_MEDIA_SAMPLE_N, (unsigned)sample_idx);
-
-    if (!is_send)
-        bput(buf, cap, &pos, ",\"payload-len\":%u", payload_len);
-
-    bput(buf, cap, &pos, ",\"attributes\":");
-    put_attrs(buf, cap, &pos, attrs, attr_count);
-
-    bput(buf, cap, &pos, ",\"payload\":");
-    put_payload(buf, cap, &pos, proto_ver, pkt_type, payload, payload_len);
-
-    bput(buf, cap, &pos, "}");
-    buf[pos] = '\0';
-
-    log_emit(log_level, "[" TAG "] %s:  %s", dir, buf);
+    /* Non-media Packets, media boundaries and sampled MIDDLE Packets are an
+     * INFO-only compile-time path. */
+    char info_buf[TAI_LOG_BUF_SIZE];
+    const char *info_dir = format_packet_log(
+        info_buf, proto_ver, is_send, pkt_type,
+        attrs, attr_count, payload, payload_len,
+        is_media, stream_flag, order, sample_idx);
+    log_tag_info(TAG, "%s:  %s", info_dir, info_buf);
 }
+
+#endif /* AGENTIC_KIT_TAI_LOG_LEVEL >= 3 */

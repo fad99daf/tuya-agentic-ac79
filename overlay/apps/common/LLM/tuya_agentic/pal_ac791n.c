@@ -4,7 +4,9 @@
  * 把 agentic-kit 的 pal/pal.h 契约(14 个回调)桥接到 AC79 宿主 API。
  * TCP 部分基本照搬 pal/pal_freertos.c(同为 lwIP);mutex 用 FreeRTOS 递归信号量
  * (configUSE_RECURSIVE_MUTEXES=1,见 include_lib/system/os/FreeRTOS/FreeRTOSConfig.h);
- * thread 用 thread_fork + thread_kill(KILL_WAIT);time 用 sys_timer_get_ms()。
+ * thread 用 thread_fork + thread_kill(KILL_WAIT);time 用 sys_timer_get_ms();
+ * sleep 用 vTaskDelay(pdMS_TO_TICKS)(上游 b616a3e 起 pal.h 新增 sleep_ms,契约
+ * "至少 ms 毫秒";os_time_dly 按 tick 计要手工换算,FreeRTOS 宏随 configTICK_RATE_HZ 自适应)。
  *
  * 递归锁是硬要求:iot-client 的 DP schema 更新路径会重入锁(pal.h 注释、iot_dp.c),
  * 普通互斥锁会死锁。
@@ -21,6 +23,7 @@
 #include "system/os/os_api.h"      /* thread_fork / thread_kill   */
 #include "FreeRTOS/FreeRTOS.h"     /* 递归信号量(与 qcloud HAL_OS_free_rtos.c 同款 include)*/
 #include "FreeRTOS/semphr.h"
+#include "FreeRTOS/task.h"         /* vTaskDelay(0.5.0 起 pal_t.sleep_ms 用) */
 #include "lwip/sockets.h"          /* socket/connect/select/...   */
 #include "lwip/netdb.h"            /* getaddrinfo                 */
 
@@ -208,6 +211,17 @@ static void ac_mutex_destroy(void *m)
 }
 
 /* ------------------------------------------------------------------------- */
+/* 睡眠 —— 0.5.0 起 pal_t 必填项(背压暂停时让出 CPU,上游 b616a3e)。
+ * pal.h 契约:挂起调用线程至少 ms 毫秒,0 为 no-op;调度延迟/取整只允许多睡。 */
+/* ------------------------------------------------------------------------- */
+static void ac_sleep_ms(uint32_t ms)
+{
+    if (ms == 0) return;
+    TickType_t ticks = pdMS_TO_TICKS(ms);
+    vTaskDelay(ticks ? ticks : 1);   /* ms 不足 1 tick 时也睡满 1 tick,保证 ≥ms */
+}
+
+/* ------------------------------------------------------------------------- */
 /* 线程 —— thread_fork(void fn(void*)) + trampoline 桥接 PAL 的 void* fn(void*),
  * join 用 thread_kill(KILL_WAIT)。                                          */
 /* ------------------------------------------------------------------------- */
@@ -273,6 +287,7 @@ static const pal_t g_ac791n_pal = {
     .mutex_destroy= ac_mutex_destroy,
     .thread_create= ac_thread_create,
     .thread_join  = ac_thread_join,
+    .sleep_ms     = ac_sleep_ms,
 };
 
 const pal_t *tai_pal_ac791n(void)

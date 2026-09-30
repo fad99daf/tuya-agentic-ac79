@@ -1,7 +1,7 @@
 #include "iot_ota.h"
 #include "atop.h"
 #include "iot_dp_internal.h"
-#include "iot_config_defaults.h"
+#include "iot_internal.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -72,7 +72,7 @@ static int tuya_iot_ota_check_upgrade_impl(iot_client_t *client, int channel,
     int rt = silent ? atop_upgrade_silent_get(client->pal, &req, &resp)
                     : atop_upgrade_get(client->pal, &req, &resp);
     if (rt != OPRT_OK) {
-        log_error("atop_upgrade_get failed: %d", rt);
+        IOT_LOGE("atop_upgrade_get failed: %d", rt);
         return rt;
     }
 
@@ -161,7 +161,7 @@ int tuya_iot_ota_report_progress(iot_client_t *client, int channel,
 
     int rt = iot_client_publish(client, (const uint8_t *)json, (size_t)len);
     if (rt != OPRT_OK) {
-        log_warn("ota progress publish fail (rt=%d, percent=%d ch=%d)",
+        IOT_LOGW("ota progress publish fail (rt=%d, percent=%d ch=%d)",
                  rt, percent, channel);
     }
     return rt;

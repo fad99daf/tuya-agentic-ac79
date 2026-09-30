@@ -103,7 +103,7 @@ static int gen_id(tai_ctx_t *ctx, const char *prefix,
  *   client-id        (12) : string — derived_client_id
  *   security-suit    (10) : bytes  — [sign_level(1)][encrypt_random(32)]
  *   max-fragment-len (15) : uint32 — largest transport fragment payload the
- *                                    client uses/accepts (TAI_MAX_FRAGMENT_PAYLOAD)
+ *                                    client uses/accepts (AGENTIC_KIT_TAI_MAX_FRAGMENT_PAYLOAD)
  *   ping-interval    (20) : uint32 — keepalive interval (ms)
  *
  * Sent unencrypted (sig_len=0 handled by caller).
@@ -125,7 +125,7 @@ int tai_proto_build_client_hello(tai_ctx_t *ctx,
         attrs[na++] = tai_attr_strv(TAI_ATTR_CLIENT_ID, ctx->client_id);
     attrs[na++] = tai_attr_bytesv(TAI_ATTR_SECURITY_SUIT, security_suit, 33);
     attrs[na++] = tai_attr_u32v(TAI_ATTR_MAX_FRAGMENT_LEN, s_maxfrag,
-                                TAI_MAX_FRAGMENT_PAYLOAD);
+                                AGENTIC_KIT_TAI_MAX_FRAGMENT_PAYLOAD);
     attrs[na++] = tai_attr_u32v(TAI_ATTR_PING_INTERVAL, s_ping,
                                 ctx->ping_interval_ms);
 
@@ -538,7 +538,8 @@ static void emit_text(tai_ctx_t *ctx, const char *text, size_t len,
 }
 
 static void emit_event(tai_ctx_t *ctx, uint16_t event_type,
-                       const uint8_t *data, size_t len)
+                       const uint8_t *data, size_t len,
+                       const tai_attr_t *user_data)
 {
     if (!ctx->on_event) return;
     tai_event_msg_t m = {0};
@@ -546,6 +547,10 @@ static void emit_event(tai_ctx_t *ctx, uint16_t event_type,
     m.data       = data;
     m.len        = len;
     m.event_id   = ctx->rx_event_id;
+    if (user_data) {
+        m.user_data     = user_data->value;
+        m.user_data_len = user_data->len;
+    }
     ctx->on_event(ctx, &m, ctx->user_data);
 }
 
@@ -620,28 +625,27 @@ static void parse_audio_params_once(tai_ctx_t *ctx,
     }
 }
 
-/* Split an audio body into CBR Opus frames of rx_audio_frame_size, emitting a
- * final short remainder. Whole frames are emitted zero-copy from `body` (valid
- * until the frame is consumed from rx_buf). fs==0 (PCM / unknown) delivers the
- * body whole. */
-static void media_audio_body(tai_ctx_t *ctx, const uint8_t *body, size_t body_len,
-                             uint8_t stream_flag, uint16_t data_id, uint64_t ts_ms)
+/* Split CBR Opus into codec frames, including a final short remainder.
+ * A zero frame size (PCM / unknown) delivers the remaining body whole.
+ * Only the worker advances this zero-copy cursor; the caller pins storage
+ * and does not dispatch another Packet until the cursor is exhausted. */
+int tai_proto_drain_pending_audio(tai_ctx_t *ctx)
 {
-    if (!ctx->on_audio) return;
-
     uint16_t fs = ctx->rx_audio_frame_size;
-    if (fs == 0) {
-        if (body_len > 0)
-            emit_audio(ctx, body, body_len, stream_flag, data_id, ts_ms);
-        return;
+    while (ctx->rx_pending_len) {
+        if (tai_rx_admission_paused(ctx)) {
+            return 1;
+        }
+        size_t len = fs == 0 || ctx->rx_pending_len < fs
+                   ? ctx->rx_pending_len : fs;
+        emit_audio(ctx, ctx->rx_pending_body, len,
+                   ctx->rx_pending_flag, ctx->rx_pending_data_id,
+                   ctx->rx_pending_ts_ms);
+        ctx->rx_pending_body += len;
+        ctx->rx_pending_len -= len;
     }
-
-    while (body_len >= fs) {
-        emit_audio(ctx, body, fs, stream_flag, data_id, ts_ms);
-        body += fs; body_len -= fs;
-    }
-    if (body_len > 0)
-        emit_audio(ctx, body, body_len, stream_flag, data_id, ts_ms);
+    ctx->rx_pending_body = NULL;
+    return 0;
 }
 
 /* AUDIO packet payload: [data_id:2][48-bit stream_flag|ts_ms][opus frames…]. */
@@ -650,7 +654,7 @@ static int media_audio(tai_ctx_t *ctx,
                        const uint8_t *payload, size_t payload_len)
 {
     if (payload_len < 8) {
-        TAI_LOGW(ctx->pal, TAG, "audio media header truncated (%u < 8)", payload_len);
+        TAI_LOGW(ctx->pal, TAG, "audio media header truncated (%zu < 8)", payload_len);
         return TAI_PROTO_ERR_MEDIA_HDR;
     }
     uint16_t data_id = 0; uint8_t stream_flag = 0; uint64_t ts_ms = 0;
@@ -670,7 +674,19 @@ static int media_audio(tai_ctx_t *ctx,
     parse_audio_params_once(ctx, attrs, attr_count);
 
     latch_event_id(ctx, attrs, attr_count);
-    media_audio_body(ctx, payload + 8, payload_len - 8, stream_flag, data_id, ts_ms);
+    /* Header-only STARTs still establish the server-time playback boundary. */
+    if (payload_len == 8 &&
+        (stream_flag == TAI_STREAM_START || stream_flag == TAI_STREAM_ONE_SHOT)) {
+        emit_audio(ctx, payload + 8, 0, stream_flag, data_id, ts_ms);
+    }
+    if (ctx->on_audio) {
+        ctx->rx_pending_body    = payload + 8;
+        ctx->rx_pending_len     = payload_len - 8;
+        ctx->rx_pending_flag    = stream_flag;
+        ctx->rx_pending_data_id = data_id;
+        ctx->rx_pending_ts_ms   = ts_ms;
+        tai_proto_drain_pending_audio(ctx);
+    }
     return TAI_OK;
 }
 
@@ -680,7 +696,7 @@ static int media_text(tai_ctx_t *ctx,
                       const uint8_t *payload, size_t payload_len)
 {
     if (payload_len < 3) {
-        TAI_LOGW(ctx->pal, TAG, "text media header truncated (%u < 3)", payload_len);
+        TAI_LOGW(ctx->pal, TAG, "text media header truncated (%zu < 3)", payload_len);
         return TAI_PROTO_ERR_MEDIA_HDR;
     }
     uint16_t data_id = tai_r16(payload);
@@ -709,7 +725,7 @@ static int media_image(tai_ctx_t *ctx,
                        const uint8_t *payload, size_t payload_len)
 {
     if (payload_len < 8) {
-        TAI_LOGW(ctx->pal, TAG, "image media header truncated (%u < 8)", payload_len);
+        TAI_LOGW(ctx->pal, TAG, "image media header truncated (%zu < 8)", payload_len);
         return TAI_PROTO_ERR_MEDIA_HDR;
     }
     uint16_t data_id = 0; uint8_t stream_flag = 0; uint64_t ts_ms = 0;
@@ -782,7 +798,8 @@ int tai_proto_dispatch(tai_ctx_t *ctx,
         }
 
         latch_event_id(ctx, attrs, attr_count);
-        emit_event(ctx, evt_type, evt_data, evt_data_len);
+        emit_event(ctx, evt_type, evt_data, evt_data_len,
+                   tai_attr_find(attrs, attr_count, TAI_ATTR_USER_DATA));
         if (evt_type == TAI_EVT_END)
             ctx->rx_event_id[0] = '\0';   /* turn over: clear after firing END */
         break;

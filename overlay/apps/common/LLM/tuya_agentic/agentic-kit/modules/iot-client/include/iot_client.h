@@ -25,7 +25,6 @@
 #define OPRT_NOT_SUPPORTED            (-0x0005) //-5, Not supported
 #define OPRT_MALLOC_FAILED            (-0x0006) //-6, Memory allocation failed
 #define OPRT_TLS_HANDSHAKE_FAILED     (-0x0007) //-7, TLS handshake failed
-#define OPRT_OTA_VERIFY_FAILED        (-0x000D) //-13, OTA firmware digest mismatch (值与上游 agentic-kit 一致)
 
 /* -0x0008..-0x000C are used by iot_dp.h (DP error codes) */
 #define OPRT_OTA_VERIFY_FAILED        (-0x000D) //-13, OTA firmware digest mismatch
@@ -33,8 +32,12 @@
 
 /* ---- Logging subsystem ----
  * The IoT SDK shares the process-wide log facade (see log.h).
- * To redirect output: log_set_handler(my_fn);
- * To filter at runtime: log_set_level(LOG_INFO);
+ * To take over the dispatch (destination, format): define AGENTIC_KIT_LOG;
+ * a function target can reuse the default output via log_emit_valist();
+ * To quiet the SDK: build with -DAGENTIC_KIT_LOG_LEVEL=N (no runtime level
+ * and no runtime handler -- the destination is a compile-time fact);
+ * to quiet only iot-client: -DAGENTIC_KIT_IOT_LOG_LEVEL=N (defaults to
+ * the SDK-wide ceiling; cannot exceed it).
  */
 
 typedef enum {
@@ -78,8 +81,8 @@ typedef struct {
  * @brief Initialize IoT SDK with the built-in default PAL adapter (POSIX / FreeRTOS).
  *
  * Must be called before any other SDK function.  Logging is dispatched
- * through the log facade — install a custom handler with
- * log_set_handler() if you need non-default output.
+ * through the log facade — the destination is a compile-time fact: define
+ * AGENTIC_KIT_LOG (log.h) for non-default output.
  *
  * @return OPRT_OK on success
  */
@@ -108,6 +111,27 @@ IOT_API int iot_init(const pal_t *pal);
 typedef void (*iot_message_callback_t)(const char *topic, size_t topic_len,
                                        const uint8_t *data, size_t data_len);
 
+
+/**
+ * @brief Callback for authenticated AI control messages delivered over MQTT.
+ *
+ * Fires on the thread calling iot_client_process(). The type and JSON data are
+ * borrowed and remain valid only for the callback duration. Keep the callback
+ * non-blocking and copy anything retained after it returns.
+ *
+ * A protocol-9000 notice this layer cannot scope -- a non-object data or
+ * data.data, a non-string type, or a re-serialization allocation failure --
+ * is left unconsumed and continues to the raw message callback.
+ *
+ * @param type      Control event type, such as "asrInterrupt".
+ * @param json_data Serialized event-specific data; not necessarily an object.
+ *                 Re-serialized from the parsed notice with cJSON (unformatted),
+ *                 so its byte layout can differ from the original wire bytes.
+ * @param data_len  Length of @p json_data, excluding any terminating NUL.
+ * @param user_data Opaque pointer supplied at registration.
+ */
+typedef void (*ai_ctrl_callback_t)(const char *type, const char *json_data,
+                                   size_t data_len, void *user_data);
 
 /**
  * @brief Reset type classification (mirrors TuyaOpen TUYA_RESET_TYPE_REMOTE_*).
@@ -271,6 +295,9 @@ struct iot_dp_context;
     void *reset_user_data;                    // Opaque pointer passed back to reset_callback
     tuya_iot_ota_confirm_callback_t ota_confirm_callback; // APP-confirmed OTA (protocol 15) callback
     void *ota_confirm_user_data;                      // Opaque pointer passed back to ota_confirm_callback
+    ai_ctrl_callback_t ai_ctrl_callback;              // AI control (protocol 9000) callback
+    void *ai_ctrl_user_data;                          // Opaque pointer passed back to ai_ctrl_callback
+
     struct iot_dp_context *dp;    // DP layer state; points into dp_storage, NULL when inactive
     void *dp_storage[IOT_DP_CONTEXT_STORAGE / sizeof(void *)]; // inline storage for *dp (no heap)
  } iot_client_t;
@@ -435,6 +462,23 @@ IOT_API int iot_client_process(iot_client_t *client, uint32_t timeout_ms);
  * @return OPRT_OK on success, OPRT_INVALID_PARAMETER if client is NULL
  */
 IOT_API int iot_client_publish(iot_client_t *client, const uint8_t *data, size_t data_len);
+
+/**
+ * @brief Register the MQTT protocol-9000 AI control callback.
+ *
+ * Register before the application starts pumping MQTT messages. If commands
+ * must be observable during initial MQTT subscription, initialize with
+ * mqtt_disable_auto_connect=true, register here, then call iot_client_connect().
+ * Passing NULL as @p callback deregisters the current callback.
+ *
+ * @param client    IoT client instance.
+ * @param callback  Callback, or NULL to deregister.
+ * @param user_data Opaque pointer passed to @p callback.
+ * @return OPRT_OK, or OPRT_INVALID_PARAMETER if @p client is NULL.
+ */
+IOT_API int iot_ai_ctrl_set_callback(iot_client_t *client,
+                                     ai_ctrl_callback_t callback,
+                                     void *user_data);
 
 /**
  * @brief Get AI agent session token from Tuya cloud.

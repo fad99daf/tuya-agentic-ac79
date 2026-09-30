@@ -165,14 +165,15 @@ typedef struct tai_ctx tai_ctx_t;
 /* --- Audio --------------------------------------------------------------- */
 typedef struct tai_audio_msg {
     const uint8_t *data;            /* Opus frame / PCM bytes; callback-lifetime */
-    size_t         len;
+    size_t         len;             /* may be 0 for a header-only START/ONE_SHOT */
     uint8_t        codec;           /* TAI_AUDIO_OPUS / TAI_AUDIO_PCM / 0=unknown */
     uint32_t       sample_rate;     /* Hz, 0 if unknown                          */
     uint16_t       frame_duration;  /* ms per Opus frame                         */
     uint8_t        stream_flag;     /* TAI_STREAM_* (from the media header)       */
     uint16_t       data_id;         /* Data ID: AUDIO_DOWN(2) / AUDIO_AUX(7)      */
     const char    *event_id;        /* turn id, borrowed; "" if none             */
-    uint64_t       timestamp_ms;    /* stream-start ts (media header)            */
+    uint64_t       timestamp_ms;    /* server media-header timestamp, not local time;
+                                    * latch START's value for stream filtering */
     uint8_t        _reserved[8];
 } tai_audio_msg_t;
 
@@ -212,6 +213,8 @@ typedef struct tai_event_msg {
     const uint8_t *data;            /* event payload (often JSON); callback-life */
     size_t         len;
     const char    *event_id;        /* attr 61, borrowed; "" if absent           */
+    const uint8_t *user_data;       /* attr 111, borrowed, NOT NUL-terminated; NULL if absent */
+    size_t         user_data_len;   /* separate from event payload; SDK does not parse JSON */
     uint8_t        _reserved[8];
 } tai_event_msg_t;
 
@@ -328,6 +331,25 @@ typedef struct tai_config {
     void (*on_disconnect)(tai_ctx_t *ctx, const tai_disconnect_msg_t *msg, void *user_data);
     void *user_data;
 
+    /* Optional TCP receive backpressure. Called on the worker thread before
+     * each receive and between complete buffered Frames. A conforming server
+     * never consults it during the synchronous connect handshake (the ack
+     * precedes media); only a server coalescing media ahead of the ack could.
+     * Return nonzero to admit another Frame or
+     * read; return 0 to pause parsing and skip the read, allowing the TCP receive
+     * window to close. This pauses all inbound traffic, including ChatBreak,
+     * text, Pong, and EOF detection. Receive-liveness timeout accounting is
+     * suspended during the pause; reopening admission grants a fresh
+     * ping_timeout_ms budget. Pings and requested shutdown remain active, and a
+     * Ping send failure still disconnects. The hook must return promptly.
+     *
+     * Admission is also checked before each codec-frame callback within an Audio
+     * Packet. A pause retains its remaining bytes without copying; resuming
+     * delivers them before any later Packet. Applications filter obsolete audio
+     * in on_audio using their own synchronized interruption state, not by mutating
+     * SDK receive state. NULL means receive continuously. */
+    int (*on_flow_control)(tai_ctx_t *ctx, void *user_data);
+
 } tai_config_t;
 
 /* =========================================================================
@@ -415,21 +437,20 @@ int tai_send_mcp_response(tai_ctx_t *ctx, const char *json_rpc_response);
 /* =========================================================================
  * Logging
  *
- * The SDK emits log messages through the global log facade.  Two
- * filters apply:
+ * The SDK emits log messages through the global log facade.  The filters
+ * are compile-time: the SDK-wide AGENTIC_KIT_LOG_LEVEL (default 4 = DEBUG;
+ * gated once in common/log.h), optionally lowered for this module alone by
+ * AGENTIC_KIT_TAI_LOG_LEVEL (defaults to the SDK-wide value; cannot exceed
+ * it).  Messages above their ceiling are optimised away at build time;
+ * below it, a line emits unconditionally -- there is no runtime level knob.
  *
- *   1. Compile-time maximum (TAI_LOG_LEVEL, default 4 = DEBUG).
- *      Messages above this level are optimised away at build time.
- *   2. Runtime level, set via tai_set_log_level().  Default: TAI_LOG_INFO.
- *
- * These thin inlines exist for source-compatibility with callers; new
- * code should prefer log_set_level() / log_get_level() directly.
- *
- * Valid level values are TAI_LOG_ERROR (1) through TAI_LOG_DEBUG (4).
- * Use 0 to disable all logging at runtime.
+ * Quiet a build with -DAGENTIC_KIT_LOG_LEVEL=N (valid values: 0 = none,
+ * then TAI_LOG_ERROR (1) .. TAI_LOG_DEBUG (4)); quiet only rtc-tcp-client
+ * with -DAGENTIC_KIT_TAI_LOG_LEVEL=N.  The destination is
+ * decided at compile time as well: define AGENTIC_KIT_LOG (see log.h)
+ * to route every line into your own macro — a function target can
+ * reuse the default output via log_emit_valist().
  * ========================================================================= */
-static inline void tai_set_log_level(int level) { log_set_level(level); }
-static inline int  tai_get_log_level(void)      { return log_get_level(); }
 
 #ifdef __cplusplus
 }
