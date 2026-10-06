@@ -35,7 +35,7 @@ diff --strip-trailing-cr <(git -C D:/code/agentic-kit show 5f4d845:modules/iot-c
 
 阶段 1 实际执行记录(2026-09-30,推翻 09-29 报告的两项预判):
 
-- `%zu` **未转换**:基线 49ab2af 本就带 8 处 %zu 且随整机出厂跑同一 log 门面,无异常证据 → 保留上游原样(树内现 11 处),逐行对齐优先。
+- `%zu` **未转换**:基线 49ab2af 本就带 8 处 %zu 且随整机出厂跑同一 log 门面,无异常证据 → 保留上游原样(树内现 11 处),逐行对齐优先。(**2026-10-06 已推翻:13 处 %zu 当时全在冷路径未执行属侥幸,stage-2 扩进热路径即崩;已全量扫除,见下方"平台适配记录"**)
 - `<time.h>`/`time(NULL)`/`<inttypes.h>`/mbedtls 角括号 **零适配**:树内均有先例(atop.c time(NULL)×4、cipher_wrapper.c `<mbedtls/gcm.h>` 可编)。
 - 应用层被迫改:`mqtt_auto_connect`→`mqtt_disable_auto_connect`(上游语义反转,false=自动连接;demo.c 四处改 `= false` 保持原"自动连接"行为不变)。
 - 合并去重两处:iot_client.h 我方 12e90d0 移植的 iot_reset_type_t/回调 typedef(换上游完整文档版)、iot_dns.c PROD switch 重复 SG case(我方 85740c6 与上游 ee7fd65 双份)。
@@ -50,6 +50,13 @@ diff --strip-trailing-cr <(git -C D:/code/agentic-kit show 5f4d845:modules/iot-c
 - **tai_connect 返回时机核查**:confirmed-connect(同步等 SessionNew ack)在 5f4d845 与 48e3c0c 逐行一致,阶段 1 板测已覆盖此时序,无需 demo 适配(方案风险点销案)。
 - **on_flow_control 留 NULL**:阶段 2 不做背压真接线(阶段 3 项);tai_config_t 尾字段 NULL=连续接收,行为与旧版一致。
 
+平台适配记录(2026-10-06,激活 axi_rd_inv 崩机定案修复,**永久保留,re-vendor 重放必做**):
+
+- **格式符扫除**:kit 8 文件(iot-client:atop.c / iot_client.c / iot_dp.c / iot_on_boarding.c;rtc-tcp-client:tai_client.c / tai_pkt_log.c / tai_protocol.c / tai_transport.c)全部 `%zu`→`%u`(35 处)、`%llu`→`(unsigned)` cast + `%u`(5 行 6 处:tai_client liveness/ping、tai_pkt_log case8/timestamp、tai_protocol CONNECTION_REFRESH_RESP)。
+- **机制**:杰理 printf 把 'z'/'ll' 当 64 位长度符,va_arg 在 32 位 ABI 上吃双槽 → 参数流错位一格 → 后续 `%.4s` 把栈垃圾当指针解引用 → 非法 AXI 读(axi_rd_inv)。5 次崩机指纹逐值相同;F′(redirect 整体旁路)绿 / F‡(保留 vsnprintf)崩在 Token 行、字节未出;git 取证 stage-1 Token 行是 %u、13 处 %zu 全在冷路径 → "格式符曾跑绿"反例证伪。
+- **安全性背书**:size_t 本平台(pi32v2)=32 位,%u 单槽读值不变;阶段 1 Token 行即 %u/%.4s 组合,板上打印正常。
+- **重放铁律:凡上游新代码引入 %zu/%llu 一律重扫成 %u / (unsigned)%u**,不留侥幸(libopus fixed_debug.h/MacroDebug.h 的 %llu 是编译门控调试机件,不在扫描范围)。
+
 ## 3. 本地补丁台账(overlay 提交 → 内容)
 
 | overlay 提交 | 日期 | 内容 | 主要落点 |
@@ -61,6 +68,7 @@ diff --strip-trailing-cr <(git -C D:/code/agentic-kit show 5f4d845:modules/iot-c
 | `align-phase0` | 09-30 | 阶段 0 热修(NST + EOF/link_dead) | tls.c / mqtt.c |
 | (阶段 1) | 09-30 | re-vendor 至 5f4d845;保留全部上述补丁 + 静默分流/进度上报/send_only reset/诊断日志;换上游 protocol11/15 opt-in、iot_ota_verify.c、reset v5.0(与 factory_reset 共存) | 全 kit(除 tuya-ble/third_party)+ demo.c 字段名 + Makefile/.cbp +iot_atop.c |
 | (阶段 2) | 09-30 | re-vendor 至 48e3c0c(0.5.0);AGENTIC_KIT_ 旋钮前缀+头拆分、编译期日志门面+本地运行时层、9000 通道、pal sleep_ms、时间过滤双判对照;全部本地补丁(ConnectionRefresh/长流v3/OTA 双 API/send_only/schema 自愈/[MQTT-RX]/tls_write 诊断/tai_current_event_id)对账存活 | 全 kit(除 tuya-ble/third_party)+ pal_ac791n.c + demo.c 接线 + Makefile/.cbp +iot_ai_ctrl.c |
+| (格式符扫除) | 10-06 | 杰理 printf 64 位长度符崩机修复:%zu→%u 35 处 + %llu→(unsigned)%u 6 处,共 8 文件;详见 §2 平台适配记录 | iot-client 4 文件 + rtc-tcp-client 4 文件 |
 
 另:tls.c 内嵌 tls_write 慢链路诊断(海外弱网定位,约 15 行,无上游对应,升级时保留)。
 

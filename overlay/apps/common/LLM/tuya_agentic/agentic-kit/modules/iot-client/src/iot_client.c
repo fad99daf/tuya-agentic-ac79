@@ -656,7 +656,7 @@ IOT_API int iot_client_get_session_token_ex(iot_client_t *client, const char *ag
     }
     size_t resp_token_len = strlen(resp.token);
     if (resp_token_len >= token_len) {
-        IOT_LOGE("token buffer too small: need %zu, have %zu", resp_token_len + 1, token_len);
+        IOT_LOGE("token buffer too small: need %u, have %u", resp_token_len + 1, token_len);
         client->pal->free(resp.token);
         return OPRT_INVALID_RESULT;
     }
@@ -771,7 +771,7 @@ IOT_API int iot_get_ca_certificate(iot_client_t *client, const char *host, uint1
         return OPRT_INVALID_RESULT;
     }
     if (cert_len >= ca_certificate_len) {
-        IOT_LOGE("ca_certificate buffer too small: need %zu, have %zu", cert_len + 1, ca_certificate_len);
+        IOT_LOGE("ca_certificate buffer too small: need %u, have %u", cert_len + 1, ca_certificate_len);
         iot_dns_ca_cert_response_free(pal, &resp);
         return OPRT_INVALID_RESULT;
     }
@@ -854,7 +854,7 @@ IOT_API int iot_get_qrcode_info(const iot_qrcode_request_t *request, char *url, 
 
     size_t resp_url_len = strlen(resp.short_url);
     if (resp_url_len >= url_len) {
-        IOT_LOGE("url buffer too small: need %zu, have %zu", resp_url_len + 1, url_len);
+        IOT_LOGE("url buffer too small: need %u, have %u", resp_url_len + 1, url_len);
         pal->free(resp.short_url);
         return OPRT_INVALID_RESULT;
     }

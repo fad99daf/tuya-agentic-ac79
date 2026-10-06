@@ -658,7 +658,7 @@ int atop_ai_token_get(const pal_t *pal, const ai_token_request_t *request, ai_to
         return OPRT_MALLOC_FAILED;
     }
 
-    IOT_LOGD("token: [%zu chars, prefix=%.4s...]",
+    IOT_LOGD("token: [%u chars, prefix=%.4s...]",
               strlen(response->token),
               strlen(response->token) >= 4 ? response->token : "----");
     return OPRT_OK;
@@ -786,7 +786,7 @@ int atop_schema_newest_get(const pal_t *pal, const schema_newest_request_t *requ
     atop_base_response_free(pal, &atop_response);
 
     if (response->updated) {
-        IOT_LOGI("atop_schema_newest_get: newer schema received (%zu bytes)",
+        IOT_LOGI("atop_schema_newest_get: newer schema received (%u bytes)",
                  strlen(response->schema));
     } else {
         IOT_LOGD("atop_schema_newest_get: no newer schema");

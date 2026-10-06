@@ -321,8 +321,8 @@ static void put_aval(char *buf, size_t cap, size_t *pos,
         case 1: bput(buf, cap, pos, "%u", (unsigned)a->value[0]); break;
         case 2: bput(buf, cap, pos, "%u", (unsigned)tai_r16(a->value)); break;
         case 4: bput(buf, cap, pos, "%u", (unsigned)tai_r32(a->value)); break;
-        case 8: bput(buf, cap, pos, "%llu",
-                     (unsigned long long)tai_r64(a->value)); break;
+        case 8: bput(buf, cap, pos, "%u",
+                     (unsigned)tai_r64(a->value)); break;
         default: bput(buf, cap, pos, "0"); break;
         }
     } else if (is_str_attr(a->type)) {
@@ -380,7 +380,7 @@ static void put_payload(char *buf, size_t cap, size_t *pos,
 
         size_t text_len = (plen > offset) ? plen - offset : 0;
         bput(buf, cap, pos,
-             "{\"data-id\":%u,\"stream-flag\":\"%s\",\"seq\":%u,\"length\":%zu",
+             "{\"data-id\":%u,\"stream-flag\":\"%s\",\"seq\":%u,\"length\":%u",
              (unsigned)data_id, sflag_kebab(sf), (unsigned)seq, text_len);
         if (text_len > 0) {
             bput(buf, cap, pos, ",\"data\":");
@@ -405,9 +405,9 @@ static void put_payload(char *buf, size_t cap, size_t *pos,
         uint64_t ts = packed & UINT64_C(0x3FFFFFFFFFF);
         bput(buf, cap, pos,
              "{\"id\":%u,\"stream-flag\":\"%s\","
-             "\"timestamp\":%llu,\"pts\":0,\"length\":%zu}",
+             "\"timestamp\":%u,\"pts\":0,\"length\":%u}",
              (unsigned)data_id, sflag_kebab(sf),
-             (unsigned long long)ts,
+             (unsigned)ts,
              plen - 8);
         break;
     }
@@ -420,7 +420,7 @@ static void put_payload(char *buf, size_t cap, size_t *pos,
         size_t data_len = plen - 2;
         bput(buf, cap, pos, "{\"event-type\":\"%s\"", evt_kebab(evt));
         if (data_len > 0 && data_off + data_len <= plen) {
-            bput(buf, cap, pos, ",\"length\":%zu,\"data\":", data_len);
+            bput(buf, cap, pos, ",\"length\":%u,\"data\":", data_len);
             put_jstr(buf, cap, pos,
                      (const char *)(p + data_off), data_len);
         }
@@ -510,7 +510,7 @@ static const char *format_packet_log(char buf[TAI_LOG_BUF_SIZE],
              (unsigned)AGENTIC_KIT_TAI_LOG_MEDIA_SAMPLE_N, (unsigned)sample_idx);
 
     if (!is_send)
-        bput(buf, cap, &pos, ",\"payload-len\":%zu", payload_len);
+        bput(buf, cap, &pos, ",\"payload-len\":%u", payload_len);
 
     bput(buf, cap, &pos, ",\"attributes\":");
     put_attrs(buf, cap, &pos, attrs, attr_count);

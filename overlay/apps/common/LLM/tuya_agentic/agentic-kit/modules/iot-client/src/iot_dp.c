@@ -126,7 +126,7 @@ static char *dp_base64_encode(const pal_t *pal, const uint8_t *data, size_t len)
     if (olen == 0) olen = 1;
     char *out = (char *)pal->malloc(olen);
     if (!out) {
-        IOT_LOGE("dp: base64 encode alloc failed (%zu bytes)", olen);
+        IOT_LOGE("dp: base64 encode alloc failed (%u bytes)", olen);
         return NULL;
     }
     if (mbedtls_base64_encode((unsigned char *)out, olen, &olen, src, len) != 0) {
@@ -297,7 +297,7 @@ void iot_dp_rebuild(iot_client_t *client)
     dp_entries_free(pal, old_entries, old_count);
     /* Use the local copy, not ctx->loose, which is shared state read here without
      * the lock. */
-    IOT_LOGI("dp: registry rebuilt (%zu DPs, %s)", new_count, loose ? "loose" : "schema");
+    IOT_LOGI("dp: registry rebuilt (%u DPs, %s)", new_count, loose ? "loose" : "schema");
 }
 
 /* ============================================================================
@@ -367,7 +367,7 @@ static int dp_store(const pal_t *pal, iot_dp_entry_t *e, const iot_dp_value_t *v
         if (v->value.raw.len > 0) {
             copy = (uint8_t *)pal->malloc(v->value.raw.len);
             if (!copy) {
-                IOT_LOGE("dp: raw value alloc failed for dp %u (%zu bytes)", (unsigned)e->id, v->value.raw.len);
+                IOT_LOGE("dp: raw value alloc failed for dp %u (%u bytes)", (unsigned)e->id, v->value.raw.len);
                 return OPRT_MALLOC_FAILED;
             }
             memcpy(copy, v->value.raw.data, v->value.raw.len);
@@ -685,7 +685,7 @@ static int dp_publish_report(iot_client_t *client, char *json)
     const pal_t *pal = client->pal;
     size_t jl = strlen(json);
     if (jl + DP_PV23_OVERHEAD > DP_MQTT_MAX_PAYLOAD) {
-        IOT_LOGE("dp: report payload too large (%zu bytes, max %d) — split via iot_dp_report",
+        IOT_LOGE("dp: report payload too large (%u bytes, max %d) — split via iot_dp_report",
                   jl, DP_MQTT_MAX_PAYLOAD - DP_PV23_OVERHEAD);
         pal->free(json);
         return OPRT_DP_PAYLOAD_TOO_LARGE;
@@ -1082,7 +1082,7 @@ bool iot_dp_dispatch_downlink(iot_client_t *client, const char *topic, size_t to
                 }
                 pal->free(snap);
             } else if (dp_cb && nchanged > 0) {
-                IOT_LOGW("dp: callback snapshot alloc failed; skipped %zu downlink callbacks", nchanged);
+                IOT_LOGW("dp: callback snapshot alloc failed; skipped %u downlink callbacks", nchanged);
             }
             if (nchanged > 0) dp_fire_save(client);
         }

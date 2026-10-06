@@ -135,7 +135,7 @@ int tai_frame_encode(uint8_t frag_flag, uint16_t sequence,
 
     size_t frame_len = 5 + payload_len + sig_len;
     if (frame_len > out_size) {
-        TAI_LOGE(pal, TAG, "frame_encode: out buffer too small (need=%zu have=%zu)", frame_len, out_size);
+        TAI_LOGE(pal, TAG, "frame_encode: out buffer too small (need=%u have=%u)", frame_len, out_size);
         return TAI_ERR_MEM;
     }
     if (payload_len + sig_len > 0xFFFFU)  return TAI_ERR_ARGS;
@@ -156,7 +156,7 @@ int tai_frame_encode(uint8_t frag_flag, uint16_t sequence,
         }
     }
 
-    TAI_LOGD(pal, TAG, "frame_encode: frag=%s seq=%u payload=%zu total=%zu",
+    TAI_LOGD(pal, TAG, "frame_encode: frag=%s seq=%u payload=%u total=%u",
              tai_frag_flag_name(frag_flag), sequence, payload_len, frame_len);
     return (int)frame_len;
 }
@@ -223,7 +223,7 @@ int tai_frame_verify(const uint8_t *raw_frame, size_t frame_len,
         diff |= computed[i] ^ sig[i];
 
     if (diff != 0) {
-        TAI_LOGW(pal, TAG, "HMAC verify failed (frame_len=%zu sig_len=%u)", frame_len, sig_len);
+        TAI_LOGW(pal, TAG, "HMAC verify failed (frame_len=%u sig_len=%u)", frame_len, sig_len);
     }
     return (diff == 0) ? TAI_OK : TAI_ERR_HMAC;
 }

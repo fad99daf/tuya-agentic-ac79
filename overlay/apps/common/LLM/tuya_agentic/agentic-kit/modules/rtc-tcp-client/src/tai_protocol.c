@@ -234,7 +234,7 @@ int tai_proto_build_event_start(tai_ctx_t *ctx,
                 + strlen(cparam) + 24;
     char *ud_json = (char *)ctx->pal->malloc(ud_cap);
     if (!ud_json) {
-        TAI_LOGE(ctx->pal, TAG, "build_event_start: user-data alloc failed (%zu bytes)", ud_cap);
+        TAI_LOGE(ctx->pal, TAG, "build_event_start: user-data alloc failed (%u bytes)", ud_cap);
         return TAI_ERR_MEM;
     }
 
@@ -654,7 +654,7 @@ static int media_audio(tai_ctx_t *ctx,
                        const uint8_t *payload, size_t payload_len)
 {
     if (payload_len < 8) {
-        TAI_LOGW(ctx->pal, TAG, "audio media header truncated (%zu < 8)", payload_len);
+        TAI_LOGW(ctx->pal, TAG, "audio media header truncated (%u < 8)", payload_len);
         return TAI_PROTO_ERR_MEDIA_HDR;
     }
     uint16_t data_id = 0; uint8_t stream_flag = 0; uint64_t ts_ms = 0;
@@ -696,7 +696,7 @@ static int media_text(tai_ctx_t *ctx,
                       const uint8_t *payload, size_t payload_len)
 {
     if (payload_len < 3) {
-        TAI_LOGW(ctx->pal, TAG, "text media header truncated (%zu < 3)", payload_len);
+        TAI_LOGW(ctx->pal, TAG, "text media header truncated (%u < 3)", payload_len);
         return TAI_PROTO_ERR_MEDIA_HDR;
     }
     uint16_t data_id = tai_r16(payload);
@@ -725,7 +725,7 @@ static int media_image(tai_ctx_t *ctx,
                        const uint8_t *payload, size_t payload_len)
 {
     if (payload_len < 8) {
-        TAI_LOGW(ctx->pal, TAG, "image media header truncated (%zu < 8)", payload_len);
+        TAI_LOGW(ctx->pal, TAG, "image media header truncated (%u < 8)", payload_len);
         return TAI_PROTO_ERR_MEDIA_HDR;
     }
     uint16_t data_id = 0; uint8_t stream_flag = 0; uint64_t ts_ms = 0;
@@ -878,8 +878,8 @@ int tai_proto_dispatch(tai_ctx_t *ctx,
         if (st) code   = tai_attr_u16(st);
         if (ex) expire = tai_attr_u64(ex);
         TAI_LOGI(ctx->pal, TAG,
-                 "CONNECTION_REFRESH_RESP: code=%u latest_expire_ts=%llu",
-                 code, (unsigned long long)expire);
+                 "CONNECTION_REFRESH_RESP: code=%u latest_expire_ts=%u",
+                 code, (unsigned)expire);
         break;
     }
 

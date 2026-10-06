@@ -280,7 +280,7 @@ static int activate_device(const pal_t *pal, on_boarding_config_t *on_boarding, 
     request.cert_bundle_attach = on_boarding->cert_bundle_attach;
 
     IOT_LOGI("Sending activation request with:");
-    IOT_LOGI("  - Token: [%zu chars, prefix=%.4s...]",
+    IOT_LOGI("  - Token: [%u chars, prefix=%.4s...]",
              request.token ? strlen(request.token) : 0,
              (request.token && strlen(request.token) >= 4) ? request.token : "----");
     IOT_LOGI("  - Software Version: %s", request.sw_ver);
@@ -509,7 +509,7 @@ int on_boarding_with_qrcode(const pal_t *pal, on_boarding_config_t *on_boarding,
     // clientId: acon_{uuid}
     client_id = (char *)pal->malloc(6 + uuid_len);
     if (!client_id) {
-        IOT_LOGE("Failed to allocate client_id buffer (%zu bytes)", 6 + uuid_len);
+        IOT_LOGE("Failed to allocate client_id buffer (%u bytes)", 6 + uuid_len);
         ret = OPRT_MALLOC_FAILED;
         goto end;
     }
@@ -519,7 +519,7 @@ int on_boarding_with_qrcode(const pal_t *pal, on_boarding_config_t *on_boarding,
     // username: acon_{uuid}|pv=2.3
     username = (char *)pal->malloc(14 + uuid_len);
     if (!username) {
-        IOT_LOGE("Failed to allocate username buffer (%zu bytes)", 14 + uuid_len);
+        IOT_LOGE("Failed to allocate username buffer (%u bytes)", 14 + uuid_len);
         ret = OPRT_MALLOC_FAILED;
         goto end;
     }
@@ -537,7 +537,7 @@ int on_boarding_with_qrcode(const pal_t *pal, on_boarding_config_t *on_boarding,
     // subscribe topic: d/ai/{uuid}
     subscribe_topic = (char *)pal->malloc(6 + uuid_len);
     if (!subscribe_topic) {
-        IOT_LOGE("Failed to allocate subscribe_topic buffer (%zu bytes)", 6 + uuid_len);
+        IOT_LOGE("Failed to allocate subscribe_topic buffer (%u bytes)", 6 + uuid_len);
         ret = OPRT_MALLOC_FAILED;
         goto end;
     }
@@ -590,7 +590,7 @@ int on_boarding_with_qrcode(const pal_t *pal, on_boarding_config_t *on_boarding,
     size_t broker_url_len = strlen(scheme) + 3 + strlen(mqtt_addr) + 1;
     broker_url = (char *)pal->malloc(broker_url_len);
     if (!broker_url) {
-        IOT_LOGE("Failed to allocate broker URL buffer (%zu bytes)", broker_url_len);
+        IOT_LOGE("Failed to allocate broker URL buffer (%u bytes)", broker_url_len);
         iot_dns_url_config_response_free(pal, &dns_resp);
         ret = OPRT_MALLOC_FAILED;
         goto end;

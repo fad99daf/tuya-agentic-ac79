@@ -444,7 +444,7 @@ int tai_connect(tai_ctx_t *ctx)
         TAI_LOGE(ctx->pal, TAG, "key derivation failed: %d", rc);
         return rc;
     }
-    TAI_LOGD(ctx->pal, TAG, "keys derived (ikm_len=%zu)", ikm_len);
+    TAI_LOGD(ctx->pal, TAG, "keys derived (ikm_len=%u)", ikm_len);
 
     /* 3. TLS connect (or raw TCP in test mode) */
     if (ctx->disable_tls) {
@@ -677,7 +677,7 @@ static int process_app_packet(tai_ctx_t *ctx,
                                 attrs, AGENTIC_KIT_TAI_MAX_ATTRS, &attr_count,
                                 &payload, &payload_len);
     if (rc != TAI_OK) {
-        TAI_LOGW(ctx->pal, TAG, "packet decode failed: %d (app_len=%zu)", rc, app_len);
+        TAI_LOGW(ctx->pal, TAG, "packet decode failed: %d (app_len=%u)", rc, app_len);
         return TAI_PROTO_ERR_PKT_DECODE;   /* fatal cause, returned to the worker */
     }
 
@@ -766,7 +766,7 @@ static int tai_process_rx(tai_ctx_t *ctx, int *paused)
             size_t wire_len = ctx->rx_pending_wire_len;
             if (wire_len < 5 || wire_len > ctx->rx_len) {
                 TAI_LOGE(ctx->pal, TAG,
-                         "pending slide out of range: wire=%zu rx=%zu",
+                         "pending slide out of range: wire=%u rx=%u",
                          wire_len, ctx->rx_len);
                 return TAI_PROTO_ERR_FRAME_DECODE;
             }
@@ -793,7 +793,7 @@ static int tai_process_rx(tai_ctx_t *ctx, int *paused)
          * the server ignores the advertised MAX_FRAGMENT_LEN. */
         if (needed > sizeof(ctx->rx_buf)) {
             TAI_LOGE(ctx->pal, TAG,
-                     "inbound frame %zu B exceeds rx_buf %zu B (server ignored MAX_FRAGMENT_LEN?)",
+                     "inbound frame %u B exceeds rx_buf %u B (server ignored MAX_FRAGMENT_LEN?)",
                      needed, sizeof(ctx->rx_buf));
             return TAI_PROTO_ERR_OVERSIZED;
         }
@@ -803,7 +803,7 @@ static int tai_process_rx(tai_ctx_t *ctx, int *paused)
         int rc = tai_frame_verify(ctx->rx_buf, needed,
                                    ctx->sig_len, ctx->sign_key, ctx->pal);
         if (rc != TAI_OK) {
-            TAI_LOGW(ctx->pal, TAG, "HMAC verify failed (frame=%zu bytes)", needed);
+            TAI_LOGW(ctx->pal, TAG, "HMAC verify failed (frame=%u bytes)", needed);
             return TAI_PROTO_ERR_HMAC;
         }
 
@@ -967,7 +967,7 @@ static int send_text_locked(tai_ctx_t *ctx, const char *text, size_t len)
 int tai_send_text(tai_ctx_t *ctx, const char *text, size_t len)
 {
     if (!ctx || !ctx->connected || !text) return TAI_ERR_ARGS;
-    TAI_LOGI(ctx->pal, TAG, "send_text: %zu bytes", len);
+    TAI_LOGI(ctx->pal, TAG, "send_text: %u bytes", len);
     ctx_lock(ctx);
     int rc = send_text_locked(ctx, text, len);
     ctx_unlock(ctx);
@@ -1132,7 +1132,7 @@ int tai_send_image(tai_ctx_t *ctx,
                    uint8_t format, uint16_t width, uint16_t height)
 {
     if (!ctx || !ctx->connected || !data) return TAI_ERR_ARGS;
-    TAI_LOGI(ctx->pal, TAG, "send_image: %zu bytes fmt=%u %ux%u",
+    TAI_LOGI(ctx->pal, TAG, "send_image: %u bytes fmt=%u %ux%u",
              len, format, width, height);
     ctx_lock(ctx);
     int rc = send_image_locked(ctx, data, len, format, width, height);
@@ -1204,7 +1204,7 @@ int tai_send_image_with_text(tai_ctx_t *ctx,
                              uint16_t width, uint16_t height)
 {
     if (!ctx || !ctx->connected || !text || !img_data) return TAI_ERR_ARGS;
-    TAI_LOGI(ctx->pal, TAG, "send_image_with_text: text=%zu img=%zu bytes",
+    TAI_LOGI(ctx->pal, TAG, "send_image_with_text: text=%u img=%u bytes",
              text_len, img_len);
     ctx_lock(ctx);
     int rc = send_image_with_text_locked(ctx, text, text_len,
@@ -1225,7 +1225,7 @@ int tai_send_image_audio_start(tai_ctx_t *ctx,
                                uint8_t bit_depth, uint32_t sample_rate)
 {
     if (!ctx || !ctx->connected || !img_data) return TAI_ERR_ARGS;
-    TAI_LOGI(ctx->pal, TAG, "image_audio_start: img=%zu bytes %ux%u codec=%u",
+    TAI_LOGI(ctx->pal, TAG, "image_audio_start: img=%u bytes %ux%u codec=%u",
              img_len, width, height, codec);
     ctx_lock(ctx);
 
@@ -1368,8 +1368,8 @@ static void *worker_thread(void *arg)
                                   ? ctx->last_rx_ms : ctx->last_pong_ms;
         if (last_resume_ms > last_alive) last_alive = last_resume_ms;
         if (!paused && now - last_alive > ctx->ping_timeout_ms) {
-            TAI_LOGW(ctx->pal, TAG, "worker: liveness timeout (%llu ms idle)",
-                     (unsigned long long)(now - last_alive));
+            TAI_LOGW(ctx->pal, TAG, "worker: liveness timeout (%u ms idle)",
+                     (unsigned)(now - last_alive));
             f_reason = TAI_DISCONNECT_TRANSPORT;
             f_detail = TAI_TRANSPORT_PING_TIMEOUT;
             break;
@@ -1377,9 +1377,9 @@ static void *worker_thread(void *arg)
 
         /* Periodic ping */
         if (now - ctx->last_ping_ms >= ctx->ping_interval_ms) {
-            TAI_LOGI(ctx->pal, TAG, "worker: sending ping at t=%llums (last_pong=%llums ago)",
-                     (unsigned long long)now,
-                     (unsigned long long)(now - ctx->last_pong_ms));
+            TAI_LOGI(ctx->pal, TAG, "worker: sending ping at t=%ums (last_pong=%ums ago)",
+                     (unsigned)now,
+                     (unsigned)(now - ctx->last_pong_ms));
             int ping_rc = tai_ping(ctx);
             if (ping_rc != TAI_OK) {
                 /* The ping is the worker's own TX health probe. A send failure
