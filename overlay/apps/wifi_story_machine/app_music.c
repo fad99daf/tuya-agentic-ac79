@@ -2196,6 +2196,13 @@ static int net_music_dec_stop(int save_breakpoint)
         return 0;
     }
 
+    /* 单一所有权护栏(2026-10-08 板测 axi_rd_inv 崩机修复):置位后,
+     * __net_music_dec_file 的 __err 不再自行 buf_inactive/DEC_STOP/
+     * net_download_close——本停止把在飞的解码 open 毒失败时,那边会与
+     * 这里并发对同一 net_file 双重 close(httpcli_close UAF)。下载句柄
+     * 的 teardown 全归本函数,末尾清位。*/
+    __this->net_stop_req = 1;
+
     led_ui_post_msg("dec_stop");
 
     net_download_buf_inactive(__this->net_file);
@@ -2307,6 +2314,8 @@ static int net_music_dec_stop(int save_breakpoint)
     net_download_close(__this->net_file);
     __this->net_file = NULL;
     __this->seek_step = 0;
+    __this->net_dec_started = 0;
+    __this->net_stop_req = 0;
 
     return 0;
 }
@@ -2515,6 +2524,8 @@ static int __net_music_dec_file(int breakpoint)
 
     server_request(__this->dec_server, AUDIO_REQ_DEC, &req);
 
+    __this->net_dec_started = 1;    /* 过了 open 在飞窗:tuya 停乐从这之后才允许 */
+
     net_download_set_pp(__this->net_file, 0);
 
 #ifdef CONFIG_NO_SDRAM_ENABLE
@@ -2535,6 +2546,14 @@ static int __net_music_dec_file(int breakpoint)
 
 __err:
     puts("play_net_music_faild\n");
+
+    if (__this->net_stop_req) {
+        /* 停止路径已持有 teardown 所有权(本次失败多半就是它的
+         * buf_inactive 毒的在飞 open):不再碰下载句柄,防止与
+         * net_music_dec_stop 并发 double-close(httpcli_close UAF,
+         * 2026-10-08 板测崩机)。ai 事件也免发——停止路径自己收尾。*/
+        return -EFAULT;
+    }
 
     net_download_buf_inactive(__this->net_file);
 
@@ -2632,6 +2651,8 @@ static int net_music_dec_file(void *_url, int breakpoint, void *handler, int arg
      * 异步等待网络下载ready，防止网络阻塞导致app卡住
      */
     __this->wait_download_suspend = 0;
+    __this->net_stop_req = 0;       /* 新一场:所有权/解码状态复位(上一场停止已清,兜底) */
+    __this->net_dec_started = 0;
 #if 1
     __this->wait_download = wait_completion(__net_download_ready,
                                             (int (*)(void *))__net_music_dec_file, (void *)breakpoint, NULL);
@@ -2869,6 +2890,21 @@ int app_music_tuya_music_busy(void)
         return 0;
     }
     return __this->net_file != NULL;
+}
+
+/* 网络音乐解码器是否已过 open 进入 START(真正出声)。music_handoff 的
+ * barge-in/唤醒停乐必须等过这一点:open 在飞(https/TLS 慢时 >1s)时强停,
+ * 正是 net_stop_req 护栏所防的并发 teardown 窗——与其事后护栏,不如根本
+ * 不在那个窗口发起停(真打断最多晚几十毫秒,START 一到即可停)。*/
+int app_music_tuya_music_started(void)
+{
+    if (__this->dec_ops != &net_music_dec_ops || !__this->net_file) {
+        return 0;
+    }
+    if (__this->wait_download) {
+        return 0;                   /* 还在等下载 ready:open 未发起 */
+    }
+    return __this->net_dec_started;
 }
 
 static int app_music_ai_listen_start(u8 voice_mode, u8 enable_vad);

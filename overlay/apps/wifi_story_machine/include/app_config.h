@@ -242,7 +242,7 @@
  *   收官证据:crc=0x9be4 写/冷读三开机一致;断电重上仍 load OK;K6 后直接 load OK
  *   无 write 再现 = 已写号区跨 K6 保留;zone 码驱动重配网激活第4个 devid 成功。
  * ★必须保持 0:留 1 = 每块新写号板开机即被擦;留 2 = 空板永远用宏自愈,STRICT 量产语义失效。*/
-#define TUYA_AUTH_RW_TEST  0   /* 1/2 两档验证均板上收官(2026-09-28),产线/日常恒为 0 */
+#define TUYA_AUTH_RW_TEST  0   /* [临时]10/8换pid至rckqt7yipzqx4tv9:板①已擦区+新pid激活成功,复位0定稿;测完恢复ptsig07xv6aehihz走RW_TEST=2重铸 */
 
 /* ===== 涂鸦下行 TTS 编码开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下生效)=====
  * 不定义(默认)= PCM:稳定能播,但 16k/16bit/mono=32KB/s,拥挤测试网易卡顿。
@@ -255,6 +255,15 @@
 /* 2026-08-28 回退:本地 libopus 软解方案在 silk_Decode 内触发确定性 axi_wr_inv 崩溃(根因未解),
  * 已放弃,恢复原杰理闭源 opus 解码路径(48k 出→软件 SRC 降 16k,颤音随之回来)。
  * 带宽仍是 opus 的 ~2KB/s。若颤音不可接受,注释下一行切纯 PCM 下行(实测不颤)。*/
+/* 2026-10-08 AEC 诊断件(L2):下行切 PCM 采 ref 后首测干净——TTS 回声自起轮整场未复现
+ * (播放期 ERLE 中位~20dB/残差 5-30万每秒,云端没咬),而 10/8 晨测(彼时 opus 下行)复发,
+ * 两测间唯一功能变量=下行 codec。
+ * 2026-10-08 晚 A/B B 侧:恢复 opus 复测(同代码只翻本宏,单变量对照定 codec 罪)。
+ *   ★opus 下行有颤音前科(8/27:48k 解码→SRC 降 16k 的时变幅度失真)——正是 AEC 线性
+ *     跟踪杀手,B 侧若回声复发即 codec 定罪,opus 降级为"省带宽但有回声/颤音代价"。
+ *   B 侧诊断件 ref 通道自动编译出局(串口 ref=0 属预期),pre/post 遥测照常可比。
+ * ★A/B 收口:定罪→恢复本行注释(PCM 常态)+注释 TUYA_AEC_DIAG;
+ *   无罪(晨测锅在会话/云状态)→保留本行(opus 常态)+注释 TUYA_AEC_DIAG。*/
 #define TUYA_DOWNLINK_OPUS_ENABLE
 
 /* ===== 涂鸦上行 ASR 编码开关(仅 CONFIG_TUYA_AGENTIC_ENABLE 下生效)=====
@@ -369,8 +378,37 @@
  *   开门逐帧实时上行;真声停 1s(25 帧 <TUYA_PLAY_GATE_REGATE_ENERGY)重新
  *   扣帧;播完(下行流结束且播放 cbuf 排空,640 判据)即归位。非播放期零
  *   改动,常开流对齐小智的行为不变。
- * 注释掉本宏 = 回纯长流基线(播放期照常逐帧上行)。*/
-#define TUYA_STREAM_PLAYBACK_GATE
+ * 注释掉本宏 = 回纯长流基线(播放期照常逐帧上行)。
+ * 2026-10-08 注释本宏(声学测试纯云形态,用户拍板"端侧把声音都交给云端,
+ * 不在端侧卡一道,不考虑成本"):TTS 播放期每帧照常上行,打断判定 100% 云端。
+ * 闸代码在 demo.c #ifdef 内原样保留,取消下一行注释即回闸。*/
+/* #define TUYA_STREAM_PLAYBACK_GATE */
+
+/* ★ 音乐期本地能量 barge-in 开关(2026-10-08 新增,默认关=纯云形态)。
+ * 历史(2026-09-05~10-08)形态:音乐期本地 VAD+能量门 3 帧确认
+ *   (BARGE_CONFIRM_ENERGY 60万)停乐。10.8 声学箱证伪:0/10dB 噪声底
+ *   (100万~490万)高于门槛,能量维度噪声/人声不可分,5 次"打断"4 次假的
+ *   (误打断 36.9%),还触发过一次 dec-open 并发崩机(已另修)。
+ * 默认形态(不定义本宏)= 对齐小智 realtime:音乐期每帧照常上行,停乐由
+ *   云端裁决(chat_break / 云端直接开答新轮),设备只执行。打断延迟从
+ *   ~120ms(本地)变为云端 RTT(~2-3s);音乐回声残差上云可能引发云端
+ *   自起轮——这正是声学测试要测的云端能力,代价已明确接受。
+ * A/B 对比/云端裁决失控时:取消下一行注释即回本地能量门。*/
+/* #define TUYA_MUSIC_LOCAL_BARGE */
+
+/* ===== AEC 残差构成诊断件(L2, 2026-10-08,默认开;仅 CONFIG_TUYA_AGENTIC_ENABLE 下生效)=====
+ * 目的:治 TTS 回声自起轮前先判残差构成,禁止盲拧参数——
+ *   世界① 线性段失配/收敛慢(可修 10-20dB,ES/对齐有救) vs 世界② 非线性泄漏(参数只剩 3-8dB)。
+ * 手段:pre(裸mic 第二编码器)/ref(下发PCM)/post(AEC后上行帧) 三路同测:
+ *   1) 串口 [AEC-DIAG] 1s 能量遥测+ERLE(erle_x100:100=0dB 1000=20dB 3162=30dB 10000=40dB);
+ *   2) 4ch 裸流 [pre,0,ref,post] 走官方 WIFI_PCM_STREAN_SOCKET_ENABLE 通道 TCP:5002 外送,
+ *      PC 用 D:\code\aec-diag\ 脚本收流+离线分析(每连接上限 60s,断开重连即可)。
+ * ★ref 通道只在下行 PCM(TUYA_DOWNLINK_OPUS_ENABLE 注释态)采到线性样本;opus 形态
+ *   ref feed 自动编译出局(串口 ref=0 预期),pre/post 遥测不受影响(10/8 A/B 即用此特性)。
+ * ★2026-10-09 A/B 收口(声学箱 2.2h 终测):B 侧双 opus 零自说自话/零崩机/零泄漏,
+ *   codec 无罪,晨测锅在会话/云状态→opus 常态(上方下行宏保留),诊断件退役:
+ *   注释下一行,采集+收流+遥测整体编译出局。再诊断时取消注释即可。*/
+/* #define TUYA_AEC_DIAG */
 
 /* ===== 涂鸦语音通道传输层开关(TCP / UDP)(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
  * 0(默认)= TCP:走原 rtc-tcp-client 源码(tai_*,agentic-kit/modules/rtc-tcp-client),
@@ -429,8 +467,8 @@
  *   apps/common/LLM/tuya_agentic/tuya_music.c(解析)+ app_music.c(导出
  *   app_music_tuya_play_url)+ tuya_agentic_demo.c ⑤ 交接块。
  *   ⚠️ 试听版仅 ~30s 片段;完整歌曲需在涂鸦平台购买音乐高级能力授权。
- *   ⚠️ 播放期间不上行(音乐回采不进 ASR);说话可打断——VAD+能量门 3 帧双
- *      确认停乐回听音,若"音乐自己把自己打断"就调 BARGE_MIN_ENERGY(demo ⑤)。
+ *   ⚠️ 2026-10-08 起播放期间照常逐帧上行、停乐由云端裁决(纯云形态,详见
+ *      下面 TUYA_MUSIC_LOCAL_BARGE 注释);本地能量停乐仅 A/B 用,默认关。
  * 不定义 = 音乐 SKILL 回复仅当普通文本打印,不起播。*/
 #define TUYA_MUSIC_ENABLE
 

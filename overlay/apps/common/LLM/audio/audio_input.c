@@ -227,6 +227,170 @@ static volatile unsigned int s_tts_last_write_ms;
 static unsigned int s_tts_underrun_cnt;
 #endif
 
+#if defined(CONFIG_TUYA_AGENTIC_ENABLE) && defined(TUYA_AEC_DIAG)
+/* ===== AEC 残差构成诊断件(L2, 2026-10-08) =====
+ * 治 TTS 回声自起轮先判残差构成,禁止盲拧参数:
+ *   世界① 线性段失配/收敛慢 → 可修 10-20dB(ES/对齐有救)
+ *   世界② 非线性泄漏(功放/喇叭失真) → 参数只剩 3-8dB,得上 TTS 音量帽(产品决策)
+ * 三路同测(宏门 TUYA_AEC_DIAG,诊断完注释即整体出局):
+ *   pre  = 裸 mic:独立第二编码器(无 AEC/无 VAD,同通道 BIT(1) 同增益),wanson.c 同款双编码器先例
+ *   ref  = 下发 TTS PCM:_device_write_voice_data 的 PCM 下行分支(★必须 PCM 下行,opus 下行采到的是压缩包)
+ *   post = 主编码器 AEC 后上行帧:recorder_vfs_fwrite
+ * 输出两路:
+ *   1) 串口 [AEC-DIAG] 1s 能量遥测(sum|s16| 归一化 16000 样本/秒,与 [TUYA] uplink sum 同口径):
+ *      erle_x100 = pre*100/post → 100=0dB(没消) 1000=20dB 3162=30dB 10000=40dB。
+ *      判读:播放期 ERLE<15dB → ①(对齐/收敛问题);ERLE>25dB 而残差仍 1万+ → ②(非线性)。
+ *   2) 4ch×16k×16bit 交错裸流 [pre,0,ref,post]×480样本/块,走官方 WIFI_PCM_STREAN_SOCKET_ENABLE
+ *      通道 TCP:5002(任务由 app_music.c 网络就绪拉起;未连接时 send 空操作零开销;
+ *      每连接上限 60s,断开重连即可)。三路不齐的块跳发(离线互相关对齐无碍)。
+ *      PC 端收流/离线分析:D:\code\aec-diag\recv_4ch.py / analyze_4ch.py。
+ * 只旁路采集:不停播、不卡帧、不改主链路一个字节(9/30 停播禁令不受影响)。*/
+#define AEC_DIAG_POINTS   480                     /* 每通道每块样本数 = 30ms@16k */
+#define AEC_DIAG_TICKS    33                      /* 33×30ms ≈ 1s 遥测周期 */
+extern void wifi_pcm_stream_socket_send(u8 *buf, u32 len);
+
+static struct {
+    struct server *raw_enc;                       /* 裸 mic 第二编码器(NULL=开失败,降级只测 ref/post) */
+    u8  raw_enc_ok;
+    volatile u8 task_run;
+    cbuffer_t raw_cbuf;   s16 raw_buf[AEC_DIAG_POINTS * 8];   /* 8 块深 ≈ 240ms:吞 ref 网络突发(单包4096B≈4.3块) */
+    cbuffer_t post_cbuf;  s16 post_buf[AEC_DIAG_POINTS * 8];
+    cbuffer_t ref_cbuf;   s16 ref_buf[AEC_DIAG_POINTS * 8];
+    s16 t_pre[AEC_DIAG_POINTS];                   /* pump 工作区(不入任务栈) */
+    s16 t_ref[AEC_DIAG_POINTS];
+    s16 t_post[AEC_DIAG_POINTS];
+    s16 send_buf[AEC_DIAG_POINTS * 4];
+    u32 e_pre, e_post, e_ref;                     /* 窗口内 sum|s16| */
+    u32 n_pre, n_post, n_ref;                     /* 窗口内样本数 */
+    u32 drop_cnt;
+} s_aec_diag;
+
+/* 三路喂数入口(各自 fwrite 内调)。写不进=pump 没跟上,清缓冲丢整段保主链路,不阻塞 */
+static void aec_diag_feed(cbuffer_t *cb, void *data, unsigned int len)
+{
+    if (!s_aec_diag.task_run) {
+        return;
+    }
+    if (len != cbuf_write(cb, data, len)) {
+        cbuf_clear(cb);
+        if (++s_aec_diag.drop_cnt % 50 == 1) {
+            printf("[AEC-DIAG] cbuf drop #%u\r\n", s_aec_diag.drop_cnt);
+        }
+    }
+}
+
+static int aec_diag_raw_vfs_fwrite(void *file, void *data, u32 len)
+{
+    aec_diag_feed(&s_aec_diag.raw_cbuf, data, len);
+    return len;
+}
+static const struct audio_vfs_ops aec_diag_raw_vfs_ops = {
+    .fwrite = aec_diag_raw_vfs_fwrite,
+    .fopen = 0,
+    .fread = 0,
+    .fseek = 0,
+    .ftell = 0,
+    .flen = 0,
+    .fclose = 0,
+};
+
+static void aec_diag_abs_sum(s16 *p, u32 bytes, u32 *e, u32 *n)
+{
+    u32 samples = bytes / 2, s = 0;
+    for (u32 i = 0; i < samples; i++) {
+        s += (p[i] < 0) ? -p[i] : p[i];
+    }
+    *e += s;
+    *n += samples;
+}
+
+/* pump:30ms 拉三路(一拍内多轮拉空,≤8 轮) → 能量累计 → 三路齐则交错外送 → 1s 打点。
+ * 数组全在静态区,任务栈仅 1KB。多轮拉空(10/8 晚改):旧版每拍每路只拉 1 块,ref 网络
+ * 突发(单包 4096B≈4.3 块,连发更多)与 30ms 相位漂移全靠溢出清缓冲硬扛(10/8 实测
+ * drop #1~#551);现在每拍拉空 ≤8 块/路,溢出只剩 >240ms 的极端突发。
+ * 四通道外送仍只在三路同轮都满整块时逐块交错(齐块跳发,离线互相关对齐无碍)。*/
+static void aec_diag_task(void *priv)
+{
+    u32 tick = 0;
+    while (s_aec_diag.task_run) {
+        os_time_dly(3);   /* 10ms tick ×3 = 30ms */
+        for (u32 round = 0; round < 8; round++) {
+            u32 rn = cbuf_read(&s_aec_diag.raw_cbuf, s_aec_diag.t_pre, sizeof(s_aec_diag.t_pre));
+            u32 fn = cbuf_read(&s_aec_diag.ref_cbuf, s_aec_diag.t_ref, sizeof(s_aec_diag.t_ref));
+            u32 pn = cbuf_read(&s_aec_diag.post_cbuf, s_aec_diag.t_post, sizeof(s_aec_diag.t_post));
+            if (!rn && !fn && !pn) {
+                break;   /* 三路都拉空,本拍收工 */
+            }
+            aec_diag_abs_sum(s_aec_diag.t_pre, rn, &s_aec_diag.e_pre, &s_aec_diag.n_pre);
+            aec_diag_abs_sum(s_aec_diag.t_ref, fn, &s_aec_diag.e_ref, &s_aec_diag.n_ref);
+            aec_diag_abs_sum(s_aec_diag.t_post, pn, &s_aec_diag.e_post, &s_aec_diag.n_post);
+            if (rn == sizeof(s_aec_diag.t_pre) && fn == sizeof(s_aec_diag.t_ref) && pn == sizeof(s_aec_diag.t_post)) {
+                for (u32 i = 0; i < AEC_DIAG_POINTS; i++) {
+                    s_aec_diag.send_buf[4 * i]     = s_aec_diag.t_pre[i];    /* ch0 裸mic(pre) */
+                    s_aec_diag.send_buf[4 * i + 1] = 0;                      /* ch1 空(单mic,对齐官方4ch约定) */
+                    s_aec_diag.send_buf[4 * i + 2] = s_aec_diag.t_ref[i];    /* ch2 播放参考(ref) */
+                    s_aec_diag.send_buf[4 * i + 3] = s_aec_diag.t_post[i];   /* ch3 AEC后(post) */
+                }
+                wifi_pcm_stream_socket_send((u8 *)s_aec_diag.send_buf, sizeof(s_aec_diag.send_buf));
+            }
+        }
+        if (++tick >= AEC_DIAG_TICKS) {
+            tick = 0;
+            /* 归一化到 16000 样本/秒(与 [TUYA] uplink sum 同口径);中间量 u64,打印只 %u */
+            u32 pre  = s_aec_diag.n_pre  ? (u32)((u64)s_aec_diag.e_pre  * 16000 / s_aec_diag.n_pre)  : 0;
+            u32 post = s_aec_diag.n_post ? (u32)((u64)s_aec_diag.e_post * 16000 / s_aec_diag.n_post) : 0;
+            u32 ref  = s_aec_diag.n_ref  ? (u32)((u64)s_aec_diag.e_ref  * 16000 / s_aec_diag.n_ref)  : 0;
+            u32 erle = post ? (u32)((u64)pre * 100 / post) : 0;
+            printf("[AEC-DIAG] pre=%u post=%u ref=%u erle_x100=%u%s\r\n",
+                   pre, post, ref, erle, s_aec_diag.raw_enc_ok ? "" : " (no-pre)");
+            s_aec_diag.e_pre = s_aec_diag.e_post = s_aec_diag.e_ref = 0;
+            s_aec_diag.n_pre = s_aec_diag.n_post = s_aec_diag.n_ref = 0;
+        }
+    }
+}
+
+/* audio_recoder_init 尾部(主编码器就绪后)调:开裸 mic 编码器 + 拉 pump,一次性 */
+static void aec_diag_start(void)
+{
+    static u8 inited = 0;
+    if (inited) {
+        return;
+    }
+    inited = 1;
+
+    cbuf_init(&s_aec_diag.raw_cbuf, s_aec_diag.raw_buf, sizeof(s_aec_diag.raw_buf));
+    cbuf_init(&s_aec_diag.post_cbuf, s_aec_diag.post_buf, sizeof(s_aec_diag.post_buf));
+    cbuf_init(&s_aec_diag.ref_cbuf, s_aec_diag.ref_buf, sizeof(s_aec_diag.ref_buf));
+
+    s_aec_diag.raw_enc = server_open("audio_server", "enc");
+    if (s_aec_diag.raw_enc) {
+        union audio_req rreq = {0};
+        rreq.enc.cmd            = AUDIO_ENC_OPEN;
+        rreq.enc.channel        = 1;
+        rreq.enc.channel_bit_map = BIT(1);            /* 与主编码器同 mic 通道 */
+        rreq.enc.frame_size     = AEC_DIAG_POINTS * 2;
+        rreq.enc.output_buf_len = rreq.enc.frame_size * 3;
+        rreq.enc.volume         = AUDIO_RECORD_VOICE_VOLUME;
+        rreq.enc.sample_rate    = SAMPLE_RATE;
+        rreq.enc.format         = "pcm";              /* 无 AEC/无 VAD:输出即裸 mic */
+        rreq.enc.sample_source  = "mic";
+        rreq.enc.vfs_ops        = &aec_diag_raw_vfs_ops;
+        rreq.enc.file           = (FILE *)&s_aec_diag.raw_cbuf;
+        if (server_request(s_aec_diag.raw_enc, AUDIO_REQ_ENC, &rreq) == 0) {
+            s_aec_diag.raw_enc_ok = 1;
+        } else {
+            printf("[AEC-DIAG] raw enc req fail(降级:只测 ref/post)\r\n");
+        }
+    } else {
+        printf("[AEC-DIAG] raw enc open fail(双编码器共存被拒?降级)\r\n");
+    }
+
+    s_aec_diag.task_run = 1;
+    thread_fork("aec_diag", 15, 1 * 1024, 0, 0, aec_diag_task, NULL);
+    printf("[AEC-DIAG] on: 4ch dump tcp:5002 [pre,0,ref,post]; 1s telemetry\r\n");
+}
+#endif /* CONFIG_TUYA_AGENTIC_ENABLE && TUYA_AEC_DIAG */
+
 int _device_write_voice_data(void *data, unsigned int len)
 {
     cbuffer_t *cbuf = (cbuffer_t *)&g_audio_hdl.pcm_cbuff_r;
@@ -260,6 +424,10 @@ int _device_write_voice_data(void *data, unsigned int len)
                 }
             }
         }
+#if defined(CONFIG_TUYA_AGENTIC_ENABLE) && defined(TUYA_AEC_DIAG)
+        /* 此分支=PCM 下行(非 opus),ref 采的才是线性样本;本 feed 在 opus 形态自动编译出局 */
+        aec_diag_feed(&s_aec_diag.ref_cbuf, data, len);   /* L2:下发 PCM = ref 通道 */
+#endif
 #endif
     }
 
@@ -311,6 +479,9 @@ static int recorder_vfs_fwrite(void *file, void *data, unsigned int len)
         }
     }
     cbuf_write(cbuf, data, len);
+#if defined(TUYA_AEC_DIAG)   /* 已在 CONFIG_TUYA_AGENTIC_ENABLE 分支内 */
+    aec_diag_feed(&s_aec_diag.post_cbuf, data, len);   /* L2:AEC 后上行帧 = post 通道 */
+#endif
 #else
     if (0 == cbuf_write(cbuf, data, len)) {
         // 上层buf写不进去时清空一下，避免出现声音滞后的情况
@@ -454,6 +625,9 @@ static void audio_recoder_init()
 
     err = server_request(g_audio_hdl.enc_server, AUDIO_REQ_ENC, &req);
     printf("err:%d", err);
+#if defined(CONFIG_TUYA_AGENTIC_ENABLE) && defined(TUYA_AEC_DIAG)
+    aec_diag_start();   /* L2 诊断件:裸mic第二编码器+三路泵(一次性,主编码器就绪后) */
+#endif
 }
 
 
@@ -685,6 +859,18 @@ void _device_net_audio_play(bool flag)
 
 }
 
+void _device_net_audio_play_keep(void)
+{
+    /* 恢复 TTS 播放器但【不清 pcm_cbuff_r】(2026-10-08,音乐期云端已开答场景):
+     * 音乐播放期云端回话帧已在往播放 cbuf 里堆(on_audio 的 START 帧清过一次,
+     * 之后全是回答正文),此刻走 _device_net_audio_play(1) 会在 MSG_START 里
+     * cbuf_clear 把回答头部整段吞掉(链式回答吞头)。keep 标志随消息体走
+     * (逐条拷贝,同 MSG_SET_NET_AUDIO_VOLUME 模式),不与并发消息竞态。*/
+    audio_debug("_device_net_audio_play_keep");
+    int keep = 1;
+    _send_audio_msg(MSG_START_NET_AUDIO_PLAY, &keep, sizeof(keep));
+}
+
 void _device_net_audio_recorder(bool flag)
 {
     audio_debug("_device_net_audio_recorder %d", flag);
@@ -740,7 +926,15 @@ static void __audio_task(void *pArg)
 
         switch (msg_data->cmd) {
         case MSG_START_NET_AUDIO_PLAY: {
-            cbuf_clear(&g_audio_hdl.pcm_cbuff_r);
+            /* keep=1(经 _device_net_audio_play_keep 发来):跳过清缓冲,保住
+             * 已在途的回话帧(音乐期云端开答/链式回答),见该函数注释。*/
+            int keep_start = 0;
+            if (msg_data->data && msg_data->data_len == sizeof(keep_start)) {
+                memcpy(&keep_start, msg_data->data, sizeof(keep_start));
+            }
+            if (!keep_start) {
+                cbuf_clear(&g_audio_hdl.pcm_cbuff_r);
+            }
 
             if (g_audio_hdl.is_audio_play_open) {
                 _audio_player_stop();

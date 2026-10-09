@@ -610,3 +610,17 @@ VM_OPT=0;//单备份...(原样不动)
 - 板测(用户执行):CB 全量构建(.bc 已清)→ 配网/对话打断/DP/OTA(阶段1 遗留项并入)→ 声学测试时一并 soak ≥2h(覆盖 ≥1 个 30min ConnectionRefresh 周期),观察 9000 通道 `[TUYA-AI-CTRL]` 与 `break-time` 对照日志。
 - 回退点:overlay 阶段1 提交 647ec00(tag 待打);整树回退 `git checkout 647ec00 -- overlay/apps/common/LLM/tuya_agentic/agentic-kit` 等。
 - patch 段:Makefile/.cbp 有接线变化(+iot_ai_ctrl.c),旧 12 段中对应段作废,以 overlay 整树覆盖为准。
+
+## 2026-10-09 增量改动(声学测试纯云形态 + 音乐崩机修复 + A/B 收口,同步主仓工作区)
+
+> 同步主仓工作区未提交状态(基线 commit 3471f9bc 之上的 10/8 晚~10/9 改动,共 6 文件 +402/-42)。主仓按用户指示不提交,本仓是该板测状态的版本化载体。
+
+- **纯云形态(用户 10/8 拍板"端侧全交云端裁决,不在端侧卡门")**:`TUYA_STREAM_PLAYBACK_GATE` 注释(TTS 播放期逐帧上行);新增 `TUYA_MUSIC_LOCAL_BARGE` 宏(默认关,音乐期本地能量门仅 A/B 回退用);`music_handoff` 重构——音乐期照常上行+云端两臂停乐(chat_break / 云端直接开答新轮);`_device_net_audio_play_keep` 无清缓冲恢复治链式回答吞头。
+- **音乐崩机修复(10/8 噪声箱 dec-open 在飞竞态)**:START 闸 `app_music_tuya_music_started` + `net_stop_req` 单一所有权,治停止与 `__err` 并发 double-close。板测:声学箱 2.2h 内 8 次 TTS↔音乐解码器交接零崩机。
+- **A/B 诊断件(L2)落码并退役**:`TUYA_AEC_DIAG` 三路采集(pre 裸麦第二编码器/ref/post)+ 4ch 裸流 TCP:5002 收流 + 1s `[AEC-DIAG]` ERLE 遥测(cbuf 240ms + 一拍多轮拉空)。**10/9 声学箱终测收口后宏已注释退役**:B 侧双 opus 2.2h/12 场景/786 标记零自说自话/零崩机/单一 TAI 会话贯穿→codec 无罪,双 opus 转正,10/8 晨测自说自话锅在会话/云状态。
+- **文件集修正**:补收 `apps/wifi_story_machine/include/app_music.h`(此前与原厂一致故未收录,10/8 起含 started 闸声明);删除阶段2 漏删遗物 `agentic-kit/modules/iot-client/src/iot_client_internal.h`(阶段2 CHANGES 已载明应删,上游重构后由 `iot_internal.h` 承载)。
+
+### 验证与回退
+
+- 板测:B 侧台架多场 + 10/9 声学箱 2.2h 终测(0 崩机/堆平/心跳无断档/8 次音乐交接干净);clang 预检(app_config/audio_input/demo)0 真错,.bc 已清交 CB。
+- 回退点:overlay 24c07c7(本条目父提交);主仓对应工作区状态即当前测试固件源。

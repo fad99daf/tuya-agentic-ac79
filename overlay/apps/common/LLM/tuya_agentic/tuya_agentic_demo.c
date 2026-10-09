@@ -35,6 +35,7 @@
 int  app_music_tuya_play_url(const char *url, void (*on_dec_end)(int));
 void app_music_tuya_music_stop(void);
 int  app_music_tuya_music_busy(void);   /* 网络音乐仍占用(下载/解码中):等待循环感知失败退出 */
+int  app_music_tuya_music_started(void);/* 网络音乐解码器已 START(过 open 在飞窗):停乐只许在此之后 */
 void app_music_tuya_play_wake_prompt(void); /* "嘿tuya"唤醒应答提示音(WakeHeyTuya.mp3) */
 #endif
 #ifdef TUYA_UPLINK_OPUS_ENABLE
@@ -58,6 +59,7 @@ int  get_recoder_state(void);
 unsigned int _device_get_voice_level(void);   /* 录音 cbuf 水位,诊断上行是否丢话头 */
 unsigned int _device_get_play_level(void);    /* 下行播放 cbuf 水位:排空≈DAC 播完 */
 void _device_net_audio_play(bool flag);       /* 停/起 TTS 网络播放器(音乐交接时让出/收回 DAC) */
+void _device_net_audio_play_keep(void);       /* 同上但恢复时不清播放 cbuf:音乐期云端已开答,保住回答头部 */
 
 /* ===== 上行延迟诊断开关(定位"打断不佳"用)=====
  * 打开后在 tai_send_audio_chunk 前后打时间戳,超 UPLINK_LAT_WARN_MS 才打印(避免刷屏)。
@@ -71,9 +73,9 @@ void _device_net_audio_play(bool flag);       /* 停/起 TTS 网络播放器(音
 #endif
 
 /* === 产品三件套(涂鸦 IoT 平台创建产品时获得,构建期固定)===(前端填这个)*/
-#define TUYA_PRODUCT_KEY    "YOUR_PID_HERE"              /* PID */
-#define TUYA_UUID           "YOUR_UUID_HERE"          /* 设备 UUID */
-#define TUYA_AUTH_KEY       "YOUR_AUTHKEY_HERE"  /* 授权码 AuthKey */
+#define TUYA_PRODUCT_KEY    "rckqt7yipzqx4tv9"              /* PID [临时]10dB声学测试与同事样机同pid,测完恢复ptsig07xv6aehihz */
+#define TUYA_UUID           "uuid81270ef7739ea8d7"          /* 设备 UUID */
+#define TUYA_AUTH_KEY       "QKQJJSSZI6IcW2nTsZWDs0hAoAoAaOCC"  /* 授权码 AuthKey */
 
 /* === 激活 token(配网时涂鸦 App 下发;调试期可从平台/App 取一次填这里)===(前端填这个)*/
 #define TUYA_ACTIVATION_TOKEN "xxxxxxxx"
@@ -172,6 +174,11 @@ static volatile unsigned int g_tts_drop_cnt;   /* 窗口内丢弃的下行帧计
 static volatile int g_barge_in;           /* barge-in 触发:跳过 TTS 后清缓冲/冷却,直接进新一轮(TUYA_BARGE_IN_ENABLE)*/
 static volatile int g_exit;               /* on_disconnect 置位:令本次会话的语音循环退出(supervisor 稍后重连) */
 static volatile int g_link_broken;        /* 上行发送失败:链路已断,快速报废本次会话交 supervisor 重连(不等 60s 超时) */
+#ifdef TUYA_UPLINK_OPUS_ENABLE
+static int g_use_opus_uplink;             /* 上行 opus 编码器可用(会话入口 init 成功置 1):主循环与
+                                          * music_handoff 共用——音乐期上行的编码形态必须与会话入口
+                                          * audio_start 声明的 codec 一致,两处不能各自为政(2026-10-08) */
+#endif
 static volatile int g_mqtt_ka_run;        /* MQTT 心跳线程运行标志:生命周期=整个 tuya 流程,不跟 AI 会话共存亡 */
 /* protocol 11 的 MQTT 回调只写此请求槽。首次请求锁定类型；重复帧不覆盖它，
  * 释放 iot/擦 VM/复位全部由 tuya_ai_run 这个唯一监督者完成。 */
@@ -903,16 +910,23 @@ static int barge_followup_wait(unsigned int closed_since)
 }
 
 #ifdef TUYA_MUSIC_ENABLE
+#ifdef TUYA_UPLINK_OPUS_ENABLE
+static int tuya_uplink_send_frame(tai_ctx_t *ctx, unsigned char *pcm1280);  /* 实现在本文件下方:
+                                                                            * 音乐期上行(2026-10-08)在定义点之前调用 */
+#endif
 /* ------------------------------------------------------------------------- */
 /* ⑤ 音乐技能交接:本轮云端回了音乐 SKILL(试听 mp3 URL,解析见 tuya_music.c)。
  * TTS 排空把"正在为您播放…"播完 → 停我们的 TTS 解码器让出 DAC → 交给
  * app_music 网络解码(net_download,https 自动 TLS)→ 等整首播完
  * (dec_end 回调清 g_music_playing)→ 重启 TTS 播放器,回 ① 继续听音。
- * ★ 播放期间不上行(音乐回采不该进 ASR),但可 barge-in 停乐:照搬 TTS drain
- *   的"VAD+能量门"双确认(见下面等待循环)。AEC 对连续音乐的效果未验证,
- *   故开头 1s 不设防、每秒打一次 mic 能量基线([MUSIC-DBG]),实测误触发
- *   ("音乐自己把自己打断")就调 BARGE_MIN_ENERGY。
- *   唤醒词同样可停乐(KWS 全程在线,同一循环喂帧,先于 barge-in 判)。
+ * ★ 2026-10-08 纯云形态(用户拍板"端侧把声音都交给云端,不考虑成本"):
+ *   播放期间每帧照常上行(与主循环同形态),停乐由云端裁决、设备只执行——
+ *   两臂信号:chat_break(g_cloud_break_evt)或云端直接开答新轮(g_tts_playing,
+ *   主信号:音乐不在云端轮生命周期内,云端多半不吐 chat_break 直接开答)。
+ *   旧本地门(VAD+能量 3 帧确认)10.8 声学箱证伪:0/10dB 噪声底 100万~490万
+ *   > 门槛 60万,5 次"打断"4 次假;降级为 A/B 开关(TUYA_MUSIC_LOCAL_BARGE,
+ *   app_config.h,默认关)。每秒 [MUSIC-DBG] 能量基线保留=对照云端裁决的数据。
+ *   唤醒词停乐保留(KWS 全程在线同一循环喂帧;本配置未启用)。
  * ★ DAC 交接前后各等 300ms:两个解码器共享 DAC,边停边开会踩到
  *   subdevice_dac 的格式重配断言(2026-08-27 提示音教训)。
  * 抽成函数有两个调用点:正常=轮末(④ TTS 排空后);兜底=idle 分支——旧轮残留
@@ -943,51 +957,110 @@ static void music_handoff(tai_ctx_t *ctx)
              * 退出条件:dec_end 回调清 g_music_playing(播完/解码停机);
              * 或 busy=0——下载失败路径 __net_music_dec_file 的 __err 不走
              * dec_end 回调,靠 net_file 已被关闭置空感知,别傻等 600s。
-             * _device_get_voice_data 内部按帧节拍(~40ms)阻塞,顺带排空 mic:
-             * 音乐回采不积压,播完立刻干净听音(不会把音乐尾巴当新问题)。
-             * barge-in(TUYA_BARGE_IN_ENABLE,判据照搬 barge_in_energy_confirmed):
-             *   VAD 在线 + 3 帧连续(120ms) sum≥BARGE_MIN_ENERGY 才停乐,断一帧
-             *   就重数——滤掉音乐瞬态拍子。若 AEC 把音乐消得够低,音乐回声到不了
-             *   门槛,只有贴脸的人声能过;实测过不了关就调门槛。
-             *   开头 25 帧(1s)不设防:避开 DAC 交接瞬态和曲首重拍。*/
+             * _device_get_voice_data 内部按帧节拍(~40ms)阻塞,逐帧取音乐期
+             * mic(音乐回声+AEC 残差)【照常上行】——停乐判定 100% 云端(2026-10-08):
+             *   臂一 g_cloud_break_evt(chat_break):音乐期无活 TTS,消费即停,
+             *     不开 3s 排空窗、不清 rbuf;
+             *   臂二 g_tts_playing(云端已开答新轮):停乐让位,主信号——音乐不在
+             *     云端轮生命周期内,云端多半不吐 chat_break 直接开答。
+             *   两臂均经 app_music_tuya_music_started() 前置(10.8 崩机修复的
+             *   START 闸:open 在飞时锁存信号,START 后再动手)。
+             *   [MUSIC-DBG] 每 ~1s 打 mic 能量基线:对照云端裁决的数据。
+             * 本地能量 barge-in 默认关(TUYA_MUSIC_LOCAL_BARGE,app_config.h):
+             *   10.8 声学箱证伪(噪声底 100万~490万>门槛 60万,4/5 假打断),
+             *   A/B 需要时放开宏即回旧行为(判据注释见宏内)。*/
             unsigned int mstart = timer_get_ms();
-            s_barge_hist_cnt = 0;   /* 历史从本曲起算:打断补发只含音乐期间的话音 */
-            int mbarge = 0, mwake = 0;           /* 停乐原因: barge-in 抢答打断 / 唤醒词打断 */
-#ifdef TUYA_BARGE_IN_ENABLE
-            unsigned int mframes = 0, mhi = 0;   /* 帧计数 / 连续达标帧数 */
+            s_barge_hist_cnt = 0;   /* 历史从本曲起算:A/B 本地停乐时打断补发只含音乐期间的话音 */
+            int mwake = 0, mcloud = 0;           /* 停乐原因: 唤醒词打断 / 云端裁决(chat_break或新轮回话) */
+            unsigned int mframes = 0;            /* 帧计数:[MUSIC-DBG] 基线节拍用 */
+            unsigned int mup = 0;                /* 音乐期已成功上行帧数:[MUSIC-DBG] 每秒报数,
+                                                  * 增量≈25/条=流在传(纯云形态验收证据) */
+#if defined(TUYA_BARGE_IN_ENABLE) && defined(TUYA_MUSIC_LOCAL_BARGE)
+            int mbarge = 0;                      /* 停乐原因: 本地能量 barge-in(A/B 开关,默认关) */
+            unsigned int mhi = 0;                /* 连续达标帧数 */
             unsigned int msums[3] = {0, 0, 0};
 #endif
             while (!g_exit && !g_link_broken && g_music_playing &&
                    app_music_tuya_music_busy() &&
                    timer_get_ms() - mstart < 600000) {
-                unsigned char _mt[TUYA_OPUS_FRAME_LEN];
+                /* ★ aligned(4) 不能省:本帧 2026-10-08 起要进 opus 编码器(短整型
+                 *   load,align 1 栈布局撞奇地址=pi32v2 misalign 崩,同主循环 abuf)。*/
+                unsigned char _mt[TUYA_OPUS_FRAME_LEN] __attribute__((aligned(4)));
                 if (_device_get_voice_data(_mt, sizeof(_mt)) != sizeof(_mt)) {
                     continue;               /* 读不够一帧:等下一拍再来 */
                 }
                 tai_log_flush();            /* 音乐长循环(可达10min)也保持库日志节拍 */
                 mcp_resp_pump(ctx);
-                barge_hist_push(_mt);       /* 音乐期帧进 barge 历史:打断时补发命令头部 */
+                barge_hist_push(_mt);       /* 音乐期帧进 barge 历史:A/B 本地停乐时补发命令头部 */
 #ifdef TUYA_KWS_ENABLE
                 /* KWS 全程在线:音乐播放期也喂唤醒词(帧已到手不浪费)。命中即停乐
                  * (TuyaOpen wakeup 回调的 player_stop 语义),提示音等恢复 TTS 播放器
-                 * 后再播(on_wake 已置 pending,见循环后)。*/
+                 * 后再播(on_wake 已置 pending,见循环后)。
+                 * ★ 未 START(open 在飞)不吃标志不下手:此窗口强停=踩 app_music
+                 *   并发 teardown 崩机窗(2026-10-08 板测);留标志下一拍 START 后再停。*/
                 tuya_kws_feed(_mt, sizeof(_mt));
-                if (g_wake_hit) {
+                if (g_wake_hit && app_music_tuya_music_started()) {
                     g_wake_hit = 0;
                     printf("[TUYA-MUSIC] wake stops music\r\n");
                     mwake = 1;
                     break;
                 }
 #endif
-#ifdef TUYA_BARGE_IN_ENABLE
                 mframes++;
                 unsigned int mes, mea;
                 opus_frame_stat(_mt, sizeof(_mt), &mes, &mea);
-                if ((mframes % 25) == 0) {  /* 每 ~1s 打能量基线:调门槛看这个 */
-                    printf("[MUSIC-DBG] playing, mic post-AEC: sum=%u act=%u%% rec=%d\r\n",
-                           mes, mea, get_recoder_state());
+                if ((mframes % 25) == 0) {  /* 每 ~1s 打能量基线+上行计数:对照云端裁决、
+                                              * 验证音乐期流在传(uplink 增量≈25/条) */
+                    printf("[MUSIC-DBG] playing, mic post-AEC: sum=%u act=%u%% rec=%d uplink=%u\r\n",
+                           mes, mea, get_recoder_state(), mup);
                 }
-                if (mframes > 25 && get_recoder_state() && mes >= BARGE_CONFIRM_ENERGY) {
+#ifdef TUYA_STREAM_MODE
+                /* ---- 云端停乐两臂(2026-10-08 纯云形态;主循环此间被本函数阻塞,
+                 *      云端信号只有这里能消费)。对齐小智 realtime:停播纯服务端
+                 *      裁决,设备只执行。 ---- */
+                if (app_music_tuya_music_started()) {   /* START 闸:open 在飞只锁存,不动手 */
+                    if (g_cloud_break_evt) {
+                        g_cloud_break_evt = 0;   /* 臂一:音乐期无活 TTS,不开排空窗不清 rbuf */
+                        printf("[TUYA-MUSIC] cloud break -> stop music (f#%u sum=%u)\r\n",
+                               mframes, mes);
+                        mcloud = 1;
+                        break;
+                    }
+                    if (g_tts_playing) {           /* 臂二(主信号):云端已开答新轮,停乐让位 */
+                        printf("[TUYA-MUSIC] cloud answer -> stop music (f#%u sum=%u)\r\n",
+                               mframes, mes);
+                        mcloud = 1;
+                        break;
+                    }
+                }
+                /* ---- 逐帧上行:与主循环同形态(编码形态=会话 audio_start 声明,见
+                 *      g_use_opus_uplink);失败=断链,同主发送快速报废会话 ---- */
+                {
+#ifdef TUYA_UPLINK_OPUS_ENABLE
+                    int _msnd = g_use_opus_uplink ? tuya_uplink_send_frame(ctx, _mt)
+                                                  : tai_send_audio_chunk(ctx, _mt, TUYA_OPUS_FRAME_LEN);
+#else
+                    int _msnd = tai_send_audio_chunk(ctx, _mt, TUYA_OPUS_FRAME_LEN);
+#endif
+                    if (_msnd != TAI_OK) {
+                        printf("[TUYA-MUSIC] uplink chunk fail\r\n");
+                        g_link_broken = 1;
+                        break;
+                    }
+                    mup++;                  /* 成功发出+1:失败路径上面已 break,不会计 */
+                }
+#endif /* TUYA_STREAM_MODE */
+#if defined(TUYA_BARGE_IN_ENABLE) && defined(TUYA_MUSIC_LOCAL_BARGE)
+                /* A/B 本地能量停乐(默认关,app_config.h TUYA_MUSIC_LOCAL_BARGE)。
+                 * 判据照搬 barge_in_energy_confirmed:VAD 在线 + 3 帧连续(120ms)
+                 * sum≥BARGE_CONFIRM_ENERGY 才停乐,断一帧重数(滤音乐瞬态拍子);
+                 * 开头 25 帧(1s)不设防(避开 DAC 交接瞬态和曲首重拍)。
+                 * ★ 停乐前置条件:解码器已 START。open 在飞(TLS 慢 >1s)时强停会踩
+                 *   app_music 停止路径与 __err 的并发 teardown(2026-10-08 板测
+                 *   axi_rd_inv 崩机:噪声假 barge-in 恰好落进该窗)。25 帧盲窗之外
+                 *   再加这道闸,真打断最多晚几十毫秒(START 一到即可停)。*/
+                if (mframes > 25 && app_music_tuya_music_started() &&
+                    get_recoder_state() && mes >= BARGE_CONFIRM_ENERGY) {
                     msums[mhi++] = mes;
                     if (mhi >= 3) {         /* 3 帧连续达标:确认真话音,停乐 */
                         printf("[TUYA-MUSIC] barge-in: stop music (sums=%u,%u,%u)\r\n",
@@ -1004,16 +1077,19 @@ static void music_handoff(tai_ctx_t *ctx)
 #endif
             }
             g_music_handoff = 1;             /* 进入 DAC 交接窗:停乐→恢复期间命中唤醒,提示音延后 */
-            if (g_music_playing) {           /* 超时/失败/打断/退出:强停,防 DAC 被占死 */
+            if (g_music_playing) {           /* 超时/失败/打断/退出:强停,防 DAC 被占死
+                                               * (net_stop_req 单一所有权护栏兜底) */
                 printf("[TUYA-MUSIC] stop (%s)\r\n",
-#ifdef TUYA_BARGE_IN_ENABLE
+#if defined(TUYA_BARGE_IN_ENABLE) && defined(TUYA_MUSIC_LOCAL_BARGE)
                        mbarge ? "barge-in" :
 #endif
+                       mcloud ? "cloud" :
                        mwake ? "wake" :
                        app_music_tuya_music_busy() ? "timeout/exit" : "download/decode fail");
                 app_music_tuya_music_stop();
                 g_music_playing = 0;
             }
+#if defined(TUYA_BARGE_IN_ENABLE) && defined(TUYA_MUSIC_LOCAL_BARGE)
             if (mbarge || mwake) {           /* 停乐后排 ~300ms 残响:打断词/唤醒词与音乐混叠,
                                                本轮已作废不清会被音乐尾巴当下句触发假轮 */
                 unsigned char _mt[TUYA_OPUS_FRAME_LEN];
@@ -1034,6 +1110,7 @@ static void music_handoff(tai_ctx_t *ctx)
                 barge_hist_to_prefill();   /* 音乐期间的话音(含残响)整体转上行 prefill:
                                             * 2026-09-05 实测不补发则云端只听到"伦的歌。"*/
             }
+#endif /* TUYA_BARGE_IN_ENABLE && TUYA_MUSIC_LOCAL_BARGE */
 #ifdef TUYA_KWS_ENABLE
             /* mbarge 判"后续话音"的种子(见 barge_followup_wait):此刻 VAD 已关=
              * 停乐前短句已说完(唤醒词典型);还开着=在继续说(命令)。停乐后的
@@ -1067,7 +1144,9 @@ static void music_handoff(tai_ctx_t *ctx)
             }
 #endif
             g_music_handoff = 0;             /* 交接完成,退出 DAC 保护窗 */
-#ifdef TUYA_KWS_ENABLE
+#if defined(TUYA_KWS_ENABLE) && defined(TUYA_BARGE_IN_ENABLE) && defined(TUYA_MUSIC_LOCAL_BARGE)
+            /* 抢答后续判定只在 A/B 本地停乐形态下存在(mbarge 唯一来源);
+             * 纯云形态停乐走 mcloud 臂,云端自己判后续,无此分支。*/
             if (mbarge && !g_wake_prompt_pending && !g_wake_hit) {
                 /* 抢答拦下的短句,引擎没认出唤醒词(AEC 双讲削损,同场景实测
                  * 成功率约一半):判用户是否还在继续说——VAD 连续开 300ms=命令,
@@ -1100,8 +1179,16 @@ static void music_handoff(tai_ctx_t *ctx)
             }
 #endif
             if (!g_player_restore_pending) {
-                _device_net_audio_play(1);   /* 正常播完/下载失败(无提示音、无抢答):
-                                              * 当场恢复播放器,原行为 */
+                if (g_tts_playing) {
+                    /* 云端已在音乐期开答(停乐原因=cloud):回答帧正积在播放 cbuf
+                     * (on_audio 的 START 帧已清过一次,之后全是回答正文),不清缓冲
+                     * 恢复——保住回答头部无缝续播。兼治自然播完后的链式回答吞头
+                     * (旧行为:恢复即 cbuf_clear,缓冲里的新回答整段弃掉)。*/
+                    _device_net_audio_play_keep();
+                } else {
+                    _device_net_audio_play(1);   /* 正常播完/下载失败(无提示音、无抢答):
+                                                  * 当场恢复播放器,原行为 */
+                }
             }
             printf("[TUYA-MUSIC] done, back to listening\r\n");
         }
@@ -2056,6 +2143,7 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
     /* 上行 opus 编码器:幂等 init(编码器常驻堆,跨会话/重连复用);失败自动回退
      * PCM 上行(仍能对话,只是带宽大),不废会话。 */
     int use_opus_uplink = (tuya_opus_enc_init() == 0);
+    g_use_opus_uplink = use_opus_uplink;   /* music_handoff 音乐期上行与主循环同编码形态(见声明注释) */
     if (!use_opus_uplink) {
         printf("[TUYA] opus enc init fail -> uplink fallback PCM\r\n");
     }
@@ -2417,10 +2505,11 @@ static unsigned int tuya_ai_session(const pal_t *pal, iot_client_t *iot, const c
             g_tts_drop_until = 0;
         }
 #ifdef TUYA_MUSIC_ENABLE
-        /* 音乐技能交接(声学测试不含音乐,保基本可用即可):云回了音乐 SKILL 且当前
-         * 无播报 → music_handoff 交接 app_music(阻塞至整首完/被打断)。播放期间
-         * 上行暂停,mic cbuf 环形覆盖旧帧(0.5s 环),播完清掉积压(别把音乐回声
-         * 传上云)再继续上流;音乐期云端打断不在 v1 范围。 */
+        /* 音乐技能交接:云回了音乐 SKILL 且当前无播报 → music_handoff 交接
+         * app_music(阻塞至整首完/被云端信号停乐)。2026-10-08 纯云形态:音乐期
+         * 逐帧照常上行在交接循环内完成(与主循环同形态),停乐由云端裁决
+         * (chat_break/新轮回话两臂,详见 music_handoff);出口清一次录音积压只为
+         * 丢掉交接瞬间的旧行残帧,不构成帧级门。 */
         if (tuya_music_pending() && !g_link_broken && !g_tts_playing &&
             _device_get_play_level() == 0) {
             music_handoff(ctx);
@@ -3636,9 +3725,10 @@ static int tuya_vm_wifi_password_valid(const char *value, int read_len, size_t v
 /* 日志级别控制:改这个值即可控制 SDK 日志输出量。
  * LOG_ERROR=1(只看错误) / LOG_WARN=2(+警告) / LOG_INFO=3(+信息) / LOG_DEBUG=4(全开)
  * 调试云端VAD等问题时设 LOG_DEBUG;平时设 LOG_WARN 减少刷屏。*/
-/* 日志级别:LOG_INFO(3) 能看到激活/连接/ASR等关键流程,又避开 LOG_DEBUG 里的
- * %llu(64位格式符,杰理 newlib 可能不支持)包日志路径。调云端VAD等问题时够用。
- * 如需更详细日志改 LOG_DEBUG(4),但注意 tai_pkt_log.c 有 %llu 可能崩溃。*/
+/* 日志级别:LOG_INFO(3) 能看到激活/连接/ASR等关键流程。
+ * 杰理 printf 把 64 位长度符(z/ll)当双槽读,曾致激活崩机;kit 内 %zu/%llu
+ * 已于 2026-10-06 全部扫成 %u(见 UPSTREAM-BASE.md),LOG_DEBUG 的包日志
+ * 路径现在也安全,需要细查时可放开。*/
 #define TUYA_SDK_LOG_LEVEL  LOG_INFO
 
 static OS_MUTEX tuya_log_mutex;   /* 防多线程并发输出交叉 */
@@ -3646,6 +3736,8 @@ static int tuya_log_mutex_inited;
 
 static void tuya_log_redirect(log_level_t level, const char *fmt, va_list args)
 {
+    extern void putbyte(char a);   /* include_lib/system/generic/printf.h */
+
     static const char level_char[] = {'-', 'E', 'W', 'I', 'D'};
     char lc = (level >= 0 && level <= 4) ? level_char[level] : '?';
 
@@ -3656,10 +3748,31 @@ static void tuya_log_redirect(log_level_t level, const char *fmt, va_list args)
     if (n < 0) return;
     if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;   /* 截断 */
 
-    /* 互斥锁保护:printf 不是线程安全的,多线程并发会交叉输出。
-     * log_emit 在 worker 线程(回调)和 agentic 线程都可能触发。*/
+    /* F‡(2026-10-06):输出不经 printf,改 putbyte 逐字节直写 UART。
+     * 【定案】激活期 axi_rd_inv 五连崩真凶 = kit 日志里的 %zu/%.4s:杰理
+     * printf 把 'z'/'ll' 当 64 位长度符,va_arg 吃双槽 → 参数流错位一格 →
+     * 后面的 %.4s 把栈垃圾当指针解引用 → 非法 AXI 读。判别链:F′(整体旁路)
+     * 绿;F‡(留 vsnprintf)遇 Token 行(%zu)2/2 崩且字节未出 → vsnprintf
+     * 定罪;9/30"格式符曾跑绿"反例经 git 证伪(stage-1 Token 行是 %u,
+     * 13 处 %zu 全在冷路径未执行)。printf 输出机制(lbuf/flush)洗清嫌疑。
+     * 2026-10-06 已扫 kit 全部格式符(%zu→%u 35 处、%llu→(unsigned)%u 6 处,
+     * overlay UPSTREAM-BASE.md 有记)。putbyte 通道暂留,是否回退 printf
+     * 输出待崩机案板测定案后另议。
+     * putbyte:对 '\n' 自动展开 CRLF、吞裸 '\r',故结尾只发 '\n'。
+     * 互斥保留:putbyte 无锁,防多任务行内交叉。*/
     if (tuya_log_mutex_inited) os_mutex_pend(&tuya_log_mutex, 0);
-    printf("[TUYA-SDK/%c] %s\r\n", lc, buf);
+    {
+        char line[280];   /* 13 前缀 + 255 buf + 余量 */
+        const char *q;
+        char *p = line;
+        *p++ = '['; *p++ = 'T'; *p++ = 'U'; *p++ = 'Y'; *p++ = 'A';
+        *p++ = '-'; *p++ = 'S'; *p++ = 'D'; *p++ = 'K'; *p++ = '/';
+        *p++ = lc;  *p++ = ']'; *p++ = ' ';
+        memcpy(p, buf, (size_t)n);
+        p += n;
+        *p++ = '\n';
+        for (q = line; q < p; q++) putbyte(*q);
+    }
     if (tuya_log_mutex_inited) os_mutex_post(&tuya_log_mutex);
 }
 
@@ -3894,11 +4007,8 @@ void tuya_agentic_main(void *arg)
         return;
     }
 
-    /* 同步到杰理 wifi 存储:防 app_music 的 wifi_return_sta_mode 读到旧 ssid 覆盖。
-     * 之前换网络后,杰理 VM 里残留旧 ssid(GJ1)覆盖了涂鸦配的 ssid,导致断网连不上 AI。*/
-    tuya_sync_wifi_to_jl(s_main_creds.ssid, s_main_creds.password);
-
-    /* ---- on_boarding 激活 ---- */
+    /* ---- on_boarding 激活 ----
+     * (杰理 wifi 存储同步已挪到激活成功之后,见下方 tuya_sync_wifi_to_jl)*/
     iot_on_boarding_config_t ob;
     memset(&ob, 0, sizeof(ob));
     strncpy((char *)ob.uuid,        tuya_trip_uuid(), sizeof(ob.uuid) - 1);
@@ -3919,6 +4029,14 @@ void tuya_agentic_main(void *arg)
     s_tuya_cloud_client_ready = 1;
     iot_ai_ctrl_set_callback(iot, on_ai_ctrl, NULL);   /* 阶段2·9000 AI控制通道(见 on_ai_ctrl) */
     printf("[TUYA] activated, devid=%s\r\n", iot->devid);
+
+    /* 同步到杰理 wifi 存储:防 app_music 的 wifi_return_sta_mode 读到旧 ssid 覆盖。
+     * 之前换网络后,杰理 VM 里残留旧 ssid(GJ1)覆盖了涂鸦配的 ssid,导致断网连不上 AI。
+     * ⚠️ 2026-10-06 从"激活之前"挪到"激活成功之后":wifi_store_mode_info 内部起
+     *   _rpc worker 做 VM flash 擦写,原先紧贴激活打印块执行,板上两次同点
+     *   axi_rd_inv 崩机(疑 VM 写 vs 双核 XIP 取指竞态,VM 写距崩点仅 47ms)。
+     *   挪开后与激活 HTTPS 窗口隔开数秒;若需挪回,务必保留与激活打印块的间隔。*/
+    tuya_sync_wifi_to_jl(s_main_creds.ssid, s_main_creds.password);
 
     /* ---- 持久化三元组 + WiFi 凭据(下次开机直连)----
      * 三元组连涂鸦 AI 云;ssid/password 供直连路径开机重连 WiFi(否则开机离线,连 AI 必失败)。*/
@@ -4012,6 +4130,8 @@ void tuya_clear_provision_and_reset(void)
  *    挪到 WiFi/BT 初始化完成之后,或由按键/事件触发。*/
 static int tuya_agentic_main_init(void)
 {
-    return thread_fork("tuya_agentic", 4, 16 * 1024, 0, 0, tuya_agentic_main, NULL);
+    /* 16K→24K(2026-10-06 激活崩机排查:顺手排除栈溢出假说;激活打印链
+     * printf 格式化深度 + 阶段2日志双城 buf[256],留足余量成本低)。*/
+    return thread_fork("tuya_agentic", 4, 24 * 1024, 0, 0, tuya_agentic_main, NULL);
 }
 late_initcall(tuya_agentic_main_init);
