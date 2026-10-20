@@ -38,6 +38,7 @@ int  app_music_tuya_music_busy(void);   /* 网络音乐仍占用(下载/解码�
 int  app_music_tuya_music_started(void);/* 网络音乐解码器已 START(过 open 在飞窗):停乐只许在此之后 */
 void app_music_tuya_play_wake_prompt(void); /* "嘿tuya"唤醒应答提示音(WakeHeyTuya.mp3) */
 #endif
+#include "app_image.h"            /* App 图片下发(面板"打印图片")接收链(实现 app_image.c),无条件 */
 #ifdef TUYA_UPLINK_OPUS_ENABLE
 #include "tuya_opus_enc.h"        /* 上行 opus 编码(杰理闭源库经 audio_server virtual 通道,实现 tuya_opus_enc.c) */
 #endif
@@ -73,9 +74,9 @@ void _device_net_audio_play_keep(void);       /* 同上但恢复时不清播放 
 #endif
 
 /* === 产品三件套(涂鸦 IoT 平台创建产品时获得,构建期固定)===(前端填这个)*/
-#define TUYA_PRODUCT_KEY    "rckqt7yipzqx4tv9"              /* PID [临时]10dB声学测试与同事样机同pid,测完恢复ptsig07xv6aehihz */
-#define TUYA_UUID           "uuid81270ef7739ea8d7"          /* 设备 UUID */
-#define TUYA_AUTH_KEY       "QKQJJSSZI6IcW2nTsZWDs0hAoAoAaOCC"  /* 授权码 AuthKey */
+#define TUYA_PRODUCT_KEY    "tuya_xxx"                       /* PID */
+#define TUYA_UUID           "tuya_xxx"                       /* 设备 UUID */
+#define TUYA_AUTH_KEY       "xxxx"                           /* 授权码 AuthKey */
 
 /* === 激活 token(配网时涂鸦 App 下发;调试期可从平台/App 取一次填这里)===(前端填这个)*/
 #define TUYA_ACTIVATION_TOKEN "xxxxxxxx"
@@ -479,6 +480,26 @@ static void on_mqtt_message(const char *topic, size_t topic_len,
            data ? (const char *)data : "(null)");
 }
 
+/* MQTT 下行路由:保留 [TUYA-MQTT] 全量打印,同时把 protocol64/fileStorageDl
+ * 喂给 app_image(命中才拷贝入队,回调内不做重活——iot_client.h 契约)。*/
+static void on_mqtt_message_router(const char *topic, size_t topic_len,
+                                   const uint8_t *data, size_t data_len)
+{
+    on_mqtt_message(topic, topic_len, data, data_len);
+    app_image_mqtt_message(topic, topic_len, data, data_len);
+}
+
+/* App 图片收完的落点:测试阶段只打印验收信息;打印流水线未实现(暂不做)。
+ * jpeg 指针仅回调期间有效,返回后 app_image 释放。*/
+static void on_app_image_ready(const uint8_t *jpeg, size_t len, void *ud)
+{
+    (void)ud;
+    printf("[PRINT-DL] App image ready: %u bytes SOI=%02X%02X"
+           " (print pipeline not implemented -- link test only)\r\n",
+           (unsigned)len,
+           (len >= 2) ? jpeg[0] : 0, (len >= 2) ? jpeg[1] : 0);
+}
+
 /* 阶段2·9000 MQTT AI 控制通道(上游 387957b):服务端 AI 事件(asrInterrupt 等)
  * 经 MQTT 带外下发,分发链 reset→ota_confirm→9000→DP→raw(iot_client_message.c)。
  * 与 TAI TCP 的 CHAT_BREAK/breakAttributes 双通道并行观察打断时序,回调内只打
@@ -636,6 +657,11 @@ static void tuya_mqtt_keepalive_task(void *arg)
                 s_ota_worker_busy = 0;
             }
         }
+
+        /* 协议19回执出队发布:必须与 iot_client_process 同线程(coreMQTT
+         * 非线程安全,并发 publish 会踩坏连接)——参考实现的 s_mqtt_mutex
+         * 思路,这里以"保活循环内串行泵出"替代。*/
+        app_image_poll_publish(iot);
         os_time_dly(1);
     }
     s_mqtt_ka_exited = 1;
@@ -1477,6 +1503,9 @@ void tuya_agentic_demo(void *arg)
     obcfg.cacert = NULL;
     obcfg.reset_callback = on_cloud_reset;
     obcfg.ota_confirm_callback = on_ota_confirm;   /* APP 确认升级(protocol 15) */
+    /* 图片下发(协议64 fileStorageDl)走 raw message_callback 路径分发
+     * (iot_client_message.c 分发链末端);不挂的话协议64会被静默丢弃。*/
+    obcfg.message_callback = on_mqtt_message_router;
     iot = iot_client_init_on_boarding_with_token(&obcfg, TUYA_ACTIVATION_TOKEN);
     if (!iot) { printf("[TUYA] on_boarding_with_token fail(token 过期/三件套错?)\r\n"); return; }
     iot_ai_ctrl_set_callback(iot, on_ai_ctrl, NULL);   /* 阶段2·9000 AI控制通道(见 on_ai_ctrl) */
@@ -1488,7 +1517,7 @@ void tuya_agentic_demo(void *arg)
     cfg.region = AY; cfg.env = PROD;
     cfg.mqtt_disable_tls = false; cfg.mqtt_disable_auto_connect = false;
     cfg.cert_bundle_attach = NULL; cfg.cacert = NULL;
-    cfg.message_callback = on_mqtt_message;   /* MQTT 常驻:收 DP 下行 */
+    cfg.message_callback = on_mqtt_message_router;   /* MQTT 常驻:收 DP 下行+图片下发 */
     cfg.reset_callback = on_cloud_reset;
     cfg.ota_confirm_callback = on_ota_confirm;   /* APP 确认升级(protocol 15) */
     extern const char *tuya_get_effective_sw_ver(void);
@@ -3437,6 +3466,16 @@ static void tuya_ai_run(const pal_t *pal, iot_client_t *iot, const char *local_k
         s_mqtt_ka_exited = 1;
     }
 
+    /* App 图片下发:引导线程做 thing.tc.init 注册 tc 通道,云端才会推
+     * fileStorageDl(协议64)——tc.init 未做时云端受理点击但零下行(10/20
+     * 云端日志定案)。协议19回执经 app_image_poll_publish 在本文件保活
+     * 循环里同线程发布(coreMQTT 非线程安全)。只验收收图,不做打印流水线。*/
+    if (app_image_start(iot, on_app_image_ready, NULL) == 0) {
+        printf("[PRINT-DL] app_image started (tc.init bootstrap forking)\r\n");
+    } else {
+        printf("[PRINT-DL] app_image start failed\r\n");
+    }
+
     audio_stream_init(16000, 16, 1);
     start_audio_stream();
 
@@ -3912,6 +3951,7 @@ void tuya_agentic_main(void *arg)
         cfg.env = PROD;
         cfg.mqtt_disable_tls = false; cfg.mqtt_disable_auto_connect = false;
         cfg.cert_bundle_attach = NULL; cfg.cacert = NULL;
+        cfg.message_callback = on_mqtt_message_router;   /* MQTT 常态路(VM 恢复)也必须接:漏接时 kit 派发链末端把协议64吞掉(dp_dispatch no user_cb,10/20 板测定罪) */
         cfg.reset_callback = on_cloud_reset;
     cfg.ota_confirm_callback = on_ota_confirm;   /* APP 确认升级(protocol 15) */
         extern const char *tuya_get_effective_sw_ver(void);

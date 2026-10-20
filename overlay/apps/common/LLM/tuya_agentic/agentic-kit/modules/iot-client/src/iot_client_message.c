@@ -27,6 +27,38 @@ static void mqtt_message_handler(const char *topic, size_t topic_len,
                            (const uint8_t *)client->local_key,
                            decrypted, &decrypted_len);
     if (ret == 0 && decrypted_len > 0) {
+        /* 兜底日志铁律(面板图片打印手册 §8.1):每条下行必打 protocol+长度一行。
+         * 没有这行,"云端没推"与"推了被静默丢弃"在端侧无法区分(2026-10-19 实机
+         * 案例端侧 log 无数据,靠云端日志才定位到 tc.init 未做)。下面的 200B 明文
+         * 摘要在 payload 超过 200B 时可能截掉根级 "protocol" 字段,故独立解析补一行;
+         * 顺带对打印图片下发(protocol64+reqType=fileStorageDl,§4.1)打 [PRINT-DL]
+         * 高亮标记——面板"发图"流程只需盯这一条(§8.1)。 */
+        cJSON *root = cJSON_ParseWithLength((const char *)decrypted, decrypted_len);
+        if (root) {
+            int proto = -1;
+            cJSON *jp = cJSON_GetObjectItem(root, "protocol");
+            if (cJSON_IsNumber(jp)) proto = jp->valueint;
+            IOT_LOGI("[MQTT-RX] downlink protocol=%d len=%u",
+                     proto, (unsigned)decrypted_len);
+            if (proto == 64) {
+                cJSON *jd = cJSON_GetObjectItem(root, "data");
+                cJSON *jr = jd ? cJSON_GetObjectItem(jd, "reqType") : NULL;
+                if (cJSON_IsString(jr) &&
+                    strcmp(jr->valuestring, "fileStorageDl") == 0) {
+                    cJSON *je = cJSON_GetObjectItem(jd, "event");
+                    cJSON *js = cJSON_GetObjectItem(jd, "sid");
+                    IOT_LOGW("[PRINT-DL] fileStorageDl event=%s sid=%s len=%u",
+                             cJSON_IsString(je) ? je->valuestring : "(none)",
+                             cJSON_IsString(js) ? js->valuestring : "(none)",
+                             (unsigned)decrypted_len);
+                }
+            }
+            cJSON_Delete(root);
+        } else {
+            IOT_LOGW("[MQTT-RX] downlink non-JSON len=%u",
+                     (unsigned)decrypted_len);
+        }
+
         /* 打断/控制命令双通道诊断:涂鸦云端打断会同时在 TCP(TAI) 和 MQTT 两条通道
          * 下发。这里打 MQTT 通道收到的每一条解密后明文,对比 TAI 通道的 chat_break
          * 是否有 MQTT 侧的伴随下发。
