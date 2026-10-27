@@ -98,7 +98,10 @@ int iot_atop_call(iot_client_t *client,
         .api       = request->api,
         .version   = request->version,
         .devid     = client->devid,
-        .timestamp = (uint32_t)time(NULL),
+        /* t-equality: callers whose body embeds a "t" pass it in via
+         * request->timestamp so the signed URL t is that very same value;
+         * everyone else keeps the wall clock. */
+        .timestamp = request->timestamp ? request->timestamp : (uint32_t)time(NULL),
         .data      = (void *)body,
         .datalen   = strlen(body),
         .host      = host[0] ? host : NULL,

@@ -273,7 +273,9 @@ static void mqtt_event_callback(MQTTContext_t *pMqttContext,
             client->suback_status = 0x80;
         }
     } else if (pPacketInfo->type == MQTT_PACKET_TYPE_PUBACK) {
-        IOT_LOGD("Received PUBACK");
+        /* broker 确认收到 QoS1 上行;id 与 "PUBLISH sent" 配对。 */
+        IOT_LOGI("Received PUBACK (id=%u) -- broker confirmed uplink",
+                 pDeserializedInfo->packetIdentifier);
     }
 }
 
@@ -577,8 +579,9 @@ int mqtt_client_publish(mqtt_client *client, const char *topic,
     publish_info.pPayload = message;
     publish_info.payloadLength = message_len;
 
+    uint16_t packet_id = MQTT_GetPacketId(&client->mqtt_context);
     MQTTStatus_t status = MQTT_Publish(&client->mqtt_context, &publish_info,
-                                      MQTT_GetPacketId(&client->mqtt_context));
+                                      packet_id);
     mqtt_note_transport_state(client, status);
 
     if (status != MQTTSuccess) {
@@ -586,7 +589,10 @@ int mqtt_client_publish(mqtt_client *client, const char *topic,
         return OPRT_COMMUNICATION_ERROR;
     }
 
-    IOT_LOGD("Published message to topic: %s", topic);
+    /* QoS1: 发出只代表进了 socket,PUBACK(id 配对)才是 broker 确认。
+     * 上行回执(协议65)是否真正被云端收到,端侧证据链=本行+PUBACK行按 id 配对。 */
+    IOT_LOGI("PUBLISH sent to %s (id=%u, %u bytes), awaiting PUBACK",
+             topic, packet_id, (unsigned)message_len);
     return OPRT_OK;
 }
 

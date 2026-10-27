@@ -83,6 +83,10 @@ typedef struct {
     const char *api;      /**< e.g. "tuya.device.upgrade.get" (required) */
     const char *version;  /**< e.g. "4.4" (required) */
     const char *data;     /**< request body, a JSON object string; NULL/"" = "{}" */
+    uint32_t timestamp;   /**< Signed-URL timestamp override; 0 = current wall clock.
+                               Set to the very value embedded as "t" in `data` when the
+                               interface requires URL t == body t — thing.tc.init e.g.
+                               rejects any mismatch with SING_VALIDATE_FALED. */
 } iot_atop_request_t;
 
 /**

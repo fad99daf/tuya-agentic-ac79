@@ -31,6 +31,7 @@ extern unsigned int get_ram_free_heap_size(void);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "app_image.h"
 #include "cJSON.h"
@@ -50,7 +51,10 @@ extern unsigned int get_ram_free_heap_size(void);
 #define MAX_IMAGE_BYTES       (512 * 1024)
 #define DL_BUF_LEN            (MAX_IMAGE_BYTES + 64 + 16)  /* 64B头 + CBC对齐余量 */
 #define MQTT_PROTOCOL_FILE_STORAGE_DL 64
-#define MQTT_PROTOCOL_DEVICE_RESPONSE 19
+/* 上行回执协议号按产品族分岔,移植勿裸搬:打印件族=19(TuyaOpen 源码 PRO_DEV_DA_RESP,
+ * 打印件 PID 板测过);云相框族=65(闭源样机+wiki+涂鸦云端 2026-10-27 坐实)——tc 服务按
+ * 协议号分发,19 会走打印/透传通道,相框面板等不到回执 60s 判"设备已离线"。 */
+#define MQTT_PROTOCOL_DEVICE_RESPONSE 65
 
 #define IMG_Q_DEPTH           4
 #define DL_TIMEOUT_MS         25000   /* 单分片读循环总预算(参考 20s,放宽链路抖动) */
@@ -208,9 +212,11 @@ static int json_string(const cJSON *obj, const char *key, char *out, size_t cap)
 }
 
 static int atop(const char *api, const char *version, const char *data,
-                iot_atop_response_t *resp)
+                uint32_t t, iot_atop_response_t *resp)
 {
-    iot_atop_request_t req = { .api = api, .version = version, .data = data };
+    /* t 单值贯通:body 里的 "t" 与验签 URL 的 t 必须同一值(见 tc_key_init)。 */
+    iot_atop_request_t req = { .api = api, .version = version, .data = data,
+                               .timestamp = t };
     int rc = iot_atop_call(s_iot, &req, resp);
     epoch_seed_from(resp->server_time);
     return rc;
@@ -222,13 +228,14 @@ static int atop(const char *api, const char *version, const char *data,
 static int tc_key_init(void)
 {
     /* skill 声明能力上限:参考实现同款,仅 maxFs 按 AC79 内存预算降到 512KB。
-     * body 每次尝试现建:纪元基准要等本模块首个 atop 应答的 server_time 才
-     * 播种,首发 body 的 "t" 只能是开机秒数(2026-10-20 板测被云端以
-     * SING_VALIDATE_FALED 拒);首败即播种,重建后第 2 次起是真纪元。
-     * 业务错误也重试:重绑定后云端文件服务 sekey 传播滞后同样报签错,
-     * 退避 5s/10s 留窗。 */
+     * 验签要求 body 的 "t" 与 URL 的 t 是同一个值(2026-10-27 云端实测:全等=过,
+     * 差 1 秒或开机秒数=SING_VALIDATE_FALED;旧假设"第 2 发起真纪元就能过"
+     * 不成立,两把钟系统差 ~1s)。每次尝试采 time(NULL) 一次,单值进 body 与
+     * req.timestamp。业务错误也重试:重绑定后云端文件服务 sekey 传播滞后
+     * 同样报签错,退避 5s/10s 留窗。 */
     int ok = -1;
     for (int attempt = 1; attempt <= 3; attempt++) {
+        uint32_t t = (uint32_t)time(NULL);
         char skill[320];
         snprintf(skill, sizeof(skill),
                  "{\"sdkVer\":\"agentic-kit\",\"resolution\":\"384*384\","
@@ -237,13 +244,13 @@ static int tc_key_init(void)
         cJSON *body_obj = cJSON_CreateObject();
         if (!body_obj) return -1;
         cJSON_AddStringToObject(body_obj, "skill", skill);
-        cJSON_AddNumberToObject(body_obj, "t", (double)now_epoch());
+        cJSON_AddNumberToObject(body_obj, "t", (double)t);
         char *body = cJSON_PrintUnformatted(body_obj);
         cJSON_Delete(body_obj);
         if (!body) return -1;
 
         iot_atop_response_t resp = {0};
-        int rc = atop("thing.tc.init", "2.0", body, &resp);
+        int rc = atop("thing.tc.init", "2.0", body, t, &resp);
         free(body);
         if (rc != OPRT_OK || !resp.result) {
             printf(PRINT_TAG "thing.tc.init failed: %d (%s) attempt %d/3\r\n", rc,
@@ -276,10 +283,11 @@ static int tc_key_init(void)
 /* thing.tc.config.get:存储凭证(分片级时效,每片现取,与参考一致)。 */
 static int get_storage_config(storage_config_t *cfg)
 {
+    uint32_t t = (uint32_t)time(NULL);
     char body[48];
-    snprintf(body, sizeof(body), "{\"action\":1,\"t\":%u}", now_epoch());
+    snprintf(body, sizeof(body), "{\"action\":1,\"t\":%u}", (unsigned)t);
     iot_atop_response_t resp = {0};
-    int rc = atop("thing.tc.config.get", "2.0", body, &resp);
+    int rc = atop("thing.tc.config.get", "2.0", body, t, &resp);
     if (rc != OPRT_OK || !resp.result) {
         printf(PRINT_TAG "thing.tc.config.get failed: %d (%s)\r\n", rc,
                resp.error_code[0] ? resp.error_code : "no-result");
@@ -632,7 +640,22 @@ static int publish_reply(const cJSON *data, const char *event, int code)
     cJSON_AddStringToObject(reply, "reqType", "fileStorageDl");
     const cJSON *sid = cJSON_GetObjectItem(data, "sid");
     const cJSON *prefix = cJSON_GetObjectItem(data, "prefix");
-    if (cJSON_IsString(sid)) cJSON_AddStringToObject(reply, "sid", sid->valuestring);
+    if (cJSON_IsString(sid)) {
+        cJSON_AddStringToObject(reply, "sid", sid->valuestring);
+    } else if (cJSON_IsNumber(sid)) {
+        /* wiki 回执模板与闭源实测(10/27)的 sid 都是字符串;探针 sid 是纯数字毫秒,
+         * 转字符串镜像保持类型同构。数值转文本走 cJSON(本板已验证零失真),
+         * 绕开 printf 浮点与 %llu 双坑([[activation-crash-zu-printf]])。 */
+        char *num = cJSON_Print(sid);
+        if (num) {
+            cJSON_AddStringToObject(reply, "sid", num);
+            free(num);
+        } else {
+            cJSON_AddStringToObject(reply, "sid", "");
+        }
+    } else {
+        cJSON_AddStringToObject(reply, "sid", "");
+    }
     cJSON_AddStringToObject(reply, "event", event);
     if (cJSON_IsString(prefix)) cJSON_AddStringToObject(reply, "prefix", prefix->valuestring);
     cJSON_AddNumberToObject(reply, "code", code);
@@ -649,7 +672,8 @@ static int publish_reply(const cJSON *data, const char *event, int code)
     cJSON *envelope = cJSON_CreateObject();
     if (!envelope) { free(payload); return -1; }
     cJSON_AddNumberToObject(envelope, "protocol", MQTT_PROTOCOL_DEVICE_RESPONSE);
-    cJSON_AddNumberToObject(envelope, "t", (double)now_epoch());
+    /* SNTP 系统钟,与 kit/URL 同源;now_epoch 播种前的开机秒数 t 不可外发 */
+    cJSON_AddNumberToObject(envelope, "t", (double)time(NULL));
     cJSON *rdata = cJSON_Parse(payload);   /* 以 data 字段身份再入信封 */
     free(payload);
     if (!rdata) { cJSON_Delete(envelope); return -1; }
