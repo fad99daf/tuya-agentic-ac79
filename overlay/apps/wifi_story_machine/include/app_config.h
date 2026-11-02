@@ -106,7 +106,7 @@
 #endif
 
 #if defined CONFIG_UI_FILE_SAVE_IN_RESERVED_EXPAND_ZONE
-#define CONFIG_UI_PACKRES_LEN 0x180000
+#define CONFIG_UI_PACKRES_LEN 0x2000    /*原0x180000;本产品无LCD UI运行时(仅LED灯效,SCAN_PEN关,camera demo空编),字库区1.5M让给KWS常量;git可还原*/
 #define CONFIG_UI_PACKRES_ADR ((__FLASH_SIZE__) - (CONFIG_UI_PACKRES_LEN) - 0x1000)
 #else
 #define CONFIG_UI_PACKRES_LEN 0
@@ -345,7 +345,10 @@
  * 纯云裁决形态(哑门开口+云端裁定),与小智配方前端改动(user_cfg.c:AGC开、
  * NS+DNS 全关)配套做声学 A/B——对照 9.21 纯云基线,本轮唯一变量=前端处理链,
  * VAD 形态与基线保持一致。*/
-#define TUYA_CLOUD_OPEN_ENABLE
+/* 2026-11-02: 注释切回组合模式(本地VAD+能量门开口、云端server-vad判停)——
+ * 唤醒词声学回归走产品形态;哑门(本地VAD/KWS唤醒窗不拦起轮)为声学 A/B 遗留,
+ * 恢复纯云开口: 取消注释本行(须与 TUYA_STREAM_MODE 同开,见 demo.c 约束)。 */
+/* #define TUYA_CLOUD_OPEN_ENABLE */
 /* 开口门限下限(2026-09-22 起为自适应门的下限):Σ|int16|/40ms 帧。文档化静音底噪
  * avg|sample|<50(即 sum<32k),取 40k = 平均|sample|≈62,只拦绝对静音;实际开门门限
  * 在 demo.c 里自适应:g_open_gate = clip(本值, 1.8×空闲底噪中位数, 600000),安静
@@ -364,7 +367,9 @@
  * 依赖 TUYA_SERVER_VAD_ENABLE + TUYA_CLOUD_OPEN_ENABLE(demo.c 内有 #error 约束)。
  * ★ 一键切回方案C(轮次制):注释掉下面这行重新编译即可,轮次代码在 demo.c 的
  *   #else 分支原样保留、一个字节未动。*/
-#define TUYA_STREAM_MODE
+/* 2026-11-02: 注释切回方案C 轮次制(组合模式,0cec78fc 实测通过配方)——长流
+ * 纯云形态为声学 A/B 遗留。恢复长流: 取消注释本行即可,#else 分支原样保留。 */
+/* #define TUYA_STREAM_MODE */
 
 /* ★ 长流模式 TTS 播放期回声闸(2026-09-24,仅 TUYA_STREAM_MODE 下生效)。
  * 背景:长流上行常开,AEC 残差(TTS 期单帧 sum 中位 ~12万、最坏 38.4万)全量
@@ -410,6 +415,35 @@
  *   注释下一行,采集+收流+遥测整体编译出局。再诊断时取消注释即可。*/
 /* #define TUYA_AEC_DIAG */
 
+/* ===== AEC A/B 台架(2026-10-26,声学部 90 条刺激开/关 AEC 对比;测完可整体退回)=====
+ * 开 AEC_AB_TEST:复活上方 TUYA_AEC_DIAG 三路采集(pre/ref/post)+ SD 清单顺序自播
+ *   + 4ch 推流 TCP:5002 / 事件口 TCP:5003。台架主体见 audio_input.c 尾部 aec_ab 块。
+ * 两版固件:ON bin = 只定义 AEC_AB_TEST;OFF bin = 再放开 AEC_AB_TEST_AEC_OFF。
+ * 不定义 = 台架代码整体编译出局,原行为一字不变。备份在 D:\code\aec_ab_bak_1026\。*/
+// #define AEC_AB_TEST            /* 台架暂停(10/27,另一窗口开发需求):回头续测时放开本行=ON bin;再放开下行=OFF bin */
+//#define AEC_AB_TEST_AEC_OFF   /* 与 AEC_AB_TEST 连用:强关上行 AEC(出 OFF bin 时放开) */
+
+/* ===== 音乐循环声学测试台架(2026-10-29 上线,10-30 场景分档收官)=====
+ * ★台架暂停(10/30):下方 #define 注释=整体编译出局;要再测,放开该行重编即可。
+ * 开 AEC_MUSIC_TEST:复用 TUYA_AEC_DIAG 三路采集(pre裸mic/ref播放参考/post AEC后),
+ *   SD storage/sd0/C/aecmusic/ 清单【循环】播放 16k/16bit/mono WAV(或裸.pcm),
+ *   板上 K5 键(KEY_OK click)启停。落盘:常开录音按场景分档——K5 开音乐换新
+ *   abm_<NN>m.raw(播放段),停音乐换新 abm_<NN>q.raw(静音段,外部声源照录),
+ *   NN 全局递增=时序;单文件 1GB 自动换号。
+ *   ★断电须知(10/30 板测定案):目录项 size 只有 fclose(K5 换档/1GB 轮换)才落卡,
+ *   打开中断电的文件 PC 显示 0KB,但数据在卡上可裸扇区取证整链捞回(单文件
+ *   ≤8.42MB≈66s 内保证;取证/拆分脚本在 PC D:\code\aec-ab\)。
+ * 麦克风全程采集过端侧 AEC,上行对云静音;云端 TTS 下行整体丢弃(on_audio)。
+ * AEC 常开:本宏无 AEC_OFF 变体。台架主体见 audio_input.c 尾部 aec_music 块。
+ * 与 AEC_AB_TEST 互斥(#error);不定义=原行为一字不变。*/
+// #define AEC_MUSIC_TEST     /* 台架暂停(10/30):要再测,放开本行重编 */
+#if defined(AEC_AB_TEST) && defined(AEC_MUSIC_TEST)
+#error "AEC_AB_TEST 与 AEC_MUSIC_TEST 互斥,只能开一个(都用 DIAG 三路采集的 SD 落盘形态)"
+#endif
+#if defined(AEC_AB_TEST) || defined(AEC_MUSIC_TEST)
+#define TUYA_AEC_DIAG
+#endif
+
 /* ===== 涂鸦语音通道传输层开关(TCP / UDP)(仅 CONFIG_TUYA_AGENTIC_ENABLE 下)=====
  * 0(默认)= TCP:走原 rtc-tcp-client 源码(tai_*,agentic-kit/modules/rtc-tcp-client),
  *           行为与历史版本完全一致。
@@ -441,7 +475,19 @@
  *          唤醒词完全一致;库仍在链接行,无引用 LTO 裁掉不占空间)。
  *          ⚠️ 开关是 #ifdef 语义(demo.c 全部按"是否定义"编译),置 0 无效,
  *          要开就把下面整行的注释去掉;要关必须整行注释掉。 */
-/* #define TUYA_KWS_ENABLE               1 */
+#define TUYA_KWS_ENABLE               1 /* 2026-11-02 KWS 线恢复:v9d FSMN 重训模型宿主对拍
+                                        * 18/18 全绿后交付板测(真人现场说话);引擎/喂点/心跳/
+                                        * mbench 全部随宏整体复活。历史:10-29 曾暂停让位并行开发 */
+
+/* TUYA_KWS_ENABLE 打开时选引擎(不定义=1):
+ *   1 = 涂鸦闭源 FSMN(kws/tuya_kws.c, "你好涂鸦"/"嘿涂鸦", 阈值 0.7)
+ *   2 = 自训 wekws FSMN(v9d, 涂鸦同架构)"小涂小涂"(kws/wekws_kws.c,
+ *       阈值 0.45, ~1MB const)。C 实现(fbank/int16 图/CTC 束含别名语义)
+ *       已过 PC 宿主 18 卷对拍(0 MISMATCH), 板上开机自测会重跑内嵌考卷
+ *       并打印分数(见 仓根 WEKWS-小涂小涂-板测手册.md)。 */
+#define TUYA_KWS_ENGINE              1 /* 2026-11-02 临时切回你好涂鸦做域差 A/B:
+                                        * 同门同链对照(小涂小涂板上 0.15-0.35 过不了
+                                        * 0.45,你好涂鸦 9 月同链能过 0.7);验完切回 2 */
 
 /* ★排查期临时(UDP 联调完成后改回 3 或删除):libstm 应用侧日志过滤。
  * 日志有两道闸门:库内部阈值 TUYA_STM_LIB_LOG_LEVEL(tuya_stm_ai.c,现默认

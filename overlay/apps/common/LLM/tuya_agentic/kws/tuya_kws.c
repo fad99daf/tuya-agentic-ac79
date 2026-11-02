@@ -18,6 +18,15 @@
  *  3. frame_threshold 必须 0: 真实 token 段多为单窗(30ms), 默认 3 的
  *     时长门会拦掉大部分真实段。
  * ==========================================================================*/
+#include "app_config.h"
+
+/* 引擎选择(app_config.h 的 TUYA_KWS_ENGINE): 2 = 自训 wekws"小涂小涂"
+ * (wekws_kws.c 实现 tuya_kws.h 全部 API), 本文件整体不编以免符号重复;
+ * 其余情况本文件照常(FSMN v7)。开关只看 TUYA_KWS_ENABLE 打开时。 */
+#if defined(TUYA_KWS_ENABLE) && defined(TUYA_KWS_ENGINE) && TUYA_KWS_ENGINE == 2
+/* engine 2: 见 wekws_kws.c */
+#else
+
 #include "keyword_tflite.h"
 #include "tuya_kws.h"
 
@@ -284,3 +293,5 @@ void tuya_kws_window_kick(void)
     if (s_ready) s_awake_until = timer_get_ms() + TUYA_KWS_AWAKE_MS;
 #endif
 }
+
+#endif /* !(TUYA_KWS_ENABLE && TUYA_KWS_ENGINE == 2) */
