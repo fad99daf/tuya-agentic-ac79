@@ -11,7 +11,7 @@
 | modules/iot-client | `48e3c0c`(0.5.0) | **阶段 2**(2026-09-30 落地,待 CB 构建+板测)= 48e3c0c + 本地补丁;新收 iot_ai_ctrl.c/h(9000 通道)、iot_internal.h、include/iot_client_config_defaults.h、iot_atop.c/h、上游版 iot_ota_verify.c;删旧 src/iot_config_defaults.h、src/iot_client_internal.h(头文件拆分进 include/iot_client_config_defaults.h + src/iot_internal.h);SG 域名表上游已带(85740c6 收编) |
 | common | `48e3c0c` | 阶段 2:tai_log.h = 上游编译期门面(AGENTIC_KIT_LOG_LEVEL/AGENTIC_KIT_LOG)+ **本地永久扩展运行时层**(log_set_handler/set_level/get_level/default_handler/log_emit_valist,见 §2);log.c = 运行时状态版;tls.c = 上游 + 本地 tls_write 诊断 |
 | modules/rtc-tcp-client | `48e3c0c` | 阶段 2 = 上游(PR#42 背压、tai_config_defaults.h 旋钮、attr111 user_data、timestamp_ms)+ ConnectionRefresh / 长流 v3 本地补丁;on_flow_control 留 NULL(阶段 3 接线) |
-| modules/tuya-ble(仅配网 3 文件) | `49ab2af` | 基线;**阶段 3 前钉住不刷新** |
+| modules/tuya-ble(仅配网 3 文件) | `49ab2af` | 基线 + 本地 149 行(日志门面+padding 修复);**2026-11-19 移植上游 fix/ble-provisioning 0x0021 通道**(847b3b2/5c46183/2407c32/8ab167b,终态 00a307c):FRM_DIRECT_CREDS_REQ define + wifi_creds_from_json 严格共享解析器 + commit_wifi_credentials 共享提交核 + handle_direct_wifi_credentials(剥尾部 NUL + 单字节 STATE ack)+ 分发 case,+87 行;0x801B 老路径零改动;上游 credentials_pending/flush 异步机制**不移植**(本 port cfg.cb 同步消费);主仓板测绿(鸿蒙 0x0021 配网→激活→MQTT→TAI 全链,安卓 0x801B 未回归即原路径无 diff) |
 | third_party/coreHTTP、coreMQTT | `49ab2af` 同步快照 | 未改动(48e3c0c 范围内零差异,已复核) |
 | pal(仅 pal.h) | `48e3c0c` | 阶段 2:+`sleep_ms` 必填(PR#42 背压暂停让出 CPU);pal_ac791n.c 用 vTaskDelay(pdMS_TO_TICKS) 实现 |
 
@@ -69,6 +69,7 @@ diff --strip-trailing-cr <(git -C D:/code/agentic-kit show 5f4d845:modules/iot-c
 | (阶段 1) | 09-30 | re-vendor 至 5f4d845;保留全部上述补丁 + 静默分流/进度上报/send_only reset/诊断日志;换上游 protocol11/15 opt-in、iot_ota_verify.c、reset v5.0(与 factory_reset 共存) | 全 kit(除 tuya-ble/third_party)+ demo.c 字段名 + Makefile/.cbp +iot_atop.c |
 | (阶段 2) | 09-30 | re-vendor 至 48e3c0c(0.5.0);AGENTIC_KIT_ 旋钮前缀+头拆分、编译期日志门面+本地运行时层、9000 通道、pal sleep_ms、时间过滤双判对照;全部本地补丁(ConnectionRefresh/长流v3/OTA 双 API/send_only/schema 自愈/[MQTT-RX]/tls_write 诊断/tai_current_event_id)对账存活 | 全 kit(除 tuya-ble/third_party)+ pal_ac791n.c + demo.c 接线 + Makefile/.cbp +iot_ai_ctrl.c |
 | (格式符扫除) | 10-06 | 杰理 printf 64 位长度符崩机修复:%zu→%u 35 处 + %llu→(unsigned)%u 6 处,共 8 文件;详见 §2 平台适配记录 | iot-client 4 文件 + rtc-tcp-client 4 文件 |
+| (鸿蒙0x0021配网) | 11-19 | 纯鸿蒙 App 凭据通道 0x0021 最小移植(上游 fix/ble-provisioning 四连提交,5c46183 定性:iOS/安卓 0x801B、鸿蒙 0x0021)+ tai_frame_verify 下溢 guard(d88e707,length<sig_len 回 TAI_ERR_PROTO);新增行 %zu/%llu 零 | tuya-ble/src/tuya_ble_prov.c +87 / rtc-tcp-client/src/tai_transport.c +4 |
 
 另:tls.c 内嵌 tls_write 慢链路诊断(海外弱网定位,约 15 行,无上游对应,升级时保留)。
 

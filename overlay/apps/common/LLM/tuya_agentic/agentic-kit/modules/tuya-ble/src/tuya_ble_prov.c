@@ -30,6 +30,7 @@ static void ble_prov_hexdump(const uint8_t *buf, size_t len)
 #define FRM_RPT_NET_STAT_REQ         0x001E
 #define FRM_DOWNLINK_TRANSPARENT_REQ 0x801B
 #define FRM_UPLINK_TRANSPARENT_REQ   0x801C
+#define FRM_DIRECT_CREDS_REQ        0x0021
 
 #define ENCRYPTION_MODE_NONE        0x00
 #define ENCRYPTION_MODE_KEY_11      0x0B
@@ -547,6 +548,89 @@ static void handle_wifi_config(tuya_ble_prov_state_t *state, const uint8_t *data
     }
 }
 
+/* 0x0021 直连 WiFi 凭据下发(纯鸿蒙 App 专用配网通道;iOS/Android 走上面的
+ * 0x801B 透传通道)。载荷是同一份 {ssid,pwd,token} JSON,但无 flag/subcmd
+ * 前缀,应答为单字节 STATE(0x00=接受)。移植自上游 fix/ble-provisioning
+ * (5c46183/2407c32/8ab167b)。凭据内容一律不得进日志。 */
+static int wifi_creds_from_json(tuya_ble_prov_state_t *state, const char *json_str)
+{
+    cJSON *root = cJSON_ParseWithOpts(json_str, NULL, true);
+    if (root == NULL) {
+        TUYA_BLE_HAL_LOGE("[PROTO] WiFi credentials JSON parse failed");
+        return -1;
+    }
+
+    cJSON *ssid = cJSON_GetObjectItemCaseSensitive(root, "ssid");
+    cJSON *pwd = cJSON_GetObjectItemCaseSensitive(root, "pwd");
+    cJSON *token = cJSON_GetObjectItemCaseSensitive(root, "token");
+    if (!cJSON_IsObject(root) || !cJSON_IsString(ssid) || !cJSON_IsString(pwd) ||
+        !cJSON_IsString(token) || !ssid->valuestring[0] || !token->valuestring[0] ||
+        strlen(ssid->valuestring) > TUYA_BLE_SSID_MAX_LEN ||
+        strlen(pwd->valuestring) > TUYA_BLE_PASSWORD_MAX_LEN ||
+        strlen(token->valuestring) > TUYA_BLE_TOKEN_MAX_LEN) {
+        TUYA_BLE_HAL_LOGW("[PROTO] WiFi JSON rejected field validation");
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    memset(&state->creds, 0, sizeof(state->creds));
+    strcpy(state->creds.ssid, ssid->valuestring);
+    strcpy(state->creds.password, pwd->valuestring);
+    strcpy(state->creds.token, token->valuestring);
+
+    cJSON_Delete(root);
+    return 0;
+}
+
+/* 凭据通道共享提交核:校验裸 JSON 区间(拒空/超长/内嵌 NUL)→ 解析 → 回 ACK
+ * → 同步交给 glue。上游的 credentials_pending 单次投递闸依赖其异步投递结构;
+ * 本 port 的 cfg.cb() 为同步消费(与 0x801B 一致),不移植该机制。 */
+static void commit_wifi_credentials(tuya_ble_prov_state_t *state,
+                                    const uint8_t *json, uint16_t json_len,
+                                    uint16_t ack_cmd, const uint8_t *ack_data,
+                                    uint16_t ack_len)
+{
+    char json_str[512];
+
+    if (json_len == 0 || json_len >= sizeof(json_str) ||
+        memchr(json, '\0', json_len) != NULL) {
+        TUYA_BLE_HAL_LOGW("[PROTO] WiFi credentials JSON empty/too long/has NUL (%u)",
+                          (unsigned int)json_len);
+        return;
+    }
+    memcpy(json_str, json, json_len);
+    json_str[json_len] = '\0';
+
+    if (wifi_creds_from_json(state, json_str) != 0) {
+        return;
+    }
+
+    if (tuya_ble_send(state, ack_cmd, ack_data, ack_len, ENCRYPTION_MODE_KEY_12) != 0) {
+        TUYA_BLE_HAL_LOGE("[PROTO] Credentials ACK send failed");
+        return;
+    }
+
+    TUYA_BLE_HAL_LOGI("[PROTO] WiFi credentials accepted: ssid_bytes=%u",
+                      (unsigned int)strlen(state->creds.ssid));
+
+    if (state->cfg.cb) {
+        state->cfg.cb(&state->creds);
+    }
+}
+
+static void handle_direct_wifi_credentials(tuya_ble_prov_state_t *state,
+                                           const uint8_t *data, uint16_t data_len)
+{
+    /* 发送端在裸 JSON 与 NUL 结尾 JSON 之间有差异(8ab167b),先剥尾部 NUL */
+    while (data_len > 0 && data[data_len - 1] == '\0') {
+        data_len--;
+    }
+
+    const uint8_t ack[] = {0x00}; /* STATE: 0 = 接受 */
+    commit_wifi_credentials(state, data, data_len,
+                            FRM_DIRECT_CREDS_REQ, ack, sizeof(ack));
+}
+
 static void tuya_ble_recv(tuya_ble_prov_state_t *state, const uint8_t *packet, uint16_t packet_len)
 {
     TUYA_BLE_HAL_LOGI("[RX] packet_len=%d", packet_len);
@@ -652,6 +736,9 @@ static void tuya_ble_recv(tuya_ble_prov_state_t *state, const uint8_t *packet, u
         break;
     case FRM_DOWNLINK_TRANSPARENT_REQ:
         handle_wifi_config(state, data, data_len);
+        break;
+    case FRM_DIRECT_CREDS_REQ:
+        handle_direct_wifi_credentials(state, data, data_len);
         break;
     default:
         TUYA_BLE_HAL_LOGW("[RX] Unhandled CMD=0x%04X", cmd);
